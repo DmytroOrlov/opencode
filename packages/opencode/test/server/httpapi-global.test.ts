@@ -1,5 +1,5 @@
 import { NodeHttpServer } from "@effect/platform-node"
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Context, Effect, Layer, Option } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -12,7 +12,7 @@ import { RootHttpApi } from "../../src/server/routes/instance/httpapi/api"
 import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/global"
 import { controlHandlers } from "../../src/server/routes/instance/httpapi/handlers/control"
 import { controlPlaneHandlers } from "../../src/server/routes/instance/httpapi/handlers/control-plane"
-import { globalHandlers } from "../../src/server/routes/instance/httpapi/handlers/global"
+import { globalHandlers, globalHealthResult } from "../../src/server/routes/instance/httpapi/handlers/global"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
 import { testEffect } from "../lib/effect"
@@ -87,4 +87,14 @@ describe("global HttpApi", () => {
       expect(response.status).toBe(415)
     }),
   )
+})
+
+describe("globalHealthResult", () => {
+  test("returns healthy, non-empty version, and resolved tlsCaMode", () => {
+    const result = globalHealthResult(() => "system")
+    expect(result.healthy).toBe(true)
+    expect(typeof result.version).toBe("string")
+    expect(result.version.length).toBeGreaterThan(0)
+    expect(result.tlsCaMode).toBe("system")
+  })
 })
