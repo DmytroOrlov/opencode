@@ -1,4 +1,5 @@
 import { runTlsCaBootstrap } from "../../../src/bootstrap"
+import { getTlsCaMode } from "../../../src/tls-ca-mode"
 
 await runTlsCaBootstrap(async () => {
   if (process.env.BUN_OPTIONS !== undefined) {
@@ -14,4 +15,5 @@ await runTlsCaBootstrap(async () => {
   }
 
   console.log("verified environment is clean")
+  console.log(`verified mode: ${getTlsCaMode()}`)
 })

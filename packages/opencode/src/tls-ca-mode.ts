@@ -42,7 +42,7 @@ export function parseTlsCaMode(args: readonly string[]): ParsedTlsCaMode {
       dropIndices.add(i)
     }
   }
-  const mode = found ?? "system"
+  const mode = found ?? "bundled"
   const argv = args.filter((_, i) => !dropIndices.has(i))
   return { mode, argv }
 }

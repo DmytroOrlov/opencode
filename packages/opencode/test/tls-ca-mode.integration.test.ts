@@ -468,6 +468,46 @@ describe("BUN_OPTIONS cleanup in verified child", () => {
   })
 })
 
+describe("default TLS CA mode through real bootstrap", () => {
+  const probeScript = path.join(fixtureDir, "bootstrap-env-probe.ts")
+
+  const cases: Array<{ label: string; args: string[]; mode: string }> = [
+    { label: "no --tls-ca-mode selects verified bundled", args: [], mode: "bundled" },
+    { label: "explicit --tls-ca-mode=bundled selects verified bundled", args: ["--tls-ca-mode=bundled"], mode: "bundled" },
+    { label: "explicit --tls-ca-mode=system selects verified system", args: ["--tls-ca-mode=system"], mode: "system" },
+  ]
+
+  for (const { label, args, mode } of cases) {
+    test(label, async () => {
+      const child = Bun.spawn(["bun", probeScript, ...args], {
+        env: {
+          PATH: process.env.PATH,
+          HOME: process.env.HOME,
+          BUN_OPTIONS: undefined,
+          OPENCODE_TLS_CA_BOOTSTRAPPED: undefined,
+          NODE_EXTRA_CA_CERTS: undefined,
+          NODE_USE_SYSTEM_CA: undefined,
+          NODE_TLS_REJECT_UNAUTHORIZED: undefined,
+          SSL_CERT_FILE: undefined,
+          SSL_CERT_DIR: undefined,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+
+      const [exitCode, stdout, stderr] = await Promise.all([
+        child.exited,
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+      ])
+
+      expect(stderr).not.toMatch(/TLS CA|conflict|getCACertificates|leaked/)
+      expect(exitCode).toBe(0)
+      expect(stdout).toContain("verified environment is clean")
+      expect(stdout).toContain(`verified mode: ${mode}`)
+    }, 30000)
+  }
+})
+
 describe("debug inspector start with OPENCODE_TLS_CA_BOOTSTRAPPED=1", () => {
   const bootstrapSource = path.join(import.meta.dirname, "../src/bootstrap.ts")
 

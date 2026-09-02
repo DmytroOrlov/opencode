@@ -13,9 +13,10 @@ import {
 
 describe("parseTlsCaMode", () => {
   const accepted: Array<{ label: string; argv: string[]; mode: TlsCaMode; expected: string[] }> = [
-    { label: "default is system", argv: [], mode: "system", expected: [] },
-    { label: "unrelated args default to system", argv: ["--version"], mode: "system", expected: ["--version"] },
-    { label: "subcommand defaults to system", argv: ["serve"], mode: "system", expected: ["serve"] },
+    { label: "default is bundled", argv: [], mode: "bundled", expected: [] },
+    { label: "unrelated args default to bundled", argv: ["--version"], mode: "bundled", expected: ["--version"] },
+    { label: "web subcommand defaults to bundled", argv: ["web"], mode: "bundled", expected: ["web"] },
+    { label: "subcommand defaults to bundled", argv: ["serve"], mode: "bundled", expected: ["serve"] },
     { label: "equals syntax system", argv: ["--tls-ca-mode=system"], mode: "system", expected: [] },
     { label: "equals syntax bundled", argv: ["--tls-ca-mode=bundled"], mode: "bundled", expected: [] },
     { label: "split syntax system", argv: ["--tls-ca-mode", "system"], mode: "system", expected: [] },
@@ -55,7 +56,8 @@ describe("parseTlsCaMode", () => {
   }
 
   test("stops parsing at -- separator", () => {
-    expect(parseTlsCaMode(["--", "--tls-ca-mode=bundled"]).mode).toBe("system")
+    expect(parseTlsCaMode(["--", "--tls-ca-mode=bundled"]).mode).toBe("bundled")
+    expect(parseTlsCaMode(["--", "--tls-ca-mode=system"]).mode).toBe("bundled")
     expect(parseTlsCaMode(["--tls-ca-mode=system", "--", "--tls-ca-mode=bundled"]).mode).toBe("system")
   })
 })
