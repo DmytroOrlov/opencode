@@ -1048,7 +1048,7 @@ it.instance(
 )
 
 it.instance(
-  "does not fail over a terminal HTTP 400 even when fallback is available",
+  "fails over an HTTP 400 when fallback is available",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(fallbackProviderCfg)
@@ -1065,18 +1065,20 @@ it.instance(
         (hit) => hit.body.model === "test-model",
         httpError(400, { error: { message: "primary unavailable" } }),
       )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback answer").stop().item())
 
       const result = yield* prompt.loop({ sessionID: session.id })
       expect(result.info.role).toBe("assistant")
       if (result.info.role === "assistant") {
-        expect(result.info.providerID).toBe(ProviderV2.ID.make("test"))
-        expect(result.info.error).toBeDefined()
+        expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+        expect(result.info.error).toBeUndefined()
       }
-      expect(
-        (yield* llm.inputs).filter(
-          (input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"),
-        ),
-      ).toHaveLength(1)
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
     }),
   { config: fallbackProviderCfg("http://localhost:1/v1") },
 )
@@ -1095,7 +1097,22 @@ it.instance(
         noReply: true,
         parts: [{ type: "text", text: "retry network failure" }],
       })
-      yield* llm.fail("fetch failed")
+      yield* llm.push(
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-retry-partial",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "partial" }, finish_reason: null }],
+            },
+            {
+              id: "chatcmpl-retry-partial",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
       yield* llm.text("primary recovered")
 
       const result = yield* prompt.loop({ sessionID: session.id })
@@ -1106,12 +1123,14 @@ it.instance(
           (input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"),
         ),
       ).toHaveLength(2)
+      expect(result.parts.some((part) => part.type === "text" && part.text === "partial")).toBe(false)
+      expect(result.parts.some((part) => part.type === "text" && part.text === "primary recovered")).toBe(true)
     }),
   { config: providerCfg("http://localhost:1/v1") },
 )
 
 it.instance(
-  "keeps retryable HTTP 503 and 429 failures on the primary",
+  "fails over HTTP 503 when fallback is available",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(fallbackProviderCfg)
@@ -1124,28 +1143,166 @@ it.instance(
         noReply: true,
         parts: [{ type: "text", text: "retry transient HTTP failures" }],
       })
-      yield* llm.push(
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
         httpError(503, { error: { message: "service unavailable" } }),
-        httpError(429, { error: { message: "rate limited" } }),
-        reply().text("primary recovered").stop().item(),
       )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback recovered").stop().item())
 
       const result = yield* prompt.loop({ sessionID: session.id })
       expect(result.info.role).toBe("assistant")
-      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("test"))
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("mlx"))
       const inputs = (yield* llm.inputs).filter(
         (input) =>
           (input.model === "test-model" || input.model === "qwen3.8-27b") &&
           !JSON.stringify(input).includes("Generate a title"),
       )
-      expect(inputs.map((input) => input.model)).toEqual(["test-model", "test-model", "test-model"])
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
     }),
   { config: fallbackProviderCfg("http://localhost:1/v1") },
   10_000,
 )
 
 it.instance(
-  "does not fail over after a connectivity failure has committed text",
+  "fails over HTTP 429 before same-provider retry",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      const statuses: SessionStatus.Info[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+        const data = event.data as typeof SessionStatus.Event.Status.data.Type
+        if (data.sessionID === session.id) statuses.push(data.status)
+        return Effect.void
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback rate limit" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(429, { error: { message: "rate limited" } }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      yield* off
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("mlx"))
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+      expect(JSON.stringify(inputs[1])).toContain("xhigh")
+      expect(statuses.some((status) => status.type === "retry")).toBe(false)
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "continues from a completed tool without replaying it after provider failure",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const registry = yield* ToolRegistry.Service
+      const { read } = yield* registry.named()
+      let executionCount = 0
+      const originalRead = read.execute
+      read.execute = (...args) => {
+        executionCount++
+        return originalRead(...args)
+      }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          read.execute = originalRead
+        }),
+      )
+      const session = yield* sessions.create({
+        title: "Tool continuation fallback",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const file = path.join(dir, "once.txt")
+      yield* writeText(file, "executed once")
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "read the file and summarize it" }],
+      })
+      yield* llm.pushMatch((hit) => hit.body.model === "test-model", reply().tool("read", { filePath: file }).item())
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-tool-failure",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback summary").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      const msgs = yield* MessageV2.filterCompactedEffect(session.id)
+      const tools = msgs.flatMap((msg) => msg.parts).filter((part) => part.type === "tool" && part.tool === "read")
+      const toolAssistant = msgs.find(
+        (msg) =>
+          msg.info.role === "assistant" &&
+          msg.parts.some((part) => part.type === "tool" && part.tool === "read" && part.state.status === "completed"),
+      )
+      const fallbackAssistant = msgs.find(
+        (msg) => msg.info.role === "assistant" && msg.info.providerID === ProviderV2.ID.make("mlx"),
+      )
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("mlx"))
+      expect(result.parts.some((part) => part.type === "text" && part.text === "fallback summary")).toBe(true)
+      expect(executionCount).toBe(1)
+      expect(tools).toHaveLength(1)
+      expect(tools[0]?.type === "tool" ? tools[0].state.status : undefined).toBe("completed")
+      expect(toolAssistant?.info.role === "assistant" ? toolAssistant.info.providerID : undefined).toBe(
+        ProviderV2.ID.make("test"),
+      )
+      expect(toolAssistant?.info.role === "assistant" ? toolAssistant.info.modelID : undefined).toBe(
+        ModelV2.ID.make("test-model"),
+      )
+      expect(fallbackAssistant?.info.role === "assistant" ? fallbackAssistant.info.providerID : undefined).toBe(
+        ProviderV2.ID.make("mlx"),
+      )
+      expect(fallbackAssistant?.info.role === "assistant" ? fallbackAssistant.info.modelID : undefined).toBe(
+        ModelV2.ID.make("qwen3.8-27b"),
+      )
+      expect(fallbackAssistant?.info.role === "assistant" ? fallbackAssistant.info.variant : undefined).toBe("xhigh")
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "test-model", "qwen3.8-27b"])
+      expect(JSON.stringify(inputs[2])).toContain("executed once")
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "replaces partial text before connectivity fallback",
   () =>
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(fallbackProviderCfg)
@@ -1160,19 +1317,33 @@ it.instance(
       })
       yield* llm.pushMatch(
         (hit) => hit.body.model === "test-model",
-        reply().text("partial").streamError("fetch failed").item(),
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-partial-connectivity",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "partial" }, finish_reason: null }],
+            },
+            {
+              id: "chatcmpl-partial-connectivity",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
       )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback answer").stop().item())
 
       const result = yield* prompt.loop({ sessionID: session.id })
       expect(result.info.role).toBe("assistant")
-      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("test"))
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("mlx"))
       const inputs = (yield* llm.inputs).filter(
         (input) =>
           (input.model === "test-model" || input.model === "qwen3.8-27b") &&
           !JSON.stringify(input).includes("Generate a title"),
       )
-      expect(inputs.some((input) => input.model === "qwen3.8-27b")).toBe(false)
-      expect(inputs.filter((input) => input.model === "test-model").length).toBeGreaterThan(1)
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+      expect(result.parts.some((part) => part.type === "text" && part.text === "partial")).toBe(false)
     }),
   { config: fallbackProviderCfg("http://localhost:1/v1") },
 )

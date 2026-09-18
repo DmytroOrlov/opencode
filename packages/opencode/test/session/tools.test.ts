@@ -22,6 +22,7 @@ const callID = "call-test"
 const sessionID = SessionID.make("ses_test")
 const messageID = MessageID.ascending()
 const partID = PartID.ascending()
+let executionHook: (() => void) | undefined
 
 const agent: Agent.Info = {
   name: "build",
@@ -82,6 +83,7 @@ const layer = Layer.mergeAll(
             jsonSchema: { type: "object", properties: {} },
             execute: (_args, ctx) =>
               Effect.gen(function* () {
+                executionHook?.()
                 yield* ctx.metadata({ metadata: { output: "first" } })
                 yield* ctx.metadata({ metadata: { output: "second" } })
                 return { title: "timing", metadata: {}, output: "done" }
@@ -96,6 +98,9 @@ const it = testEffect(layer)
 
 it.effect("preserves running tool start time across metadata updates", () =>
   Effect.gen(function* () {
+    const order: string[] = []
+    executionHook = () => order.push("execute")
+    yield* Effect.addFinalizer(() => Effect.sync(() => void (executionHook = undefined)))
     const state: SessionV1.ToolPart = {
       id: partID,
       sessionID,
@@ -133,7 +138,11 @@ it.effect("preserves running tool start time across metadata updates", () =>
           return state
         }),
       completeToolCall: () => Effect.void,
-    } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+      markToolExecutionStarted: () => Effect.sync(() => order.push("mark")),
+    } satisfies Pick<
+      SessionProcessor.Handle,
+      "message" | "updateToolCall" | "completeToolCall" | "markToolExecutionStarted"
+    >
 
     const tools = yield* SessionTools.resolve({
       agent,
@@ -159,6 +168,7 @@ it.effect("preserves running tool start time across metadata updates", () =>
     )
 
     expect(updates).toEqual([100, 100])
+    expect(order).toEqual(["mark", "execute"])
     expect(state.state.status).toBe("running")
     if (state.state.status === "running") {
       expect(state.state.time.start).toBe(100)

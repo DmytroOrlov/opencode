@@ -204,6 +204,7 @@ function fake(
     },
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
+    markToolExecutionStarted: Effect.fn("TestSessionProcessor.markToolExecutionStarted")(() => Effect.void),
     finalizeFailure: Effect.fn("TestSessionProcessor.finalizeFailure")(() => Effect.void),
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
   } satisfies SessionProcessorModule.SessionProcessor.Handle

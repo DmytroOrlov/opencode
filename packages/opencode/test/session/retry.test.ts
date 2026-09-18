@@ -149,6 +149,47 @@ describe("session.retry.delay", () => {
 })
 
 describe("session.retry.retryable", () => {
+  test("prefers fallback for model-attempt errors when available", () => {
+    const errors = [
+      wrap("FailedToOpenSocket"),
+      wrap("fetch failed"),
+      ...[400, 401, 403, 404, 408, 422, 429, 500, 502, 503, 504].map((statusCode) =>
+        Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+          new SessionV1.APIError({ message: `HTTP ${statusCode}`, statusCode, isRetryable: false }).toObject(),
+        ),
+      ),
+      wrap("provider rejected the request"),
+      wrap("unknown model stream failure"),
+    ]
+
+    for (const error of errors) expect(SessionRetry.classify(error, retryProvider, true)).toBe("failover")
+  })
+
+  test("keeps retry and terminal classification when fallback is unavailable", () => {
+    const retryableError = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({ message: "Service unavailable", statusCode: 503, isRetryable: false }).toObject(),
+    )
+    const rateLimitError = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({ message: "Rate limited", statusCode: 429, isRetryable: false }).toObject(),
+    )
+    const terminalError = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({ message: "Bad request", statusCode: 400, isRetryable: false }).toObject(),
+    )
+
+    expect(SessionRetry.classify(wrap("fetch failed"), retryProvider, false)).toBe("retry")
+    expect(SessionRetry.classify(retryableError, retryProvider, false)).toBe("retry")
+    expect(SessionRetry.classify(rateLimitError, retryProvider, false)).toBe("retry")
+    expect(SessionRetry.classify(terminalError, retryProvider, false)).toBe("terminal")
+    expect(SessionRetry.classify(wrap("unknown model stream failure"), retryProvider, false)).toBe("terminal")
+  })
+
+  test("does not fail over abort or context overflow errors", () => {
+    const aborted = new SessionV1.AbortedError({ message: "Aborted" }).toObject()
+    const overflow = new SessionV1.ContextOverflowError({ message: "overflow" }).toObject()
+    expect(SessionRetry.classify(aborted, retryProvider, true)).toBe("terminal")
+    expect(SessionRetry.classify(overflow, retryProvider, true)).toBe("terminal")
+  })
+
   test("classifies transport failures for immediate failover only when available", () => {
     const transport = wrap("fetch failed")
     expect(SessionRetry.classify(transport, retryProvider, true)).toBe("failover")
@@ -187,7 +228,7 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.classify(error, retryProvider, true)).toBe("failover")
   })
 
-  test("keeps transient HTTP responses on the same-provider retry path", () => {
+  test("fails over transient HTTP responses when fallback is available", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
       new SessionV1.APIError({
         message: "Service unavailable",
@@ -195,7 +236,8 @@ describe("session.retry.retryable", () => {
         statusCode: 503,
       }).toObject(),
     )
-    expect(SessionRetry.classify(error, retryProvider, true)).toBe("retry")
+    expect(SessionRetry.classify(error, retryProvider, true)).toBe("failover")
+    expect(SessionRetry.classify(error, retryProvider, false)).toBe("retry")
   })
 
   test("retries serialized too_many_requests messages", () => {

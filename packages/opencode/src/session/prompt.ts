@@ -1408,6 +1408,13 @@ const layer = Layer.effect(
                 outcome = "break"
                 break
               }
+              if (result.mode === "continue") {
+                fallbackUsed = true
+                active = FIXED_FALLBACK
+                yield* instruction.clear(msg.id)
+                outcome = "continue"
+                break
+              }
               fallbackUsed = true
               active = FIXED_FALLBACK
               attemptRef = FIXED_FALLBACK

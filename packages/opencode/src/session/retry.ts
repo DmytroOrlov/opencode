@@ -175,9 +175,10 @@ export function isTransportFailure(error: Err) {
 }
 
 export function classify(error: Err, provider: string, failoverAvailable = false): FailureAction {
+  if (SessionV1.ContextOverflowError.isInstance(error) || SessionV1.AbortedError.isInstance(error)) return "terminal"
+  if (failoverAvailable) return "failover"
   const retry = retryable(error, provider)
   if (!retry) return "terminal"
-  if (failoverAvailable && isTransportFailure(error)) return "failover"
   return "retry"
 }
 
@@ -211,6 +212,7 @@ export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
   failover?: () => boolean
+  canRetry?: () => boolean
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
@@ -218,7 +220,7 @@ export function policy(opts: {
       const error = opts.parse(meta.input)
       const retry = retryable(error, opts.provider)
       const action = classify(error, opts.provider, opts.failover?.() === true)
-      if (action !== "retry" || !retry) return Cause.done(meta.attempt)
+      if (action !== "retry" || !retry || opts.canRetry?.() === false) return Cause.done(meta.attempt)
       if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
