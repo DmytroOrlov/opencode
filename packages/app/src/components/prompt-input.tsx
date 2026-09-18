@@ -1665,7 +1665,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                           props.controls.agents.select(value)
                           restoreFocus()
                         }}
-                        class="capitalize max-w-[160px] text-text-base"
+                        class="capitalize max-w-[160px] text-text-base !px-0"
                         valueClass="truncate text-13-regular text-text-base"
                         triggerStyle={control()}
                         triggerProps={{ "data-action": "prompt-agent" }}
@@ -1694,7 +1694,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                               as="div"
                               variant="ghost"
                               size="normal"
-                              class="min-w-0 max-w-[320px] text-13-regular text-text-base group"
+                              class="min-w-0 max-w-[320px] text-13-regular text-text-base group !px-0"
                               style={control()}
                               onClick={() => {
                                 dialog.show(() => <DialogSelectModelUnpaid model={props.controls.model.selection} />)
@@ -1730,7 +1730,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                                 variant="ghost"
                                 size="normal"
                                 style={control()}
-                                class="min-w-0 max-w-[320px] text-13-regular text-text-base group"
+                                class="min-w-0 max-w-[320px] text-13-regular text-text-base group !px-0"
                                 data-action="prompt-model"
                               >
                                 <Show when={props.controls.model.selection.current()?.provider?.id}>
@@ -1772,7 +1772,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                               props.controls.model.selection.variant.set(value === "default" ? undefined : value)
                               restoreFocus()
                             }}
-                            class="capitalize max-w-[160px] text-text-base"
+                            class="capitalize max-w-[160px] text-text-base !px-0"
                             valueClass="truncate text-13-regular text-text-base"
                             triggerStyle={control()}
                             triggerProps={{ "data-action": "prompt-model-variant" }}
