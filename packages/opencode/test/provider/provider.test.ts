@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test"
 import { mkdir, unlink } from "fs/promises"
 import path from "path"
+import { pathToFileURL } from "url"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { Effect, Layer } from "effect"
@@ -2115,4 +2116,85 @@ it.effect("opencode loader keeps paid models when auth exists", () =>
     expect(none).toBe(0)
     expect(keyedCount).toBeGreaterThan(0)
   }).pipe(provideMultiInstance),
+)
+
+// ---------------------------------------------------------------------------
+// Effective endpoint (telemetry source of truth) + SDK constructor sanitization
+// ---------------------------------------------------------------------------
+
+const captureSDK = pathToFileURL(path.join(import.meta.dir, "fixtures/capture-provider-sdk.ts")).href
+const capturedSDKOptions = () => (globalThis as any).__capturedProviderSDKOptions as Record<string, any> | undefined
+
+const captureProviderConfig = (api: string) => ({
+  enabled_providers: ["capture"],
+  provider: {
+    capture: {
+      name: "Capture",
+      npm: captureSDK,
+      api,
+      env: [],
+      models: { "m-1": { name: "M1", limit: { context: 8000, output: 2000 } } },
+      // Deliberately NO options.baseURL: the endpoint must resolve through the
+      // provider/model API config path that telemetry dispatch follows.
+      options: { apiKey: "dispatch-key", mlxTelemetry: true },
+    },
+  },
+})
+
+it.instance(
+  "getEndpoint reuses the dispatch-resolved provider API endpoint",
+  () =>
+    Effect.gen(function* () {
+      const provider = yield* Provider.Service
+      const model = yield* provider.getModel(ProviderV2.ID.make("capture"), ModelV2.ID.make("m-1"))
+      // No options.baseURL is configured; the effective endpoint comes from
+      // provider.api exactly as provider dispatch will use it.
+      const endpoint = yield* provider.getEndpoint(model)
+      expect(endpoint).toBe("https://api.dispatch.test/v1")
+      const info = yield* provider.getProvider(ProviderV2.ID.make("capture"))
+      expect(info.options.baseURL).toBeUndefined()
+    }),
+  { config: captureProviderConfig("https://api.dispatch.test/v1") },
+)
+
+it.instance(
+  "getEndpoint applies env ${VAR} substitution through the production path",
+  () =>
+    Effect.gen(function* () {
+      yield* set("CAPTURE_TEST_HOST", "sub.example.com")
+      const provider = yield* Provider.Service
+      const model = yield* provider.getModel(ProviderV2.ID.make("capture"), ModelV2.ID.make("m-1"))
+      expect(yield* provider.getEndpoint(model)).toBe("https://sub.example.com/v1")
+      // Dispatch resolves through the same helper: constructing the SDK
+      // applies the substituted endpoint to the factory options.
+      ;(globalThis as any).__capturedProviderSDKOptions = undefined
+      yield* provider.getLanguage(model)
+      expect(capturedSDKOptions()?.baseURL).toBe("https://sub.example.com/v1")
+    }),
+  { config: captureProviderConfig("https://${CAPTURE_TEST_HOST}/v1") },
+)
+
+it.instance(
+  "SDK constructor options never receive the backend-only mlxTelemetry flag",
+  () =>
+    Effect.gen(function* () {
+      const provider = yield* Provider.Service
+      const model = yield* provider.getModel(ProviderV2.ID.make("capture"), ModelV2.ID.make("m-1"))
+      // The backend gate keeps the strict boolean true so LLM telemetry still
+      // attaches.
+      const info = yield* provider.getProvider(ProviderV2.ID.make("capture"))
+      expect(info.options.mlxTelemetry).toBe(true)
+      ;(globalThis as any).__capturedProviderSDKOptions = undefined
+      yield* provider.getLanguage(model)
+      const options = capturedSDKOptions()
+      expect(options).toBeDefined()
+      // The SDK factory was invoked with a sanitized copy: the flag is gone,
+      // the resolved endpoint and auth survive.
+      expect("mlxTelemetry" in (options ?? {})).toBe(false)
+      expect(options?.baseURL).toBe("https://api.dispatch.test/v1")
+      expect(options?.apiKey).toBe("dispatch-key")
+      // Original provider config is untouched for the backend gate.
+      expect((yield* provider.getProvider(ProviderV2.ID.make("capture"))).options.mlxTelemetry).toBe(true)
+    }),
+  { config: captureProviderConfig("https://api.dispatch.test/v1") },
 )

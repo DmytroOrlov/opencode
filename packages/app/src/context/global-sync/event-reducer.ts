@@ -11,6 +11,7 @@ import type {
   Todo,
 } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
+import type { GenerationTelemetrySnapshot } from "@opencode-ai/session-ui/generation-telemetry"
 import type { State, VcsCache } from "./types"
 import { trimSessions } from "./session-trim"
 import { dropSessionCaches } from "./session-cache"
@@ -27,6 +28,7 @@ const SESSION_CONTENT_EVENTS = new Set([
   "message.part.updated",
   "message.part.removed",
   "message.part.delta",
+  "session.telemetry",
   "permission.asked",
   "permission.replied",
   "question.asked",
@@ -267,6 +269,38 @@ export function applyDirectoryEvent(input: {
     case "session.status": {
       const props = event.properties as { sessionID: string; status: SessionStatus }
       input.setStore("session_status", props.sessionID, reconcile(props.status))
+      break
+    }
+    case "session.telemetry": {
+      // The generated SDK event union does not include this non-durable event yet; narrow at the boundary.
+      const props = event.properties as {
+        sessionID: string
+        assistantMessageID: string
+        phase: GenerationTelemetrySnapshot["phase"]
+        processed?: number
+        total?: number
+        tokensPerSecond?: number
+        done?: boolean
+        source?: GenerationTelemetrySnapshot["source"]
+        approximate?: boolean
+      }
+      if (!props.sessionID || !props.assistantMessageID) break
+      input.setStore(
+        "generation_telemetry",
+        props.sessionID,
+        (current) => ({
+          ...current,
+          [props.assistantMessageID]: {
+            phase: props.phase,
+            processed: props.processed,
+            total: props.total,
+            tokensPerSecond: props.tokensPerSecond,
+            done: props.done,
+            source: props.source,
+            approximate: props.approximate,
+          },
+        }),
+      )
       break
     }
     case "message.updated": {

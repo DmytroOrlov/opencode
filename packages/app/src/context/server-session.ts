@@ -12,6 +12,7 @@ import type {
   Todo,
 } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
+import type { GenerationTelemetrySnapshot } from "@opencode-ai/session-ui/generation-telemetry"
 import { batch } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { message as cleanMessage } from "@/utils/diffs"
@@ -204,6 +205,7 @@ export function createServerSession(
     session_message: {} as Record<string, SessionMessageInfo[]>,
     part: {} as Record<string, Part[]>,
     part_text_accum_delta: {} as Record<string, string>,
+    generation_telemetry: {} as Record<string, Record<string, GenerationTelemetrySnapshot>>,
     session_working(id: string) {
       return (this.session_status[id]?.type ?? "idle") !== "idle"
     },
@@ -1025,6 +1027,34 @@ export function createServerSession(
       case "session.status": {
         const props = event.properties as { sessionID: string; status: SessionStatus }
         setData("session_status", props.sessionID, reconcile(props.status))
+        return
+      }
+      case "session.telemetry": {
+        // The generated SDK event union does not include this non-durable event yet; narrow at the boundary.
+        const props = event.properties as {
+          sessionID: string
+          assistantMessageID: string
+          phase: GenerationTelemetrySnapshot["phase"]
+          processed?: number
+          total?: number
+          tokensPerSecond?: number
+          done?: boolean
+          source?: GenerationTelemetrySnapshot["source"]
+          approximate?: boolean
+        }
+        if (!props.sessionID || !props.assistantMessageID) return
+        setData("generation_telemetry", props.sessionID, (current) => ({
+          ...current,
+          [props.assistantMessageID]: {
+            phase: props.phase,
+            processed: props.processed,
+            total: props.total,
+            tokensPerSecond: props.tokensPerSecond,
+            done: props.done,
+            source: props.source,
+            approximate: props.approximate,
+          },
+        }))
         return
       }
       case "message.updated": {

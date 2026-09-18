@@ -83,6 +83,7 @@ const baseState = (input: Partial<State> = {}) =>
     session_message: {},
     part: {},
     part_text_accum_delta: {},
+    generation_telemetry: {},
     ...input,
   }) as State
 
@@ -135,6 +136,100 @@ describe("applyGlobalEvent", () => {
 })
 
 describe("applyDirectoryEvent", () => {
+  test("stores session.telemetry snapshots per assistant message", () => {
+    const [store, setStore] = createStore(baseState())
+
+    applyDirectoryEvent({
+      event: {
+        type: "session.telemetry",
+        properties: { sessionID: "ses_1", assistantMessageID: "msg_a", phase: "decode", tokensPerSecond: 21.84 },
+      },
+      store,
+      setStore,
+      push() {},
+      directory: "/tmp",
+      loadLsp() {},
+    })
+    applyDirectoryEvent({
+      event: {
+        type: "session.telemetry",
+        properties: { sessionID: "ses_1", assistantMessageID: "msg_b", phase: "prefill", processed: 379, total: 1000 },
+      },
+      store,
+      setStore,
+      push() {},
+      directory: "/tmp",
+      loadLsp() {},
+    })
+
+    expect(store.generation_telemetry.ses_1?.msg_a).toEqual({
+      phase: "decode",
+      processed: undefined,
+      total: undefined,
+      tokensPerSecond: 21.84,
+      done: undefined,
+    })
+    expect(store.generation_telemetry.ses_1?.msg_b).toEqual({
+      phase: "prefill",
+      processed: 379,
+      total: 1000,
+      tokensPerSecond: undefined,
+      done: undefined,
+    })
+  })
+
+  test("keeps done session.telemetry snapshots", () => {
+    const [store, setStore] = createStore(baseState())
+
+    applyDirectoryEvent({
+      event: {
+        type: "session.telemetry",
+        properties: { sessionID: "ses_1", assistantMessageID: "msg_a", phase: "decode", tokensPerSecond: 30, done: true },
+      },
+      store,
+      setStore,
+      push() {},
+      directory: "/tmp",
+      loadLsp() {},
+    })
+
+    expect(store.generation_telemetry.ses_1?.msg_a?.done).toBe(true)
+    expect(store.generation_telemetry.ses_1?.msg_a?.tokensPerSecond).toBe(30)
+  })
+
+  test("carries source and approximate metadata through session.telemetry snapshots", () => {
+    const [store, setStore] = createStore(baseState())
+
+    applyDirectoryEvent({
+      event: {
+        type: "session.telemetry",
+        properties: {
+          sessionID: "ses_1",
+          assistantMessageID: "msg_c",
+          phase: "decode",
+          tokensPerSecond: 21.8,
+          approximate: true,
+          source: "fallback",
+        },
+      },
+      store,
+      setStore,
+      push() {},
+      directory: "/tmp",
+      loadLsp() {},
+    })
+
+    expect(store.generation_telemetry.ses_1?.msg_c).toEqual({
+      phase: "decode",
+      processed: undefined,
+      total: undefined,
+      tokensPerSecond: 21.8,
+      done: undefined,
+      source: "fallback",
+      approximate: true,
+    })
+  })
+
   test("initializes text delta accumulation from the current part text", () => {
     const part = { ...textPart("part", "session", "message"), text: "existing" }
     const [store, setStore] = createStore(baseState({ part: { message: [part] } }))

@@ -656,11 +656,27 @@ export const Error = define({
   },
 })
 
+export const Telemetry = define({
+  type: "session.telemetry",
+  schema: {
+    sessionID: SessionID,
+    assistantMessageID: MessageID,
+    phase: Schema.Literals(["prefill", "decode"]),
+    processed: optional(Schema.Finite),
+    total: optional(Schema.Finite),
+    tokensPerSecond: optional(Schema.Finite),
+    done: optional(Schema.Boolean),
+    source: optional(Schema.Literals(["provider", "fallback"])),
+    approximate: optional(Schema.Boolean),
+  },
+})
+
 export const Event = {
   ...events,
   PartDelta,
   Diff,
   Error,
+  Telemetry,
   Definitions: inventory(
     events.Created,
     events.Updated,

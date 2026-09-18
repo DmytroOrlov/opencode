@@ -1606,6 +1606,53 @@ describe("server session", () => {
     expect(ctx.get).toEqual([])
   })
 
+  test("projects session.telemetry snapshots with source and approximate", () => {
+    const ctx = setup({})
+    ctx.store.apply({ type: "session.created", properties: { sessionID: "root", info: session("root") } })
+    ctx.store.apply({
+      type: "session.telemetry",
+      properties: {
+        sessionID: "root",
+        assistantMessageID: "msg_a",
+        phase: "decode",
+        tokensPerSecond: 42.5,
+        done: true,
+        source: "fallback",
+        approximate: true,
+      },
+    })
+    ctx.store.apply({
+      type: "session.telemetry",
+      properties: {
+        sessionID: "root",
+        assistantMessageID: "msg_b",
+        phase: "prefill",
+        processed: 370,
+        total: 1000,
+        source: "provider",
+      },
+    })
+
+    expect(ctx.store.data.generation_telemetry.root?.msg_a).toEqual({
+      phase: "decode",
+      processed: undefined,
+      total: undefined,
+      tokensPerSecond: 42.5,
+      done: true,
+      source: "fallback",
+      approximate: true,
+    })
+    expect(ctx.store.data.generation_telemetry.root?.msg_b).toEqual({
+      phase: "prefill",
+      processed: 370,
+      total: 1000,
+      tokensPerSecond: undefined,
+      done: undefined,
+      source: "provider",
+      approximate: undefined,
+    })
+  })
+
   test("preserves pinned session content under server-wide cache pressure", () => {
     const ctx = setup({})
     ctx.store.pin("active")
