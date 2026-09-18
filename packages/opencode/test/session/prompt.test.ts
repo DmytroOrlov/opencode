@@ -52,7 +52,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -298,6 +298,49 @@ function providerCfg(url: string) {
           ...cfg.provider.test.options,
           baseURL: url,
         },
+      },
+    },
+  }
+}
+
+function fallbackProviderCfg(url: string) {
+  const base = providerCfg(url)
+  const fallback = {
+    ...base.provider.test,
+    id: "mlx",
+    name: "MLX",
+    models: {
+      "qwen3.8-27b": {
+        ...cfg.provider.test.models["test-model"],
+        id: "qwen3.8-27b",
+        name: "Qwen 3.8 27B",
+        reasoning: true,
+        variants: { xhigh: { reasoningEffort: "xhigh" } },
+      },
+    },
+  }
+  return {
+    ...providerCfg(url),
+    provider: {
+      ...base.provider,
+      mlx: fallback,
+    },
+  }
+}
+
+function fallbackRemoteDownCfg(url: string) {
+  const base = fallbackProviderCfg(url)
+  return {
+    ...base,
+    provider: {
+      ...base.provider,
+      test: {
+        ...base.provider.test,
+        options: { ...base.provider.test.options, baseURL: "http://127.0.0.1:1/v1" },
+      },
+      mlx: {
+        ...base.provider.mlx,
+        options: { ...base.provider.mlx.options, baseURL: url },
       },
     },
   }
@@ -781,6 +824,143 @@ it.instance("static loop returns assistant text through local provider", () =>
   }),
 )
 
+it.instance(
+  "fails over on the same assistant message and routes the active variant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Fallback provider",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback me" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-primary-transport",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      if (result.info.role !== "assistant") throw new Error("expected assistant message")
+      expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+      expect(result.info.modelID).toBe(ModelV2.ID.make("qwen3.8-27b"))
+      expect(result.info.variant).toBe("xhigh")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "fallback answer")).toBe(true)
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+      expect(JSON.stringify(inputs[1])).toContain("xhigh")
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "fails over immediately on a primary connectivity failure",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      const statuses: SessionStatus.Info[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+        const data = event.data as typeof SessionStatus.Event.Status.data.Type
+        if (data.sessionID === session.id) statuses.push(data.status)
+        return Effect.void
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback on network loss" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-connectivity",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("local answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      yield* off
+      expect(result.info.role).toBe("assistant")
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+      expect(JSON.stringify(inputs[1])).toContain("xhigh")
+      expect(statuses.some((status) => status.type === "retry")).toBe(false)
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "discards failed connectivity telemetry before local fallback telemetry starts",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackRemoteDownCfg)
+      const events = yield* EventV2Bridge.Service
+      const telemetry: { assistantMessageID?: string; done?: boolean; source?: string }[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type === SessionV1.Event.Telemetry.type) {
+          telemetry.push(event.data as { assistantMessageID?: string; done?: boolean; source?: string })
+        }
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => off)
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback telemetry" }],
+      })
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("local answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      yield* Effect.sleep("100 millis")
+      const current = telemetry.filter((item) => item.assistantMessageID === result.info.id)
+      expect(current.filter((item) => item.done === false).length).toBeGreaterThanOrEqual(2)
+      expect(current.filter((item) => item.done === true)).toHaveLength(0)
+    }),
+  { config: fallbackRemoteDownCfg("http://localhost:1/v1") },
+)
+
 it.instance("static loop consumes queued replies across turns", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -820,6 +1000,229 @@ it.instance("static loop consumes queued replies across turns", () =>
     expect(yield* llm.hits).toHaveLength(2)
     expect(yield* llm.pending).toBe(0)
   }),
+)
+
+it.instance(
+  "keeps the fallback model sticky across a tool step",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Sticky fallback",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "use a tool" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-sticky-transport",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().tool("first", { value: "first" }).item())
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("sticky answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b", "qwen3.8-27b"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "does not fail over a terminal HTTP 400 even when fallback is available",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "do not use fallback for HTTP 400" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(400, { error: { message: "primary unavailable" } }),
+      )
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.providerID).toBe(ProviderV2.ID.make("test"))
+        expect(result.info.error).toBeDefined()
+      }
+      expect(
+        (yield* llm.inputs).filter(
+          (input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"),
+        ),
+      ).toHaveLength(1)
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "keeps retrying the primary when connectivity fails without a fallback",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "retry network failure" }],
+      })
+      yield* llm.fail("fetch failed")
+      yield* llm.text("primary recovered")
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("test"))
+      expect(
+        (yield* llm.inputs).filter(
+          (input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"),
+        ),
+      ).toHaveLength(2)
+    }),
+  { config: providerCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "keeps retryable HTTP 503 and 429 failures on the primary",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "retry transient HTTP failures" }],
+      })
+      yield* llm.push(
+        httpError(503, { error: { message: "service unavailable" } }),
+        httpError(429, { error: { message: "rate limited" } }),
+        reply().text("primary recovered").stop().item(),
+      )
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("test"))
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "test-model", "test-model"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "does not fail over after a connectivity failure has committed text",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "do not fail over after output" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        reply().text("partial").streamError("fetch failed").item(),
+      )
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("test"))
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.some((input) => input.model === "qwen3.8-27b")).toBe(false)
+      expect(inputs.filter((input) => input.model === "test-model").length).toBeGreaterThan(1)
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "does not retry a failed fallback or fall back recursively",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback failure" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-no-recursive-primary",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "qwen3.8-27b",
+        httpError(400, { error: { message: "fallback unavailable" } }),
+      )
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+        expect(result.info.modelID).toBe(ModelV2.ID.make("qwen3.8-27b"))
+        expect(result.info.error).toBeDefined()
+      }
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
 )
 
 it.instance("loop continues when finish is tool-calls", () =>

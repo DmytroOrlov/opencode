@@ -149,6 +149,55 @@ describe("session.retry.delay", () => {
 })
 
 describe("session.retry.retryable", () => {
+  test("classifies transport failures for immediate failover only when available", () => {
+    const transport = wrap("fetch failed")
+    expect(SessionRetry.classify(transport, retryProvider, true)).toBe("failover")
+    expect(SessionRetry.classify(transport, retryProvider, false)).toBe("retry")
+  })
+
+  test("preserves and classifies Bun FailedToOpenSocket APICallErrors", () => {
+    const error = new APICallError({
+      message: "Cannot connect to API: Was there a typo in the url or port?",
+      url: "http://remote.invalid/v1/chat/completions",
+      requestBodyValues: {},
+      isRetryable: true,
+      cause: {
+        code: "FailedToOpenSocket",
+        message: "Was there a typo in the url or port?",
+      },
+    })
+    const parsed = MessageV2.fromError(error, { providerID })
+    expect(SessionV1.APIError.isInstance(parsed)).toBe(true)
+    if (!SessionV1.APIError.isInstance(parsed)) throw new Error("expected APIError")
+    expect(parsed.data.metadata).toMatchObject({
+      url: "http://remote.invalid/v1/chat/completions",
+      code: "FailedToOpenSocket",
+      message: "Was there a typo in the url or port?",
+    })
+    expect(SessionRetry.classify(parsed, retryProvider, true)).toBe("failover")
+  })
+
+  test("classifies the Bun connection message when no cause code is available", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Cannot connect to API: Was there a typo in the url or port?",
+        isRetryable: true,
+      }).toObject(),
+    )
+    expect(SessionRetry.classify(error, retryProvider, true)).toBe("failover")
+  })
+
+  test("keeps transient HTTP responses on the same-provider retry path", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Service unavailable",
+        isRetryable: false,
+        statusCode: 503,
+      }).toObject(),
+    )
+    expect(SessionRetry.classify(error, retryProvider, true)).toBe("retry")
+  })
+
   test("retries serialized too_many_requests messages", () => {
     const error = wrap(JSON.stringify({ type: "error", error: { type: "too_many_requests" } }))
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Too Many Requests" })

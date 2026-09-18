@@ -4,7 +4,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Exit, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
@@ -474,23 +474,21 @@ const live: Layer.Layer<
                 })
               : undefined
 
-            // One composite finalizer, installed BEFORE entering run() so
-            // setup failures and cancellations still tear telemetry down:
-            // provider telemetry flushes first and gets the chance to mark
-            // this attempt decode-accepted BEFORE the fallback decides
-            // whether it may emit a terminal snapshot. Both legs are
-            // idempotent, so guardAttempt's early provider finalize cannot
-            // double-close with this one.
-            yield* Effect.addFinalizer(() =>
-              Effect.sync(MLXTelemetry.finalizeAttempt(telemetry, fallback)).pipe(Effect.ignore),
+            const result = yield* run({ ...input, abort: ctrl.signal, telemetry, bridge }).pipe(
+              MLXTelemetry.guardAttempt(telemetry, fallback),
             )
 
-            const result = yield* run({ ...input, abort: ctrl.signal, telemetry, bridge }).pipe(
-              MLXTelemetry.guardAttempt(telemetry),
-            )
+            const teardown = (exit: Exit.Exit<unknown, unknown>) =>
+              Effect.sync(
+                Exit.isSuccess(exit)
+                  ? MLXTelemetry.finalizeAttempt(telemetry, fallback)
+                  : MLXTelemetry.discardAttempt(telemetry, fallback),
+              ).pipe(Effect.ignore)
 
             const tracked = (stream: Stream.Stream<LLMEvent, unknown>) =>
-              fallback ? stream.pipe(Stream.map((event) => (fallback.push(event), event))) : stream
+              (fallback ? stream.pipe(Stream.map((event) => (fallback.push(event), event))) : stream).pipe(
+                Stream.onExit(teardown),
+              )
 
             if (result.type === "native") return tracked(result.stream)
 

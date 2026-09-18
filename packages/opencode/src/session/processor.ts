@@ -27,7 +27,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 
 const DOOM_LOOP_THRESHOLD = 3
-export type Result = "compact" | "stop" | "continue"
+export type Result = "compact" | "stop" | "continue" | { type: "failover"; error: unknown }
 
 export interface Handle {
   readonly message: SessionV1.Assistant
@@ -44,6 +44,7 @@ export interface Handle {
       attachments?: SessionV1.FilePart[]
     },
   ) => Effect.Effect<void>
+  readonly finalizeFailure: (error: unknown) => Effect.Effect<void>
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
 }
 
@@ -51,6 +52,7 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  failoverAvailable?: boolean
 }
 
 export interface Interface {
@@ -72,6 +74,7 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  committed: boolean
 }
 
 type StreamEvent = LLMEvent
@@ -111,6 +114,7 @@ const layer = Layer.effect(
         needsCompaction: false,
         currentText: undefined,
         reasoningMap: {},
+        committed: false,
       }
       let aborted = false
 
@@ -292,6 +296,7 @@ const layer = Layer.effect(
             return
 
           case "reasoning-delta":
+            if (value.text.length > 0) ctx.committed = true
             // Match dev: silently drop orphan deltas (no preceding reasoning-start).
             if (!(value.id in ctx.reasoningMap)) return
             ctx.reasoningMap[value.id].text += value.text
@@ -313,6 +318,7 @@ const layer = Layer.effect(
             return
 
           case "tool-input-start":
+            ctx.committed = true
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
@@ -320,15 +326,18 @@ const layer = Layer.effect(
             return
 
           case "tool-input-delta":
+            ctx.committed = true
             yield* ensureToolCall(value)
             return
 
           case "tool-input-end": {
+            ctx.committed = true
             yield* ensureToolCall(value)
             return
           }
 
           case "tool-call": {
+            ctx.committed = true
             if (ctx.assistantMessage.summary) {
               throw new Error(`Tool call not allowed while generating summary: ${value.name}`)
             }
@@ -381,6 +390,7 @@ const layer = Layer.effect(
           }
 
           case "tool-result": {
+            ctx.committed = true
             const toolCall = yield* readToolCall(value.id)
             if (!toolCall && value.result.type === "error") return
             if (value.result.type === "error") {
@@ -414,6 +424,7 @@ const layer = Layer.effect(
           }
 
           case "tool-error": {
+            ctx.committed = true
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }
@@ -433,6 +444,7 @@ const layer = Layer.effect(
             return
 
           case "step-finish": {
+            ctx.committed = true
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
             // Anthropic reports thinking blocks it removed before the model saw the
@@ -511,6 +523,7 @@ const layer = Layer.effect(
             return
 
           case "text-delta":
+            if (value.text.length > 0) ctx.committed = true
             if (!ctx.currentText) return
             ctx.currentText.text += value.text
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
@@ -610,6 +623,27 @@ const layer = Layer.effect(
         yield* session.updateMessage(ctx.assistantMessage)
       })
 
+      const rollback = Effect.fn("SessionProcessor.rollback")(function* (baseline: Set<string>) {
+        if (ctx.snapshot) ctx.snapshot = undefined
+        const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        yield* Effect.forEach(
+          parts.filter((part) => !baseline.has(part.id)),
+          (part) =>
+            session.removePart({
+              sessionID: part.sessionID,
+              messageID: part.messageID,
+              partID: part.id,
+            }),
+        )
+        ctx.currentText = undefined
+        ctx.reasoningMap = {}
+        ctx.toolcalls = {}
+        ctx.needsCompaction = false
+        ctx.blocked = false
+      })
+
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
         yield* Effect.logError("process", {
           "session.id": input.sessionID,
@@ -644,7 +678,14 @@ const layer = Layer.effect(
           messageID: input.assistantMessage.id,
         })
         ctx.needsCompaction = false
+        ctx.committed = false
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        const baseline = new Set(
+          (yield* MessageV2.parts(ctx.assistantMessage.id).pipe(Effect.provideService(Database.Service, database))).map(
+            (part) => part.id,
+          ),
+        )
+        let failover: { error: unknown } | undefined
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -675,6 +716,7 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
+                failover: () => input.failoverAvailable === true && !ctx.committed,
                 set: (info) => {
                   return status.set(ctx.sessionID, {
                     type: "retry",
@@ -686,14 +728,47 @@ const layer = Layer.effect(
                 },
               }),
             ),
-            Effect.catch(halt),
-            Effect.ensuring(cleanup()),
+            Effect.catch((error) => {
+              const parsed = parse(error)
+              const action = SessionRetry.classify(
+                parsed,
+                input.model.providerID,
+                input.failoverAvailable === true && !ctx.committed,
+              )
+              if (
+                action === "failover" &&
+                !aborted &&
+                !ctx.committed &&
+                !ctx.needsCompaction &&
+                !ctx.blocked &&
+                !SessionV1.ContextOverflowError.isInstance(parsed)
+              ) {
+                failover = { error }
+                return Effect.void
+              }
+              return halt(error)
+            }),
+            Effect.ensuring(
+              Effect.gen(function* () {
+                if (failover) {
+                  yield* rollback(baseline)
+                  return
+                }
+                yield* cleanup()
+              }),
+            ),
           )
 
           if (ctx.needsCompaction) return "compact"
+          if (failover) return { type: "failover", error: failover.error } as const
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
         })
+      })
+
+      const finalizeFailure = Effect.fn("SessionProcessor.finalizeFailure")(function* (error: unknown) {
+        yield* halt(error)
+        yield* cleanup()
       })
 
       return {
@@ -702,6 +777,7 @@ const layer = Layer.effect(
         },
         updateToolCall,
         completeToolCall,
+        finalizeFailure,
         process,
       } satisfies Handle
     })

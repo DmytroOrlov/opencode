@@ -34,11 +34,14 @@ const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
   /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
   /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/i,
-  /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/i,
+  /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout|cannot connect to api|was there a typo in the url or port/i,
   /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i,
   /try your request again|retry your request|resource exhausted|resource_exhausted/i,
   /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
+  /unable to connect|cannot connect to api|was there a typo in the url or port|host unreachable|network is unreachable|network unavailable|name resolution|could not resolve|no such host|headers timed out|header timeout/i,
 ]
+
+export type FailureAction = "retry" | "failover" | "terminal"
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
@@ -154,6 +157,30 @@ export function retryable(error: Err, provider: string) {
   return undefined
 }
 
+export function isTransportFailure(error: Err) {
+  if (SessionV1.APIError.isInstance(error)) {
+    // An HTTP response, including a transient 5xx response, is not a
+    // connectivity failure. Only errors without a response status can bypass
+    // the same-provider retry schedule.
+    if (error.data.statusCode !== undefined) return false
+    const code = error.data.metadata?.code
+    const metadataMessage = error.data.metadata?.message
+    return (
+      transportCode(code) || matchesTransportMessage(error.data.message) || matchesTransportMessage(metadataMessage)
+    )
+  }
+
+  const message = isRecord(error.data) ? error.data.message : undefined
+  return matchesTransportMessage(message)
+}
+
+export function classify(error: Err, provider: string, failoverAvailable = false): FailureAction {
+  const retry = retryable(error, provider)
+  if (!retry) return "terminal"
+  if (failoverAvailable && isTransportFailure(error)) return "failover"
+  return "retry"
+}
+
 function matchesRetryableMessage(value: unknown) {
   return typeof value === "string" && RETRYABLE_MESSAGE_PATTERNS.some((pattern) => pattern.test(value))
 }
@@ -183,13 +210,15 @@ function parseJSON(value: unknown) {
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
+  failover?: () => boolean
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
       const error = opts.parse(meta.input)
       const retry = retryable(error, opts.provider)
-      if (!retry) return Cause.done(meta.attempt)
+      const action = classify(error, opts.provider, opts.failover?.() === true)
+      if (action !== "retry" || !retry) return Cause.done(meta.attempt)
       if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
       return Effect.gen(function* () {
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
@@ -203,6 +232,24 @@ export function policy(opts: {
         return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
       })
     }),
+  )
+}
+
+function transportCode(value: string | undefined) {
+  return (
+    typeof value === "string" &&
+    /^(?:failedtoopensocket|econnrefused|econnreset|enotfound|eai_again|etimedout|ehostunreach|enetunreach|providerheadertimeouterror)$/i.test(
+      value,
+    )
+  )
+}
+
+function matchesTransportMessage(value: unknown) {
+  return (
+    typeof value === "string" &&
+    /unable to connect|cannot connect to api|was there a typo in the url or port|host unreachable|network is unreachable|network unavailable|name resolution|could not resolve|no such host|headers timed out|header timeout|fetch failed|failed to fetch|network[-_\s]?error|connection error|connection refused|connection reset|connection lost|socket connection|socket hang up|terminated|getaddrinfo|econnrefused|econnreset|enotfound|eai_again|etimedout/i.test(
+      value,
+    )
   )
 }
 

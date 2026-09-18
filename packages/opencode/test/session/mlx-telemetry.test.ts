@@ -689,6 +689,22 @@ test("guardAttempt finalizes the held attempt only when setup fails", async () =
   expect(finalized).toBe(1)
 })
 
+test("discard closes mlx attribution without freezing a terminal rate", async () => {
+  const server = await startMlx()
+  const sink = collect()
+  const attempt = await attach(server, "msg_discard", sink)
+  expect(attempt).toBeDefined()
+  server.push(round("discarded", 0, 100, 500))
+  server.push(round("discarded", 1, 10, 100))
+  await waitFor(() => rates(sink.snapshots).length > 0)
+  attempt!.discard?.()
+  attempt!.finalize()
+  expect(sink.snapshots.some((item) => item.done === true)).toBe(false)
+  server.push(round("discarded", 2, 10, 100))
+  await settle(300)
+  expect(sink.snapshots.some((item) => item.done === true)).toBe(false)
+})
+
 test("teardown arbitration: pending provider sample beats an already-valid fallback", async () => {
   const server = await startMlx()
   const sink = collect()

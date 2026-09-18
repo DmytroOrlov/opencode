@@ -34,6 +34,7 @@ export type FallbackTelemetryInput = {
 export type FallbackTelemetryAttempt = {
   readonly push: (event: LLMEvent) => void
   readonly finalize: () => void
+  readonly discard: () => void
 }
 
 const DECODE_THROTTLE_MS = 250
@@ -191,6 +192,10 @@ export function createFallbackTelemetry(input: FallbackTelemetryInput): Fallback
         if (!terminal || input.suppressed?.()) return
         publish({ ...terminal, done: true })
       } catch {}
+    },
+    discard: () => {
+      finalized = true
+      intervalStart = undefined
     },
   }
 }

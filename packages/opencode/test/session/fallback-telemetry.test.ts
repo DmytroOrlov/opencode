@@ -313,3 +313,12 @@ test("finalize is idempotent", () => {
   const decode = h.provider()
   expect(decode.filter((item) => item.done === true).length).toBe(1)
 })
+
+test("discard closes a live attempt without publishing a terminal sample", () => {
+  const h = harness()
+  h.attempt.push(LLMEvent.textStart({ id: "text" }))
+  h.attempt.push(text("text", "some generated content"))
+  h.attempt.discard()
+  h.attempt.finalize()
+  expect(h.snapshots.some((item) => item.done === true)).toBe(false)
+})

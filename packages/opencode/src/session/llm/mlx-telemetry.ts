@@ -34,6 +34,7 @@ export type AttachInput = {
 
 export type TelemetryAttempt = {
   readonly finalize: () => void
+  readonly discard?: () => void
 }
 
 export type TelemetryHolder = {
@@ -63,11 +64,21 @@ export const hasAuthoritativeDecodeRate = (snapshot: TelemetrySnapshot) =>
 // request can never poison attribution for the next AssistantMessage. A
 // successful pass hands the attempt's lifetime to the stream-scope finalizer.
 export const guardAttempt =
-  (holder: TelemetryHolder) =>
+  (holder: TelemetryHolder, fallback?: { discard?: () => void }) =>
   <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
     effect.pipe(
       Effect.onExit((exit) =>
-        Exit.isFailure(exit) && holder.current ? Effect.sync(() => holder.current?.finalize()) : Effect.void,
+        Exit.isFailure(exit)
+          ? Effect.sync(() => {
+              try {
+                if (holder.current?.discard) holder.current.discard()
+                else holder.current?.finalize()
+              } catch {}
+              try {
+                fallback?.discard?.()
+              } catch {}
+            })
+          : Effect.void,
       ),
     )
 
@@ -155,6 +166,15 @@ export function eventsURL(baseURL: string): string | undefined {
   }
 }
 
+export const discardAttempt = (holder: TelemetryHolder, fallback: { discard?: () => void } | undefined) => () => {
+  try {
+    holder.current?.discard?.()
+  } catch {}
+  try {
+    fallback?.discard?.()
+  } catch {}
+}
+
 export async function attach(input: AttachInput): Promise<TelemetryAttempt | undefined> {
   try {
     if (input.options.mlxTelemetry !== true) return undefined
@@ -183,25 +203,25 @@ export async function attach(input: AttachInput): Promise<TelemetryAttempt | und
     // generation that attribution accounting does not know about, and so a
     // timed-out generation still has a handle for its stream finalizer.
     const attempt = register(target, input)
-    const close = () => {
-      input.abort?.removeEventListener("abort", close)
-      finalize(target, attempt)
+    const discard = () => {
+      input.abort?.removeEventListener("abort", discard)
+      close(target, attempt)
       maybeRetire(target)
     }
     if (input.abort) {
       if (input.abort.aborted) {
-        close()
+        discard()
         return undefined
       }
-      input.abort.addEventListener("abort", close, { once: true })
+      input.abort.addEventListener("abort", discard, { once: true })
     }
     const ready = await waitReady(target, input.abort)
     if (ready === "abort") {
-      close()
+      discard()
       return undefined
     }
     if (target.stopped) {
-      close()
+      discard()
       return undefined
     }
     // A readiness timeout poisons this watcher epoch: the timed-out
@@ -211,7 +231,14 @@ export async function attach(input: AttachInput): Promise<TelemetryAttempt | und
     // connection.
     if (ready !== "ready") target.poisoned = true
     attempt.armed = true
-    return { finalize: close }
+    return {
+      finalize: () => {
+        input.abort?.removeEventListener("abort", discard)
+        finalize(target, attempt)
+        maybeRetire(target)
+      },
+      discard,
+    }
   } catch (error) {
     log(input.onError, "attach", error)
     return undefined
