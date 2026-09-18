@@ -7,14 +7,10 @@ export type ModelAttemptRef = {
   variant?: string
 }
 
-// Temporary backend-only fallback. Keep this as the single source of truth
-// until fallback selection is exposed through the model/session settings.
-export const FIXED_FALLBACK: ModelAttemptRef = {
-  providerID: ProviderV2.ID.make("mlx"),
-  modelID: ModelV2.ID.make("qwen3.8-27b"),
-  variant: "xhigh",
+export function sameModel(a: ModelAttemptRef, b: ModelAttemptRef) {
+  return a.providerID === b.providerID && a.modelID === b.modelID
 }
 
 export function sameModelAttempt(a: ModelAttemptRef, b: ModelAttemptRef) {
-  return a.providerID === b.providerID && a.modelID === b.modelID && a.variant === b.variant
+  return sameModel(a, b) && a.variant === b.variant
 }

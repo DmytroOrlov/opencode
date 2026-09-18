@@ -1,13 +1,11 @@
 import { ImagePreview } from "@opencode-ai/ui/image-preview"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
-import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
-import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
-import { Icon } from "@opencode-ai/ui/v2/icon"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
+import type { ModelFallbackConfig } from "@opencode-ai/core/model-fallback"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 import { createEffect, createMemo, on, Show } from "solid-js"
-import { ModelSelectorPopoverV2 } from "@/components/dialog-select-model"
+import { ModelSelectorPopoverV2, ModelSelectorTriggerV2 } from "@/components/dialog-select-model"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
 import type { PromptInputProps } from "@/components/prompt-input/contracts"
 import { normalizePromptHistoryEntry, promptLength, type PromptHistoryComment } from "@/components/prompt-input/history"
@@ -19,14 +17,28 @@ import { useComments } from "@/context/comments"
 import { useCommand } from "@/context/command"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
+import { useModels } from "@/context/models"
 import { usePermission } from "@/context/permission"
 import { type ImageAttachmentPart, usePrompt } from "@/context/prompt"
 import { usePlatform } from "@/context/platform"
 import { useSDK } from "@/context/sdk"
+import { useServerSync } from "@/context/server-sync"
 import { useSync } from "@/context/sync"
 import { createSessionTabs } from "@/pages/session/helpers"
+import {
+  displayedFallbackForPrimary,
+  fallbackForModelPair,
+  fallbackForModelSelection,
+  filterFallbackModels,
+  parseModelReference,
+  sameModelIdentity,
+} from "@/utils/model-fallback"
 import { showToast } from "@/utils/toast"
-import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
+import {
+  PromptInputV2,
+  PromptInputV2Select,
+  type PromptInputV2Suggestion,
+} from "@opencode-ai/session-ui/v2/prompt-input"
 import {
   createPromptInputV2Controller,
   createPromptInputV2State,
@@ -43,11 +55,172 @@ export type PromptInputV2ControllerProps = Omit<PromptInputProps, "class" | "sub
 export type PromptInputV2ComposerController = PromptInputV2Interaction & {
   readonly model: PromptInputProps["controls"]["model"]
 }
+type PromptModelItem = ReturnType<ReturnType<typeof useModels>["list"]>[number]
 
 export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
   const dialog = useDialog()
   const command = useCommand()
   const language = useLanguage()
+  const models = useModels()
+  const serverSync = useServerSync()
+  const primaryModel = createMemo(() => props.controller.model.selection.current())
+  const primary = createMemo(() => {
+    const item = primaryModel()
+    if (!item) return
+    return {
+      providerID: item.provider.id,
+      modelID: item.id,
+    }
+  })
+  const rawFallback = () => serverSync().data.config.fallback
+  const displayedFallback = createMemo(() => displayedFallbackForPrimary(primary(), rawFallback()))
+  const selectedFallbackModel = createMemo(() => {
+    const fallback = displayedFallback()
+    if (!fallback) return undefined
+    return models.find(parseModelReference(fallback.model))
+  })
+  const visibleModels = createMemo(() =>
+    models.list().filter((item) =>
+      models.visible({
+        providerID: item.provider.id,
+        modelID: item.id,
+      }),
+    ),
+  )
+  const primaryModels = createMemo(() => {
+    const current = selectedFallbackModel()
+    if (
+      !current ||
+      visibleModels().some((item) => item.provider.id === current.provider.id && item.id === current.id)
+    ) {
+      return visibleModels()
+    }
+    return [current, ...visibleModels()]
+  })
+  const fallbackModels = createMemo(() => {
+    const current = selectedFallbackModel()
+    const visible = visibleModels()
+    const withCurrent =
+      current && !visible.some((item) => item.provider.id === current.provider.id && item.id === current.id)
+        ? [current, ...visible]
+        : visible
+    if (!current) return filterFallbackModels(withCurrent, primary())
+
+    const selectedPrimary = primaryModel()
+    if (
+      !selectedPrimary ||
+      withCurrent.some((item) => item.provider.id === selectedPrimary.provider.id && item.id === selectedPrimary.id)
+    ) {
+      return withCurrent
+    }
+    return [selectedPrimary, ...withCurrent]
+  })
+  const fallbackVariantOptions = createMemo(() => [
+    { id: "", label: language.t("common.default") },
+    ...Object.keys(selectedFallbackModel()?.variants ?? {}).map((id) => ({ id, label: id })),
+  ])
+  const persistFallback = async (next: ModelFallbackConfig | null) => {
+    const before = serverSync().data.config.fallback
+
+    serverSync().set("config", "fallback", next)
+
+    await serverSync()
+      .updateConfig({ fallback: next })
+      .catch((err: unknown) => {
+        serverSync().set("config", "fallback", before)
+
+        const message = err instanceof Error ? err.message : String(err)
+
+        showToast({
+          title: language.t("common.requestFailed"),
+          description: message,
+        })
+      })
+  }
+  const selectFallbackModel = (id: string) => {
+    if (!id) {
+      void persistFallback(null)
+      return
+    }
+    const item = fallbackModels().find((model) => `${model.provider.id}/${model.id}` === id)
+    if (!item) return
+    const model = { providerID: item.provider.id, modelID: item.id }
+    const currentPrimary = primary()
+    if (currentPrimary && sameModelIdentity(model, currentPrimary)) {
+      if (selectedFallbackModel()) {
+        void swapModels()
+        return
+      }
+      void persistFallback(null)
+      return
+    }
+    void persistFallback(
+      fallbackForModelSelection({
+        model,
+        variants: item.variants ?? {},
+        rawFallback: rawFallback(),
+      }),
+    )
+  }
+  const selectFallbackVariant = (id: string) => {
+    const fallback = displayedFallback()
+    if (!fallback || !selectedFallbackModel()) return
+    void persistFallback({
+      ...fallback,
+      variant: id || null,
+    })
+  }
+  const swapModels = async () => {
+    const oldPrimaryModel = primaryModel()
+    const oldPrimary = primary()
+    const beforeFallback = serverSync().data.config.fallback
+    const beforePrimarySelectedVariant = props.controller.model.selection.variant.selected()
+    const oldPrimaryVariant = props.controller.model.selection.variant.current()
+    const oldSecondaryModel = selectedFallbackModel()
+    const oldSecondaryFallback = displayedFallback()
+    if (!oldPrimaryModel || !oldPrimary || !oldSecondaryModel || !oldSecondaryFallback) return
+
+    const nextFallback = fallbackForModelPair({
+      model: oldPrimary,
+      variants: oldPrimaryModel.variants ?? {},
+      variant: oldPrimaryVariant,
+    })
+    const nextPrimaryVariant =
+      typeof oldSecondaryFallback.variant === "string" &&
+      Object.hasOwn(oldSecondaryModel.variants ?? {}, oldSecondaryFallback.variant)
+        ? oldSecondaryFallback.variant
+        : undefined
+
+    serverSync().set("config", "fallback", nextFallback)
+    props.controller.model.selection.set(
+      { providerID: oldSecondaryModel.provider.id, modelID: oldSecondaryModel.id },
+      { recent: true },
+    )
+    props.controller.model.selection.variant.set(nextPrimaryVariant)
+
+    await serverSync()
+      .updateConfig({ fallback: nextFallback })
+      .catch((err: unknown) => {
+        serverSync().set("config", "fallback", beforeFallback)
+        props.controller.model.selection.set(oldPrimary, { recent: false })
+        props.controller.model.selection.variant.set(beforePrimarySelectedVariant ?? undefined)
+
+        const message = err instanceof Error ? err.message : String(err)
+
+        showToast({
+          title: language.t("common.requestFailed"),
+          description: message,
+        })
+      })
+  }
+  const selectPrimaryModel = (item: PromptModelItem) => {
+    const currentSecondary = selectedFallbackModel()
+    if (currentSecondary && item.provider.id === currentSecondary.provider.id && item.id === currentSecondary.id) {
+      void swapModels()
+      return
+    }
+    props.controller.model.selection.set({ providerID: item.provider.id, modelID: item.id }, { recent: true })
+  }
 
   return (
     <div class="flex flex-col gap-3">
@@ -65,6 +238,8 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
             title={language.t("command.model.choose")}
             keybind={command.keybindParts("model.choose")}
             model={props.controller.model.selection}
+            items={() => primaryModels()}
+            onSelect={selectPrimaryModel}
             providerID={props.controller.model.selection.current()?.provider?.id}
             modelName={props.controller.model.selection.current()?.name ?? language.t("dialog.model.select.title")}
             onClose={props.controller.restoreFocus}
@@ -72,6 +247,45 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
               dialog.show(() => <DialogSelectModelUnpaidV2 model={props.controller.model.selection} />)
             }
           />
+        }
+        afterVariantControl={
+          <Show when={!props.controller.model.loading}>
+            <div class="flex min-w-0 items-center gap-1">
+              <TooltipV2
+                placement="top"
+                gutter={4}
+                value={`${language.t("ui.sessionTurn.status.fallback")} · ${language.t("model.tooltip.model")}`}
+              >
+                <ModelSelectorPopoverV2
+                  items={() => fallbackModels()}
+                  current={() => selectedFallbackModel()}
+                  includeNone
+                  noneCurrent={() => !displayedFallback()}
+                  onSelect={(item) => selectFallbackModel(`${item.provider.id}/${item.id}`)}
+                  onSelectNone={() => void persistFallback(null)}
+                  trigger={(triggerProps) => (
+                    <ModelSelectorTriggerV2
+                      triggerProps={triggerProps}
+                      providerID={selectedFallbackModel()?.provider.id}
+                      modelName={
+                        selectedFallbackModel()?.name ?? displayedFallback()?.model ?? language.t("sound.option.none")
+                      }
+                      dataAction="prompt-fallback-model"
+                      dataControlType="popover"
+                    />
+                  )}
+                />
+              </TooltipV2>
+              <PromptInputV2Select
+                title={`${language.t("ui.sessionTurn.status.fallback")} · ${language.t("model.tooltip.reasoning")}`}
+                options={fallbackVariantOptions()}
+                current={displayedFallback()?.variant ?? ""}
+                class="!px-0"
+                disabled={!displayedFallback() || !selectedFallbackModel()}
+                onSelect={selectFallbackVariant}
+              />
+            </div>
+          </Show>
         }
       />
     </div>
@@ -474,29 +688,14 @@ function PromptInputV2ModelControl(props: {
   title: string
   keybind: string[]
   model: PromptInputV2ComposerController["model"]["selection"]
+  items?: () => PromptModelItem[]
+  onSelect?: (item: PromptModelItem) => void
   providerID?: string
   modelName: string
   onClose: () => void
   onUnpaidClick: () => void
 }) {
   const shouldAnimate = createMemo<boolean>((previous) => previous ?? props.loading)
-  const content = () => (
-    <>
-      <Show when={props.providerID}>
-        {(providerID) => (
-          <ProviderIcon
-            id={providerID()}
-            class="size-4 shrink-0 opacity-40 group-hover:opacity-100 transition-opacity duration-150"
-            style={{ "will-change": "opacity", transform: "translateZ(0)" }}
-          />
-        )}
-      </Show>
-      <span class="truncate leading-4">{props.modelName}</span>
-      <span class="-ml-0.5 -mr-1 flex shrink-0">
-        <Icon name="chevron-down" />
-      </span>
-    </>
-  )
   return (
     <Show when={!props.loading}>
       <TooltipV2
@@ -512,35 +711,29 @@ function PromptInputV2ModelControl(props: {
         <Show
           when={props.paid}
           fallback={
-            <ButtonV2
-              data-action="prompt-model"
-              data-control-type="dialog"
-              variant="ghost-muted"
-              size="normal"
-              class="min-w-0 max-w-[220px] justify-start ![font-weight:440] group !px-0"
-              classList={{ "animate-in fade-in": shouldAnimate() }}
-              style={{ height: "28px" }}
-              onClick={props.onUnpaidClick}
-            >
-              {content()}
-            </ButtonV2>
+            <ModelSelectorTriggerV2
+              triggerProps={{ onClick: props.onUnpaidClick }}
+              providerID={props.providerID}
+              modelName={props.modelName}
+              animate={shouldAnimate()}
+              dataAction="prompt-model"
+              dataControlType="dialog"
+            />
           }
         >
           <ModelSelectorPopoverV2
             model={props.model}
+            items={props.items}
+            onSelect={props.onSelect}
             trigger={(triggerProps) => (
-              <ButtonV2
-                {...triggerProps}
-                variant="ghost-muted"
-                size="normal"
-                style={{ height: "28px" }}
-                class="min-w-0 max-w-[220px] justify-start ![font-weight:440] group !px-0"
-                classList={{ "animate-in fade-in": shouldAnimate() }}
+              <ModelSelectorTriggerV2
+                triggerProps={triggerProps}
+                providerID={props.providerID}
+                modelName={props.modelName}
+                animate={shouldAnimate()}
                 data-action="prompt-model"
                 data-control-type="popover"
-              >
-                {content()}
-              </ButtonV2>
+              />
             )}
             onClose={props.onClose}
           />

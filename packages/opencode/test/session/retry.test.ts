@@ -18,12 +18,13 @@ const providerID = ProviderV2.ID.make("test")
 const retryProvider = "test"
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionStatus.node, CrossSpawnSpawner.node])))
 
-function apiError(headers?: Record<string, string>): SessionV1.APIError {
+function apiError(headers?: Record<string, string>, statusCode?: number): SessionV1.APIError {
   return Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
     new SessionV1.APIError({
       message: "boom",
       isRetryable: true,
       responseHeaders: headers,
+      statusCode,
     }).toObject(),
   )
 }
@@ -97,7 +98,8 @@ describe("session.retry.delay", () => {
   it.instance("policy updates retry status and increments attempts", () =>
     Effect.gen(function* () {
       const sessionID = SessionID.make("session-retry-test")
-      const error = apiError({ "retry-after-ms": "0" })
+      const error = apiError({ "retry-after-ms": "0" }, 503)
+      const statuses: Array<number | undefined> = []
       const status = yield* SessionStatus.Service
 
       const step = yield* Schedule.toStepWithMetadata(
@@ -105,11 +107,14 @@ describe("session.retry.delay", () => {
           provider: "test",
           parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
           set: (info) =>
-            status.set(sessionID, {
-              type: "retry",
-              attempt: info.attempt,
-              message: info.message,
-              next: info.next,
+            Effect.gen(function* () {
+              statuses.push(info.statusCode)
+              yield* status.set(sessionID, {
+                type: "retry",
+                attempt: info.attempt,
+                message: info.message,
+                next: info.next,
+              })
             }),
         }),
       )
@@ -121,6 +126,7 @@ describe("session.retry.delay", () => {
         attempt: 2,
         message: "boom",
       })
+      expect(statuses).toStrictEqual([503, 503])
     }),
   )
 

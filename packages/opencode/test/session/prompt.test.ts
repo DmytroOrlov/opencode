@@ -317,6 +317,16 @@ function fallbackProviderCfg(url: string) {
         reasoning: true,
         variants: { xhigh: { reasoningEffort: "xhigh" } },
       },
+      "qwen-fallback-test": {
+        ...cfg.provider.test.models["test-model"],
+        id: "qwen-fallback-test",
+        name: "Qwen Fallback Test",
+        reasoning: true,
+        variants: {
+          low: { reasoningEffort: "low" },
+          high: { reasoningEffort: "high" },
+        },
+      },
     },
   }
   return {
@@ -922,6 +932,217 @@ it.instance(
       expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
       expect(JSON.stringify(inputs[1])).toContain("xhigh")
       expect(statuses.some((status) => status.type === "retry")).toBe(false)
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "does not use a fallback when explicitly disabled",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...fallbackProviderCfg(url), fallback: null }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "retry primary" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "disabled-fallback",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "test-model", reply().text("primary recovered").stop().item())
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(
+        (yield* llm.inputs)
+          .filter((input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"))
+          .map((input) => input.model),
+      ).toEqual(["test-model", "test-model"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "uses the configured fallback model and variant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...fallbackProviderCfg(url),
+        fallback: { model: "mlx/qwen-fallback-test", variant: "high" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "configured fallback" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(503, { error: { message: "primary unavailable" } }),
+      )
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "qwen-fallback-test",
+        reply().text("configured answer").stop().item(),
+      )
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+        expect(result.info.modelID).toBe(ModelV2.ID.make("qwen-fallback-test"))
+        expect(result.info.variant).toBe("high")
+      }
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          ["test-model", "qwen-fallback-test"].some((model) => model === input.model) &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen-fallback-test"])
+      expect(JSON.stringify(inputs[1])).toContain("high")
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "uses configured fallback default reasoning without forcing a variant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...fallbackProviderCfg(url),
+        fallback: { model: "mlx/qwen-fallback-test", variant: null },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "default fallback" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(503, { error: { message: "primary unavailable" } }),
+      )
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "qwen-fallback-test",
+        reply().text("default answer").stop().item(),
+      )
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.variant).toBeUndefined()
+      const fallbackInput = (yield* llm.inputs).find(
+        (input) => input.model === "qwen-fallback-test" && !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(fallbackInput).toBeDefined()
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "does not substitute the legacy fallback for invalid configured fallback values",
+  () =>
+    Effect.gen(function* () {
+      const cases = [
+        { name: "invalid variant", fallback: { model: "mlx/qwen-fallback-test", variant: "missing" } },
+        { name: "inherited invalid variant", fallback: { model: "mlx/qwen-fallback-test", variant: "toString" } },
+        { name: "invalid model", fallback: { model: "mlx/does-not-exist", variant: null } },
+      ] as const
+      for (const item of cases) {
+        const { llm } = yield* useServerConfig((url) => ({ ...fallbackProviderCfg(url), fallback: item.fallback }))
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: item.name }],
+        })
+        yield* llm.pushMatch(
+          (hit) => hit.body.model === "test-model",
+          raw({
+            chunks: [
+              {
+                id: item.name,
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+              },
+            ],
+          }),
+        )
+        yield* llm.pushMatch((hit) => hit.body.model === "test-model", reply().text("primary recovered").stop().item())
+        yield* prompt.loop({ sessionID: session.id })
+        expect((yield* llm.inputs).filter((input) => input.model !== "test-model")).toHaveLength(0)
+      }
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "does not fail over to the same provider and model with another variant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => {
+        const base = fallbackProviderCfg(url)
+        return {
+          ...base,
+          provider: {
+            ...base.provider,
+            test: {
+              ...base.provider.test,
+              models: {
+                ...base.provider.test.models,
+                "test-model": {
+                  ...base.provider.test.models["test-model"],
+                  reasoning: true,
+                  variants: {
+                    high: { reasoningEffort: "high" },
+                    xhigh: { reasoningEffort: "xhigh" },
+                  },
+                },
+              },
+            },
+          },
+          fallback: { model: "test/test-model", variant: "xhigh" },
+        }
+      })
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        variant: "high",
+        parts: [{ type: "text", text: "same model" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(400, { error: { message: "do not recurse" } }),
+      )
+      yield* prompt.loop({ sessionID: session.id })
+      expect(
+        (yield* llm.inputs).filter(
+          (input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"),
+        ),
+      ).toHaveLength(1)
     }),
   { config: fallbackProviderCfg("http://localhost:1/v1") },
 )
@@ -2879,6 +3100,57 @@ it.instance("records aborted errors when prompt is cancelled mid-stream", () =>
     const last = msgs.findLast((msg) => msg.info.role === "assistant")
     expect(last?.info.role).toBe("assistant")
     if (last?.info.role === "assistant") {
+      expect(last.info.error?.name).toBe("MessageAbortedError")
+    }
+  }),
+)
+
+it.instance("records an aborted fallback when prompt is cancelled", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(fallbackProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Fallback cancel regression" })
+
+    yield* llm.pushMatch(
+      (hit) => hit.body.model === "test-model" && !JSON.stringify(hit.body).includes("Generate a title"),
+      raw({
+        chunks: [
+          {
+            id: "fallback-cancel-primary",
+            object: "chat.completion.chunk",
+            choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+          },
+        ],
+      }),
+    )
+    yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().hang().item())
+
+    const fiber = yield* prompt
+      .prompt({
+        sessionID: session.id,
+        agent: "build",
+        parts: [{ type: "text", text: "Cancel fallback" }],
+      })
+      .pipe(Effect.forkChild)
+
+    yield* pollWithTimeout(
+      llm.inputs.pipe(
+        Effect.map((inputs) => (inputs.some((input) => input.model === "qwen3.8-27b") ? true : undefined)),
+      ),
+      "fallback request did not start",
+    )
+    yield* waitForBusy(session.id)
+    yield* prompt.cancel(session.id)
+
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isSuccess(exit)).toBe(true)
+    const msgs = yield* sessions.messages({ sessionID: session.id })
+    const last = msgs.findLast((msg) => msg.info.role === "assistant")
+    expect(last?.info.role).toBe("assistant")
+    if (last?.info.role === "assistant") {
+      expect(last.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+      expect(last.info.modelID).toBe(ModelV2.ID.make("qwen3.8-27b"))
       expect(last.info.error?.name).toBe("MessageAbortedError")
     }
   }),

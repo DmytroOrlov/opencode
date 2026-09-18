@@ -756,6 +756,39 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
+      const logDecision = (input: {
+        decision: "retry_current" | "failover_restart" | "failover_continue" | "terminal"
+        reason:
+          | "retryable_failure"
+          | "replay_safe"
+          | "settled_tool_result"
+          | "executing_tool_unknown"
+          | "aborted"
+          | "context_overflow"
+          | "blocked"
+          | "retry_exhausted"
+          | "non_retryable_failure"
+        mode?: "restart" | "continue"
+        statusCode?: number
+        retryAttempt?: number
+        retryNext?: number
+      }) => {
+        return Effect.logInfo("session recovery", {
+          "session.id": ctx.sessionID,
+          messageID: ctx.assistantMessage.id,
+          providerID: ctx.model.providerID,
+          modelID: ctx.model.id,
+          variant: ctx.assistantMessage.variant,
+          phase: "decision",
+          decision: input.decision,
+          reason: input.reason,
+          mode: input.mode,
+          retryAttempt: input.retryAttempt,
+          retryNext: input.retryNext,
+          statusCode: input.statusCode,
+        })
+      }
+
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
@@ -783,6 +816,21 @@ const layer = Layer.effect(
         }
         let failover: { error: unknown; mode: "restart" | "continue" } | undefined
         let continuation = false
+        let terminalDecisionLogged = false
+        const logTerminalDecision = (input: {
+          reason:
+            | "executing_tool_unknown"
+            | "aborted"
+            | "context_overflow"
+            | "blocked"
+            | "retry_exhausted"
+            | "non_retryable_failure"
+          statusCode?: number
+        }) => {
+          if (terminalDecisionLogged) return Effect.void
+          terminalDecisionLogged = true
+          return logDecision({ decision: "terminal", ...input })
+        }
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -797,14 +845,6 @@ const layer = Layer.effect(
               Stream.runDrain,
             )
           }).pipe(
-            Effect.onInterrupt(() =>
-              Effect.gen(function* () {
-                aborted = true
-                if (!ctx.assistantMessage.error) {
-                  yield* halt(new DOMException("Aborted", "AbortError"))
-                }
-              }),
-            ),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) => Effect.fail(Cause.squash(cause)),
@@ -822,6 +862,13 @@ const layer = Layer.effect(
                   !ctx.needsCompaction,
                 set: (info) =>
                   Effect.gen(function* () {
+                    yield* logDecision({
+                      decision: "retry_current",
+                      reason: "retryable_failure",
+                      statusCode: info.statusCode,
+                      retryAttempt: info.attempt,
+                      retryNext: info.next,
+                    })
                     yield* restart(baseline, messageBaseline, true)
                     yield* status.set(ctx.sessionID, {
                       type: "retry",
@@ -833,39 +880,87 @@ const layer = Layer.effect(
                   }),
               }),
             ),
-            Effect.catch((error) => {
-              const parsed = parse(error)
-              const action = SessionRetry.classify(parsed, input.model.providerID, input.failoverAvailable === true)
-              const unsafe = ctx.executingToolCalls.size > 0
-              const continuationSafe = ctx.executingToolCalls.size === 0 && ctx.settledExecutedToolCalls.size > 0
-              if (
-                action === "failover" &&
-                !aborted &&
-                !ctx.needsCompaction &&
-                !ctx.blocked &&
-                !SessionV1.ContextOverflowError.isInstance(parsed)
-              ) {
-                if (unsafe) return halt(error)
-                if (continuationSafe) {
-                  failover = { error, mode: "continue" }
-                  return sealForContinuation(baseline)
+            Effect.onInterrupt(() =>
+              Effect.gen(function* () {
+                aborted = true
+                yield* logTerminalDecision({ reason: "aborted" })
+                if (!ctx.assistantMessage.error) {
+                  yield* halt(new DOMException("Aborted", "AbortError"))
                 }
-                failover = { error, mode: "restart" }
-                return Effect.void
-              }
-              if (
-                action === "retry" &&
-                continuationSafe &&
-                !aborted &&
-                !ctx.needsCompaction &&
-                !ctx.blocked &&
-                !SessionV1.ContextOverflowError.isInstance(parsed)
-              ) {
-                continuation = true
-                return sealForContinuation(baseline)
-              }
-              return halt(error)
-            }),
+              }),
+            ),
+            Effect.catch((error) =>
+              Effect.gen(function* () {
+                const parsed = parse(error)
+                const statusCode = SessionV1.APIError.isInstance(parsed) ? parsed.data.statusCode : undefined
+                const action = SessionRetry.classify(parsed, input.model.providerID, input.failoverAvailable === true)
+                const unsafe = ctx.executingToolCalls.size > 0
+                const continuationSafe = ctx.executingToolCalls.size === 0 && ctx.settledExecutedToolCalls.size > 0
+                if (
+                  action === "failover" &&
+                  !aborted &&
+                  !ctx.needsCompaction &&
+                  !ctx.blocked &&
+                  !SessionV1.ContextOverflowError.isInstance(parsed)
+                ) {
+                  if (unsafe) {
+                    yield* logTerminalDecision({
+                      reason: "executing_tool_unknown",
+                      statusCode,
+                    })
+                    return yield* halt(error)
+                  }
+                  if (continuationSafe) {
+                    yield* logDecision({
+                      decision: "failover_continue",
+                      reason: "settled_tool_result",
+                      mode: "continue",
+                      statusCode,
+                    })
+                    failover = { error, mode: "continue" }
+                    return yield* sealForContinuation(baseline)
+                  }
+                  yield* logDecision({
+                    decision: "failover_restart",
+                    reason: "replay_safe",
+                    mode: "restart",
+                    statusCode,
+                  })
+                  failover = { error, mode: "restart" }
+                  return
+                }
+                if (
+                  action === "retry" &&
+                  continuationSafe &&
+                  !aborted &&
+                  !ctx.needsCompaction &&
+                  !ctx.blocked &&
+                  !SessionV1.ContextOverflowError.isInstance(parsed)
+                ) {
+                  yield* logDecision({
+                    decision: "retry_current",
+                    reason: "settled_tool_result",
+                    mode: "continue",
+                    statusCode,
+                  })
+                  continuation = true
+                  return yield* sealForContinuation(baseline)
+                }
+                const reason = aborted
+                  ? "aborted"
+                  : SessionV1.ContextOverflowError.isInstance(parsed) || ctx.needsCompaction
+                    ? "context_overflow"
+                    : ctx.blocked
+                      ? "blocked"
+                      : unsafe
+                        ? "executing_tool_unknown"
+                        : action === "retry"
+                          ? "retry_exhausted"
+                          : "non_retryable_failure"
+                yield* logTerminalDecision({ reason, statusCode })
+                return yield* halt(error)
+              }),
+            ),
             Effect.ensuring(
               Effect.gen(function* () {
                 if (failover) {
@@ -883,7 +978,11 @@ const layer = Layer.effect(
           if (ctx.needsCompaction) return "compact"
           if (failover) return { type: "failover", error: failover.error, mode: failover.mode } as const
           if (continuation) return "continue"
-          if (ctx.blocked || ctx.assistantMessage.error) return "stop"
+          if (ctx.blocked) {
+            yield* logTerminalDecision({ reason: "blocked" })
+            return "stop"
+          }
+          if (ctx.assistantMessage.error) return "stop"
           return "continue"
         })
       })

@@ -4,15 +4,18 @@ import type { ModelKey, ModelSelection } from "@/context/local"
 import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "@/context/model-variant"
 import { usePrompt } from "@/context/prompt"
 import { useSDK } from "@/context/sdk"
+import { useServerSync } from "@/context/server-sync"
 import { useSync } from "@/context/sync"
 import { useProviders } from "@/hooks/use-providers"
 import { resolveDefaultModel } from "@/hooks/provider-catalog"
+import { shouldClearFallbackForPrimary } from "@/utils/model-fallback"
 
 export function createPromptModelSelection(input: { agent: () => { model?: ModelKey; variant?: string } | undefined }) {
   const sdk = useSDK()
   const sync = useSync()
   const models = useModels()
   const prompt = usePrompt()
+  const serverSync = useServerSync()
   const providers = useProviders(() => sdk().directory)
   const connected = createMemo(() => new Set(providers.connected().map((item) => item.id)))
 
@@ -73,6 +76,21 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
           if (options?.recent) models.recent.push(item)
         }),
       )
+      if (!item) return
+      if (
+        !shouldClearFallbackForPrimary(
+          { providerID: item.providerID, modelID: item.modelID },
+          serverSync().data.config.fallback,
+        )
+      )
+        return
+      const before = serverSync().data.config.fallback
+      serverSync().set("config", "fallback", null)
+      void serverSync()
+        .updateConfig({ fallback: null })
+        .catch(() => {
+          serverSync().set("config", "fallback", before)
+        })
     },
     visible: models.visible,
     setVisibility: models.setVisibility,

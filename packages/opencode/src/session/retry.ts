@@ -213,7 +213,13 @@ export function policy(opts: {
   parse: (error: unknown) => Err
   failover?: () => boolean
   canRetry?: () => boolean
-  set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
+  set: (input: {
+    attempt: number
+    message: string
+    action?: Retryable["action"]
+    next: number
+    statusCode?: number
+  }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
     Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
@@ -230,6 +236,7 @@ export function policy(opts: {
           message: retry.message,
           action: retry.action,
           next: now + wait,
+          statusCode: SessionV1.APIError.isInstance(error) ? error.data.statusCode : undefined,
         })
         return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
       })

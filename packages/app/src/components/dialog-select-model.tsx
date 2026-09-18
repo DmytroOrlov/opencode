@@ -5,7 +5,9 @@ import { useLocal } from "@/context/local"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { popularProviders } from "@/hooks/use-providers"
 import { Button } from "@opencode-ai/ui/button"
+import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { IconButton } from "@opencode-ai/ui/icon-button"
+import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { Tag } from "@opencode-ai/ui/tag"
 import { Dialog } from "@opencode-ai/ui/dialog"
@@ -31,6 +33,7 @@ type ModelItem = ReturnType<ModelState["list"]>[number]
 
 const modelKey = (model: ModelItem) => `${model.provider.id}:${model.id}`
 const manageKey = "action:manage"
+const noneKey = "model:none"
 
 const sortModelGroups = (a: { category: string; items: ModelItem[] }, b: { category: string; items: ModelItem[] }) => {
   const aIndex = popularProviders.indexOf(a.category)
@@ -112,9 +115,46 @@ const ModelList: Component<{
   )
 }
 
-type ModelSelectorTriggerProps = Omit<ComponentProps<typeof Kobalte.Trigger>, "as" | "ref">
+export type ModelSelectorTriggerProps = Omit<ComponentProps<typeof Kobalte.Trigger>, "as" | "ref">
 type ModelSelectorTrigger = (props: ModelSelectorTriggerProps) => JSX.Element
 type Dismiss = "escape" | "outside" | "select" | "manage" | "provider"
+
+export function ModelSelectorTriggerV2(props: {
+  triggerProps: ModelSelectorTriggerProps
+  providerID?: string
+  modelName: string
+  animate?: boolean
+  dataAction?: string
+  dataControlType?: string
+}) {
+  return (
+    <ButtonV2
+      {...props.triggerProps}
+      variant="ghost-muted"
+      size="normal"
+      style={{ height: "28px" }}
+      class="min-w-0 max-w-[220px] justify-start ![font-weight:440] group !px-0"
+      classList={{ "animate-in fade-in": props.animate }}
+      data-action={props.dataAction}
+      data-control-type={props.dataControlType}
+      aria-label={props.modelName}
+    >
+      <Show when={props.providerID}>
+        {(providerID) => (
+          <ProviderIcon
+            id={providerID()}
+            class="size-4 shrink-0 opacity-40 group-hover:opacity-100 transition-opacity duration-150"
+            style={{ "will-change": "opacity", transform: "translateZ(0)" }}
+          />
+        )}
+      </Show>
+      <span class="truncate leading-4">{props.modelName}</span>
+      <span class="-ml-0.5 -mr-1 flex shrink-0">
+        <Icon name="chevron-down" />
+      </span>
+    </ButtonV2>
+  )
+}
 
 export function ModelSelectorPopover(props: {
   provider?: string
@@ -225,14 +265,26 @@ export function ModelSelectorPopover(props: {
 export function ModelSelectorPopoverV2(props: {
   provider?: string
   model?: ModelState
+  items?: () => ModelItem[]
+  current?: () => ModelItem | undefined
+  onSelect?: (item: ModelItem) => void
+  includeNone?: boolean
+  noneCurrent?: () => boolean
+  onSelectNone?: () => void
   trigger: ModelSelectorTrigger
   onClose?: () => void
 }) {
   const dialog = useDialog()
   const controller = createModelSelectorController({
     model: props.model,
+    items: props.items,
+    current: props.current,
+    onSelect: props.onSelect,
+    includeNone: props.includeNone,
+    noneCurrent: props.noneCurrent,
+    onSelectNone: props.onSelectNone,
     provider: () => props.provider,
-    onSelect: () => props.onClose?.(),
+    onClose: props.onClose,
   })
 
   return (
@@ -242,6 +294,9 @@ export function ModelSelectorPopoverV2(props: {
       groups={controller.groups}
       current={controller.current}
       select={controller.select}
+      includeNone={controller.includeNone}
+      noneCurrent={controller.noneCurrent}
+      selectNone={controller.selectNone}
       onManage={() => {
         void import("./dialog-manage-models").then((module) => {
           void dialog.show(() => <module.DialogManageModelsV2 />)
@@ -255,15 +310,33 @@ export function ModelSelectorPopoverV2(props: {
 function createModelSelectorController(input: {
   provider: () => string | undefined
   model?: ModelState
-  onSelect: () => void
+  items?: () => ModelItem[]
+  current?: () => ModelItem | undefined
+  onSelect?: (item: ModelItem) => void
+  includeNone?: boolean
+  noneCurrent?: () => boolean
+  onSelectNone?: () => void
+  onClose?: () => void
 }) {
   const model = input.model ?? useLocal().model
   const allModels = createMemo(() =>
-    model
-      .list()
-      .filter((item) => model.visible({ modelID: item.id, providerID: item.provider.id }))
-      .filter((item) => (input.provider() ? item.provider.id === input.provider() : true)),
+    (
+      input.items?.() ??
+      model.list().filter((item) => model.visible({ modelID: item.id, providerID: item.provider.id }))
+    ).filter((item) => (input.provider() ? item.provider.id === input.provider() : true)),
   )
+  const current = input.current ?? model.current
+  const noneCurrent = input.noneCurrent ?? (() => false)
+  const select =
+    input.onSelect ??
+    ((item: ModelItem) => {
+      model.set({ modelID: item.id, providerID: item.provider.id }, { recent: true })
+    })
+  const selectWithClose = (item: ModelItem) => {
+    select(item)
+    input.onClose?.()
+  }
+  const onSelectNone = input.onSelectNone ?? (() => {})
 
   return {
     models: (search: string) => {
@@ -281,13 +354,14 @@ function createModelSelectorController(input: {
       return Array.from(byProvider, ([category, items]) => ({ category, items })).sort(sortModelGroups)
     },
     current: () => {
-      const value = model.current()
+      if (noneCurrent()) return noneKey
+      const value = current()
       return value ? modelKey(value) : undefined
     },
-    select: (item: ModelItem) => {
-      model.set({ modelID: item.id, providerID: item.provider.id }, { recent: true })
-      input.onSelect()
-    },
+    select: selectWithClose,
+    includeNone: input.includeNone ?? false,
+    noneCurrent,
+    selectNone: onSelectNone,
   }
 }
 
@@ -297,6 +371,9 @@ function ModelSelectorPopoverV2View(props: {
   groups: (models: ModelItem[]) => { category: string; items: ModelItem[] }[]
   current: () => string | undefined
   select: (item: ModelItem) => void
+  includeNone: boolean
+  noneCurrent: () => boolean
+  selectNone: () => void
   onManage: () => void
   onClose: () => void
 }) {
@@ -308,8 +385,9 @@ function ModelSelectorPopoverV2View(props: {
 
   const models = createMemo(() => props.models(store.search))
   const groups = createMemo(() => props.groups(models()))
-  const keys = () => [...models().map(modelKey), manageKey]
+  const keys = () => [...(props.includeNone ? [noneKey] : []), ...models().map(modelKey), manageKey]
   const initialActive = () => {
+    if (props.includeNone && props.noneCurrent()) return noneKey
     const selected = props.current()
     const options = keys()
     if (selected && options.includes(selected)) return selected
@@ -336,6 +414,11 @@ function ModelSelectorPopoverV2View(props: {
     setOpen(false)
     dismiss.afterClose(() => props.select(item))
   }
+  const selectNone = () => {
+    dismiss.preventTriggerRestore()
+    setOpen(false)
+    dismiss.afterClose(props.selectNone)
+  }
   const manage = () => {
     dismiss.preventTriggerRestore()
     setOpen(false)
@@ -345,6 +428,10 @@ function ModelSelectorPopoverV2View(props: {
     const item = models().find((item) => modelKey(item) === store.active)
     if (item) {
       selectModel(item)
+      return
+    }
+    if (props.includeNone && store.active === noneKey) {
+      selectNone()
       return
     }
     if (store.active === manageKey) manage()
@@ -359,7 +446,7 @@ function ModelSelectorPopoverV2View(props: {
   }
   const setSearch = (value: string) => {
     const first = props.models(value)[0]
-    setStore({ search: value, active: first ? modelKey(first) : manageKey })
+    setStore({ search: value, active: first ? modelKey(first) : props.includeNone ? noneKey : manageKey })
   }
 
   createEffect(() => {
@@ -439,6 +526,23 @@ function ModelSelectorPopoverV2View(props: {
           <div class="h-px bg-v2-border-border-muted" />
           <ScrollView data-slot="model-selector-scroll" class="max-h-[220px] min-h-0">
             <div class="flex flex-col p-0.5 pt-0">
+              <Show when={props.includeNone}>
+                <MenuV2.RadioGroup value={props.current()}>
+                  <MenuV2.RadioItem
+                    value={noneKey}
+                    data-option-key={noneKey}
+                    data-selected-model={props.noneCurrent() ? true : undefined}
+                    classList={{ "!bg-v2-overlay-simple-overlay-hover": store.active === noneKey }}
+                    onMouseEnter={() => {
+                      setStore("active", noneKey)
+                      setTimeout(() => searchRef?.focus())
+                    }}
+                    onSelect={selectNone}
+                  >
+                    <span class="min-w-0 truncate leading-5">{language.t("sound.option.none")}</span>
+                  </MenuV2.RadioItem>
+                </MenuV2.RadioGroup>
+              </Show>
               <Show
                 when={models().length > 0}
                 fallback={

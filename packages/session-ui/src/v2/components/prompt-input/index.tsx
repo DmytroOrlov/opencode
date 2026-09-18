@@ -42,6 +42,7 @@ export type PromptInputV2Props = {
   class?: string
   modelControl?: JSX.Element
   variantControlVisible?: boolean
+  afterVariantControl?: JSX.Element
   attachKeybind?: string[]
   attachShortcut?: string
 }
@@ -255,6 +256,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
                 </Show>
               )}
             </Show>
+            {props.afterVariantControl}
           </div>
           <PromptInputV2SubmitButton
             mode={state.mode}
@@ -559,6 +561,7 @@ export function PromptInputV2Select(props: {
   current: string
   currentIcon?: JSX.Element
   class?: string
+  disabled?: boolean
   onOpenChange?: (open: boolean) => void
   onSelect: (id: string) => void
 }) {
@@ -578,6 +581,7 @@ export function PromptInputV2Select(props: {
           variant="ghost-muted"
           size="normal"
           class={`max-w-[220px] justify-start ![font-weight:440] ${props.class ?? ""}`}
+          disabled={props.disabled}
           aria-label={props.title}
         >
           {props.currentIcon}

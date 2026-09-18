@@ -10,7 +10,7 @@ import fsNode from "fs/promises"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
-import { applyEdits, modify } from "jsonc-parser"
+import { applyEdits, findNodeAtLocation, modify, parseTree } from "jsonc-parser"
 import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
 import { existsSync } from "fs"
 import { Account } from "@/account/account"
@@ -148,8 +148,8 @@ function globalConfigFile() {
 }
 
 function patchJsonc(input: string, patch: unknown, path: string[] = []): string {
-  if (!isRecord(patch)) {
-    const edits = modify(input, path, patch, {
+  const replaceJsoncValue = (value: unknown) => {
+    const edits = modify(input, path, value, {
       formattingOptions: {
         insertSpaces: true,
         tabSize: 2,
@@ -157,6 +157,14 @@ function patchJsonc(input: string, patch: unknown, path: string[] = []): string 
     })
     return applyEdits(input, edits)
   }
+
+  if (!isRecord(patch)) {
+    return replaceJsoncValue(patch)
+  }
+
+  const tree = parseTree(input)
+  const current = tree ? findNodeAtLocation(tree, path) : undefined
+  if (!current || current.type !== "object") return replaceJsoncValue(patch)
 
   return Object.entries(patch).reduce((result, [key, value]) => patchJsonc(result, value, [...path, key]), input)
 }

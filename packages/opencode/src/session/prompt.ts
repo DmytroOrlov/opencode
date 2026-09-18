@@ -56,7 +56,8 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
-import { FIXED_FALLBACK, sameModelAttempt, type ModelAttemptRef } from "./model-attempt"
+import { resolveModelFallback } from "@opencode-ai/core/model-fallback"
+import { sameModel, type ModelAttemptRef } from "./model-attempt"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -600,6 +601,14 @@ const layer = Layer.effect(
       const exit = yield* provider.getModel(providerID, modelID).pipe(Effect.exit)
       if (Exit.isSuccess(exit)) return exit.value
       const err = Cause.squash(exit.cause)
+      yield* Effect.logError("session recovery", {
+        "session.id": sessionID,
+        providerID,
+        modelID,
+        phase: "boundary",
+        reason: "model_resolution_failed",
+        recoveryCapable: false,
+      })
       if (Provider.ModelNotFoundError.isInstance(err)) {
         const hint = err.suggestions?.length ? ` Did you mean: ${err.suggestions.join(", ")}?` : ""
         yield* events.publish(Session.Event.Error, {
@@ -1088,6 +1097,7 @@ const layer = Layer.effect(
         let activeUserID: string | undefined
         let active: ModelAttemptRef | undefined
         let fallbackUsed = false
+        let pendingContinuationSourceMessageID: string | undefined
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1110,6 +1120,7 @@ const layer = Layer.effect(
             activeUserID = lastUser.id
             active = primary
             fallbackUsed = false
+            pendingContinuationSourceMessageID = undefined
           }
           if (!active) active = primary
           const activeRef = active
@@ -1140,6 +1151,20 @@ const layer = Layer.effect(
                 messageID: lastAssistant.id,
                 tool: orphan.tool,
                 callID: orphan.callID,
+              })
+            }
+            if (fallbackUsed && !lastAssistant.error && lastAssistant.structured === undefined) {
+              yield* Effect.logInfo("session recovery", {
+                "session.id": sessionID,
+                messageID: lastAssistant.id,
+                providerID: activeRef.providerID,
+                modelID: activeRef.modelID,
+                variant: activeRef.variant,
+                fallbackProviderID: activeRef.providerID,
+                fallbackModelID: activeRef.modelID,
+                fallbackVariant: activeRef.variant,
+                phase: "fallback_outcome",
+                outcome: "completed",
               })
             }
             yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
@@ -1194,16 +1219,46 @@ const layer = Layer.effect(
           }
           const maxSteps = agent.steps ?? Infinity
           const isLastStep = step >= maxSteps
+          const configuredFallback = resolveModelFallback((yield* config.get()).fallback)
+          const fallbackRef: ModelAttemptRef | undefined = configuredFallback
+            ? (() => {
+                const parsed = Provider.parseModel(configuredFallback.model)
+                return {
+                  providerID: parsed.providerID,
+                  modelID: parsed.modelID,
+                  ...(configuredFallback.variant === null ? {} : { variant: configuredFallback.variant }),
+                }
+              })()
+            : undefined
           const fallbackCandidate =
-            !fallbackUsed && !sameModelAttempt(activeRef, FIXED_FALLBACK)
-              ? yield* provider.getModel(FIXED_FALLBACK.providerID, FIXED_FALLBACK.modelID).pipe(Effect.exit)
+            !fallbackUsed && fallbackRef && !sameModel(activeRef, fallbackRef)
+              ? yield* provider.getModel(fallbackRef.providerID, fallbackRef.modelID).pipe(Effect.exit)
               : undefined
-          const fallbackModel =
+          const fallbackVariantAvailable =
             fallbackCandidate &&
             Exit.isSuccess(fallbackCandidate) &&
-            (!FIXED_FALLBACK.variant || fallbackCandidate.value.variants?.[FIXED_FALLBACK.variant] !== undefined)
+            (fallbackRef?.variant === undefined ||
+              Object.hasOwn(fallbackCandidate.value.variants ?? {}, fallbackRef.variant))
+          const fallbackModel =
+            fallbackCandidate && Exit.isSuccess(fallbackCandidate) && fallbackVariantAvailable
               ? fallbackCandidate.value
               : undefined
+          const fallbackResolutionReason = !configuredFallback
+            ? "fallback_disabled"
+            : fallbackUsed
+              ? "fallback_already_used"
+              : fallbackRef && sameModel(activeRef, fallbackRef)
+                ? "fallback_same_model"
+                : fallbackCandidate && Exit.isFailure(fallbackCandidate)
+                  ? "fallback_model_unavailable"
+                  : fallbackCandidate &&
+                      Exit.isSuccess(fallbackCandidate) &&
+                      fallbackRef?.variant !== undefined &&
+                      !fallbackVariantAvailable
+                    ? "fallback_variant_unavailable"
+                    : fallbackModel
+                      ? "fallback_available"
+                      : "fallback_model_unavailable"
           msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
             Effect.provideService(RuntimeFlags.Service, flags),
             Effect.provideService(FSUtil.Service, fsys),
@@ -1226,15 +1281,39 @@ const layer = Layer.effect(
             sessionID,
           }
           yield* sessions.updateMessage(msg)
-
-          const finalizeInterruptedAssistant = Effect.gen(function* () {
-            if (msg.time.completed) return
-            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
-              providerID: msg.providerID,
-              aborted: true,
+          if (
+            pendingContinuationSourceMessageID &&
+            fallbackUsed &&
+            fallbackRef !== undefined &&
+            sameModel(activeRef, fallbackRef)
+          ) {
+            yield* Effect.logInfo("session recovery", {
+              "session.id": sessionID,
+              messageID: msg.id,
+              sourceMessageID: pendingContinuationSourceMessageID,
+              providerID: activeRef.providerID,
+              modelID: activeRef.modelID,
+              variant: activeRef.variant,
+              fallbackProviderID: fallbackRef.providerID,
+              fallbackModelID: fallbackRef.modelID,
+              fallbackVariant: fallbackRef.variant,
+              phase: "fallback_dispatch",
+              outcome: "entered",
+              mode: "continue",
             })
-            msg.time.completed = Date.now()
-            yield* sessions.updateMessage(msg)
+            pendingContinuationSourceMessageID = undefined
+          }
+          yield* Effect.logInfo("session recovery", {
+            "session.id": sessionID,
+            messageID: msg.id,
+            providerID: activeRef.providerID,
+            modelID: activeRef.modelID,
+            variant: activeRef.variant,
+            fallbackProviderID: fallbackRef?.providerID,
+            fallbackModelID: fallbackRef?.modelID,
+            fallbackVariant: fallbackRef?.variant,
+            phase: "fallback_resolution",
+            reason: fallbackResolutionReason,
           })
 
           let outcome: "break" | "continue" = "continue"
@@ -1248,6 +1327,35 @@ const layer = Layer.effect(
                 mcpInstructions: string | undefined
               }
             | undefined
+          let fallbackOutcomeLogged = false
+          const isFallbackAttempt = () =>
+            fallbackUsed && fallbackRef !== undefined && sameModel(attemptRef, fallbackRef)
+          const logFallbackOutcome = (outcome: "completed" | "failed") => {
+            if (!isFallbackAttempt() || fallbackOutcomeLogged) return Effect.void
+            fallbackOutcomeLogged = true
+            return Effect.logInfo("session recovery", {
+              "session.id": sessionID,
+              messageID: msg.id,
+              providerID: attemptRef.providerID,
+              modelID: attemptRef.modelID,
+              variant: attemptRef.variant,
+              fallbackProviderID: fallbackRef?.providerID,
+              fallbackModelID: fallbackRef?.modelID,
+              fallbackVariant: fallbackRef?.variant,
+              phase: "fallback_outcome",
+              outcome,
+            })
+          }
+          const finalizeInterruptedAssistant = Effect.gen(function* () {
+            yield* logFallbackOutcome("failed")
+            if (msg.time.completed) return
+            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+              providerID: msg.providerID,
+              aborted: true,
+            })
+            msg.time.completed = Date.now()
+            yield* sessions.updateMessage(msg)
+          })
 
           while (true) {
             const attemptUser: SessionV1.User = {
@@ -1264,7 +1372,10 @@ const layer = Layer.effect(
                 sessionID,
                 model: attemptModel,
                 failoverAvailable:
-                  !fallbackUsed && fallbackModel !== undefined && !sameModelAttempt(attemptRef, FIXED_FALLBACK),
+                  !fallbackUsed &&
+                  fallbackRef !== undefined &&
+                  fallbackModel !== undefined &&
+                  !sameModel(attemptRef, fallbackRef),
               })
               .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -1354,6 +1465,7 @@ const layer = Layer.effect(
                 handle.message.structured = structured
                 handle.message.finish = handle.message.finish ?? "stop"
                 yield* sessions.updateMessage(handle.message)
+                yield* logFallbackOutcome("completed")
                 return "break" as const
               }
 
@@ -1369,6 +1481,21 @@ const layer = Layer.effect(
                   }).toObject()
                   yield* sessions.updateMessage(handle.message)
                   yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+                  yield* Effect.logError("session recovery", {
+                    "session.id": sessionID,
+                    messageID: msg.id,
+                    providerID: attemptRef.providerID,
+                    modelID: attemptRef.modelID,
+                    variant: attemptRef.variant,
+                    fallbackProviderID: fallbackRef?.providerID,
+                    fallbackModelID: fallbackRef?.modelID,
+                    fallbackVariant: fallbackRef?.variant,
+                    phase: "boundary",
+                    decision: "terminal",
+                    reason: "postprocess_content_filter",
+                    recoveryCapable: false,
+                  })
+                  yield* logFallbackOutcome("failed")
                   return "break" as const
                 }
                 if (format.type === "json_schema") {
@@ -1377,11 +1504,29 @@ const layer = Layer.effect(
                     retries: 0,
                   }).toObject()
                   yield* sessions.updateMessage(handle.message)
+                  yield* Effect.logError("session recovery", {
+                    "session.id": sessionID,
+                    messageID: msg.id,
+                    providerID: attemptRef.providerID,
+                    modelID: attemptRef.modelID,
+                    variant: attemptRef.variant,
+                    fallbackProviderID: fallbackRef?.providerID,
+                    fallbackModelID: fallbackRef?.modelID,
+                    fallbackVariant: fallbackRef?.variant,
+                    phase: "boundary",
+                    decision: "terminal",
+                    reason: "postprocess_structured_output",
+                    recoveryCapable: false,
+                  })
+                  yield* logFallbackOutcome("failed")
                   return "break" as const
                 }
               }
 
-              if (processorResult === "stop") return "break" as const
+              if (processorResult === "stop") {
+                yield* logFallbackOutcome("failed")
+                return "break" as const
+              }
               if (processorResult === "compact") {
                 yield* compaction.create({
                   sessionID,
@@ -1402,26 +1547,55 @@ const layer = Layer.effect(
             )
 
             if (typeof result === "object" && result.type === "failover") {
-              if (fallbackUsed || !fallbackModel || sameModelAttempt(attemptRef, FIXED_FALLBACK)) {
+              if (fallbackUsed || !fallbackRef || !fallbackModel || sameModel(attemptRef, fallbackRef)) {
+                yield* Effect.logWarning("session recovery", {
+                  "session.id": sessionID,
+                  messageID: msg.id,
+                  providerID: attemptRef.providerID,
+                  modelID: attemptRef.modelID,
+                  variant: attemptRef.variant,
+                  fallbackProviderID: fallbackRef?.providerID,
+                  fallbackModelID: fallbackRef?.modelID,
+                  fallbackVariant: fallbackRef?.variant,
+                  phase: "fallback_dispatch",
+                  outcome: "guard_rejected",
+                  reason: "fallback_dispatch_guard_rejected",
+                  mode: result.mode,
+                })
+                yield* logFallbackOutcome("failed")
                 yield* instruction.clear(msg.id)
                 yield* handle.finalizeFailure(result.error)
                 outcome = "break"
                 break
               }
+              yield* Effect.logInfo("session recovery", {
+                "session.id": sessionID,
+                messageID: msg.id,
+                providerID: attemptRef.providerID,
+                modelID: attemptRef.modelID,
+                variant: attemptRef.variant,
+                fallbackProviderID: fallbackRef.providerID,
+                fallbackModelID: fallbackRef.modelID,
+                fallbackVariant: fallbackRef.variant,
+                phase: "fallback_dispatch",
+                outcome: "accepted",
+                mode: result.mode,
+              })
               if (result.mode === "continue") {
+                pendingContinuationSourceMessageID = msg.id
                 fallbackUsed = true
-                active = FIXED_FALLBACK
+                active = fallbackRef
                 yield* instruction.clear(msg.id)
                 outcome = "continue"
                 break
               }
               fallbackUsed = true
-              active = FIXED_FALLBACK
-              attemptRef = FIXED_FALLBACK
+              active = fallbackRef
+              attemptRef = fallbackRef
               attemptModel = fallbackModel
               msg.providerID = fallbackModel.providerID
               msg.modelID = fallbackModel.id
-              msg.variant = FIXED_FALLBACK.variant
+              msg.variant = fallbackRef.variant
               yield* sessions.updateMessage(msg)
               continue
             }

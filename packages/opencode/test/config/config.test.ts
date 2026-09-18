@@ -399,6 +399,48 @@ it.effect("updates global config and omits empty shell key in jsonc", () =>
   ),
 )
 
+it.effect("updates a JSONC object after the field was set to null", () =>
+  withGlobalConfig({}, ({ dir }) =>
+    Effect.gen(function* () {
+      const file = path.join(dir, "opencode.jsonc")
+      yield* FSUtil.use.writeWithDirs(
+        file,
+        `{
+  "$schema": "https://opencode.ai/config.json",
+  // preserve this comment
+  "username": "keep",
+  "fallback": {
+    "model": "mlx/qwen3.8-27b",
+    "variant": "xhigh"
+  }
+}
+`,
+      )
+
+      yield* Config.use.updateGlobal({ fallback: null })
+      const afterNull = ConfigParse.schema(
+        ConfigV1.Info,
+        ConfigParse.jsonc(yield* FSUtil.use.readFileString(file), file),
+        file,
+      )
+      expect(afterNull.fallback).toBeNull()
+
+      yield* Config.use.updateGlobal({
+        fallback: {
+          model: "opencode-go/qwen3.8-flash",
+          variant: null,
+        },
+      })
+
+      const written = yield* FSUtil.use.readFileString(file)
+      const final = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(written, file), file)
+      expect(final.fallback).toEqual({ model: "opencode-go/qwen3.8-flash", variant: null })
+      expect(final.username).toBe("keep")
+      expect(written).toContain("// preserve this comment")
+    }),
+  ),
+)
+
 it.effect("logs global update diagnostics once without exposing values", () =>
   withGlobalConfig(
     {
