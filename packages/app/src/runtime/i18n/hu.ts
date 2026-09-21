@@ -785,6 +785,7 @@ export const dict = {
   "server.action.authenticate": "Hitelesítés",
   "server.status.connecting": "Csatlakozás SSH-n keresztül…",
   "server.status.authentication": "Hitelesítés szükséges",
+  "ui.sessionTurn.status.fallback": "Tartalékmodell",
   "mcp.auth.interactiveForm": "A MCP szerver A {{name}} interaktív hitelesítési űrlapot igényel",
   "server.connect.title": "Csatlakozás egy szerverhez",
   "server.connect.description": "A kezdéshez adja meg a szerver címét és jelszavát.",

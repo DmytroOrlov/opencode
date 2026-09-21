@@ -802,6 +802,7 @@ export const dict = {
   "server.action.authenticate": "Uwierzytelnij się",
   "server.status.connecting": "Łączenie przez SSH…",
   "server.status.authentication": "Wymagane uwierzytelnienie",
+  "ui.sessionTurn.status.fallback": "Model zapasowy",
   "common.color.orange": "pomarańczowy",
   "common.color.yellow": "żółty",
   "common.color.cyan": "cyjan",

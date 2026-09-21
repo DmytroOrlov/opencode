@@ -776,6 +776,7 @@ export const dict = {
   "server.action.authenticate": "Автентицирај се",
   "server.status.connecting": "Се поврзува преку SSH…",
   "server.status.authentication": "Потребна е автентикација",
+  "ui.sessionTurn.status.fallback": "Резервен модел",
   "common.color.orange": "портокалова",
   "common.color.yellow": "жолта",
   "common.color.cyan": "цијан",

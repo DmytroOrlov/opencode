@@ -778,6 +778,7 @@ export const dict = {
   "server.action.authenticate": "Тасдиқ кардан",
   "server.status.connecting": "Пайвастшавӣ тавассути SSH…",
   "server.status.authentication": "Аутентификатсия талаб карда мешавад",
+  "ui.sessionTurn.status.fallback": "Модели эҳтиётӣ",
   "common.color.orange": "норанҷӣ",
   "common.color.yellow": "зард",
   "common.color.cyan": "фирӯзагӣ",

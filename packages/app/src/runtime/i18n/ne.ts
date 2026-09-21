@@ -779,6 +779,7 @@ export const dict = {
   "server.action.authenticate": "प्रमाणीकरण गर्नुहोस्",
   "server.status.connecting": "SSH मा जडान गर्दै…",
   "server.status.authentication": "प्रमाणीकरण आवश्यक छ",
+  "ui.sessionTurn.status.fallback": "फलब्याक मोडेल",
   "common.color.orange": "सुन्तला",
   "common.color.yellow": "पहेंलो",
   "common.color.cyan": "स्यान",

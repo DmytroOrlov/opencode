@@ -52,6 +52,7 @@ export const Settings = Schema.StructWithRest(
     chunkTimeout: Schema.Union([Schema.Finite, Schema.Literal(false)]).pipe(optional),
     mlxTelemetry: Schema.Boolean.pipe(optional),
     splashTelemetry: Schema.Boolean.pipe(optional),
+    splashAdaptiveSseTimeout: Schema.Boolean.pipe(optional),
     compaction: Compaction.pipe(optional),
     transport: Transport.pipe(optional),
   }),

@@ -790,6 +790,7 @@ export const dict = {
   "server.action.authenticate": "အတည်ပြုရန်",
   "server.status.connecting": "SSH ဖြင့် ချိတ်ဆက်နေသည်…",
   "server.status.authentication": "အမှုအရာအတည်ပြုခြင်း လိုအပ်ပါသည်",
+  "ui.sessionTurn.status.fallback": "အရန်မော်ဒယ်",
   "common.color.orange": "လိမ္မော်ရောင်",
   "common.color.yellow": "အဝါရောင်",
   "common.color.cyan": "စိန်ရောင်",

@@ -795,6 +795,7 @@ export const dict = {
   "server.action.authenticate": "Autentifikuoti",
   "server.status.connecting": "Jungiamasi per SSH…",
   "server.status.authentication": "Reikalingas autentifikavimas",
+  "ui.sessionTurn.status.fallback": "Atsarginis modelis",
   "mcp.auth.interactiveForm": "MCP serveriui {{name}} reikalinga interaktyvi autentifikavimo forma",
   "server.connect.title": "Prisijunkite prie serverio",
   "server.connect.description": "Norėdami pradėti, įveskite savo serverio adresą ir slaptažodį.",

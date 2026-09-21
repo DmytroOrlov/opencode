@@ -16,6 +16,7 @@ export const dict = {
   "server.action.authenticate": "Godkend",
   "server.status.connecting": "Opretter forbindelse via SSH...",
   "server.status.authentication": "Godkendelse påkrævet",
+  "ui.sessionTurn.status.fallback": "Reservemodel",
   "mcp.auth.interactiveForm": "MCP server {{name}} kræver en interaktiv godkendelsesformular",
   "server.connect.title": "Opret forbindelse til en server",
   "server.connect.description": "Indtast din serveradresse og adgangskode for at komme i gang.",

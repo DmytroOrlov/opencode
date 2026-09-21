@@ -797,6 +797,7 @@ export const dict = {
   "server.action.authenticate": "ސައްހަކުރުން",
   "server.status.connecting": "SSH މެދުވެރިކޮށް ގުޅެމުން...",
   "server.status.authentication": "އޮތެންޓިކޭޝަން ބޭނުންވެއެވެ",
+  "ui.sessionTurn.status.fallback": "ފޯލްބެކް",
   "common.color.orange": "އޮރެންޖު",
   "common.color.yellow": "ރީނދޫ",
   "common.color.cyan": "ސައިން އެވެ",

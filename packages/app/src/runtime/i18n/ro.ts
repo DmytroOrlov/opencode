@@ -781,6 +781,7 @@ export const dict = {
   "server.action.authenticate": "Autentificare",
   "server.status.connecting": "Se conectează prin SSH…",
   "server.status.authentication": "Este necesară autentificare",
+  "ui.sessionTurn.status.fallback": "Model de rezervă",
   "mcp.auth.interactiveForm": "Serverul MCP {{name}} necesită un formular de autentificare interactiv",
   "server.connect.title": "Conectați-vă la un server",
   "server.connect.description": "Introdu adresa serverului și parola pentru a începe.",

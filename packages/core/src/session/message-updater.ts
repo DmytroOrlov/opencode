@@ -2,6 +2,7 @@ import { castDraft, produce, type WritableDraft } from "immer"
 import { DateTime, Effect, Match, pipe, Schema } from "effect"
 import { SessionEvent } from "./event.js"
 import { SessionMessage } from "./message.js"
+import { SessionProviderContext } from "./provider-context.js"
 
 export interface Adapter {
   readonly getAgent: () => Effect.Effect<SessionMessage.AgentSelected["agent"] | undefined>
@@ -10,7 +11,8 @@ export interface Adapter {
   readonly getCurrentAssistant: () => Effect.Effect<SessionMessage.Assistant | undefined>
   readonly getAssistant: (messageID: SessionMessage.ID) => Effect.Effect<SessionMessage.Assistant | undefined>
   readonly getShell: (shellID: SessionMessage.Shell["shellID"]) => Effect.Effect<SessionMessage.Shell | undefined>
-  readonly getCompaction: () => Effect.Effect<SessionMessage.Compaction | undefined>
+  readonly getCompaction: (candidateID?: SessionMessage.ID) => Effect.Effect<SessionMessage.Compaction | undefined>
+  readonly hasCompactionCandidate: (candidateID: SessionMessage.ID) => Effect.Effect<boolean>
   readonly updateAssistant: (assistant: SessionMessage.Assistant) => Effect.Effect<void>
   readonly updateShell: (shell: SessionMessage.Shell) => Effect.Effect<void>
   readonly updateCompaction: (compaction: SessionMessage.Compaction) => Effect.Effect<void>
@@ -411,21 +413,52 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
         })
       },
       "session.compaction.started": (event) =>
-        adapter.appendMessage(
-          SessionMessage.CompactionRunning.make({
-            id: event.data.inputID ?? SessionMessage.ID.fromEvent(event.id),
-            type: "compaction",
-            status: "running",
-            metadata: event.metadata,
-            reason: event.data.reason,
-            summary: "",
-            recent: event.data.recent ?? "",
-            time: { created },
-          }),
-        ),
+        Effect.gen(function* () {
+          if (event.data.candidateID && (yield* adapter.hasCompactionCandidate(event.data.candidateID)))
+            return yield* Effect.die(new Error("Compaction candidate identity was already used"))
+          yield* adapter.appendMessage(
+            SessionMessage.CompactionRunning.make({
+              id: event.data.candidateID ?? event.data.inputID ?? SessionMessage.ID.fromEvent(event.id),
+              type: "compaction",
+              status: "running",
+              metadata: event.metadata,
+              reason: event.data.reason,
+              summary: "",
+              recent: event.data.recent ?? "",
+              candidateID: event.data.candidateID,
+              published: event.data.candidateID === undefined ? undefined : false,
+              time: { created },
+            }),
+          )
+        }),
       "session.compaction.ended": (event) =>
         Effect.gen(function* () {
-          const current = yield* adapter.getCompaction()
+          const current = yield* adapter.getCompaction(event.data.candidateID)
+          if (event.data.candidateID) {
+            if (
+              current?.status !== "running" ||
+              current.id !== event.data.candidateID ||
+              event.data.summaryID === undefined
+            )
+              return yield* Effect.die(new Error("Compaction completion does not match a running candidate"))
+            yield* adapter.updateCompaction({
+              ...current,
+              status: "completed",
+              metadata: event.metadata ? { ...current.metadata, ...event.metadata } : current.metadata,
+              reason: event.data.reason,
+              model: event.data.model,
+              providerState: event.data.providerState,
+              summary: event.data.text,
+              providerContext: event.data.providerContext,
+              recent: event.data.recent,
+              cost: event.data.cost,
+              tokens: event.data.tokens,
+              candidateID: event.data.candidateID,
+              summaryID: event.data.summaryID,
+              published: false,
+            })
+            return
+          }
           if (current?.status === "running") {
             yield* adapter.updateCompaction({
               ...current,
@@ -460,13 +493,33 @@ export function update(adapter: Adapter, event: SessionEvent.DurableEvent) {
             }),
           )
         }),
+      "session.compaction.published": (event) =>
+        Effect.gen(function* () {
+          const current = yield* adapter.getCompaction(event.data.candidateID)
+          if (
+            current?.status !== "completed" ||
+            current.id !== event.data.candidateID ||
+            current.candidateID !== event.data.candidateID ||
+            current.summaryID !== event.data.summaryID ||
+            current.published !== false ||
+            (!current.providerContext && !current.summary.trim())
+          )
+            return yield* Effect.die(new Error("Compaction publication does not match a usable completed pair"))
+          if (current.providerContext)
+            yield* SessionProviderContext.validate(current.providerContext).pipe(Effect.asVoid, Effect.orDie)
+          yield* adapter.updateCompaction({ ...current, published: true })
+        }),
       "session.compaction.failed": (event) =>
         Effect.gen(function* () {
-          const current = yield* adapter.getCompaction()
+          const current = yield* adapter.getCompaction(event.data.candidateID)
+          if (event.data.candidateID && (current?.status !== "running" || current.id !== event.data.candidateID))
+            return yield* Effect.die(new Error("Compaction failure does not match a running candidate"))
           const failed = SessionMessage.CompactionFailed.make({
-            id: current?.id ?? event.data.inputID ?? SessionMessage.ID.fromEvent(event.id),
+            id: event.data.candidateID ?? current?.id ?? event.data.inputID ?? SessionMessage.ID.fromEvent(event.id),
             type: "compaction",
             status: "failed",
+            candidateID: event.data.candidateID,
+            published: event.data.candidateID === undefined ? undefined : false,
             metadata: current?.metadata ?? event.metadata,
             reason: event.data.reason,
             error: event.data.error,

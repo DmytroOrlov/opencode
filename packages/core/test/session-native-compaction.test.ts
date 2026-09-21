@@ -213,8 +213,9 @@ const setup = Effect.fnUntraced(function* (options: { endpoint?: boolean } = {})
   // Opens the compaction's message as the runner does when it delivers `/compact`.
   const compact = Effect.gen(function* () {
     const inputID = SessionMessage.ID.create()
-    yield* bus.publish(SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "", inputID })
-    return yield* compaction.compact({ reason: "manual", context: yield* load, inputID })
+    const candidateID = SessionCompaction.manualCandidateID(inputID)
+    yield* bus.publish(SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "", inputID, candidateID })
+    return yield* compaction.compact({ reason: "manual", context: yield* load, inputID, candidateID, started: true })
   })
   const checkpoint = Effect.gen(function* () {
     const messages = (yield* load).messages

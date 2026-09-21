@@ -851,6 +851,7 @@ export const dict = {
   "server.action.authenticate": "Kimlik Doğrula",
   "server.status.connecting": "SSH üzerinden bağlanılıyor…",
   "server.status.authentication": "Kimlik doğrulama gerekli",
+  "ui.sessionTurn.status.fallback": "Yedek model",
   "mcp.auth.interactiveForm": "MCP sunucusu {{name}} etkileşimli bir kimlik doğrulama formu gerektirir",
   "server.connect.title": "Bir sunucuya bağlanın",
   "server.connect.description": "Başlamak için sunucu adresinizi ve şifrenizi girin.",

@@ -786,6 +786,7 @@ export const dict = {
   "server.action.authenticate": "Έλεγχος ταυτότητας",
   "server.status.connecting": "Σύνδεση μέσω SSH…",
   "server.status.authentication": "Απαιτείται έλεγχος ταυτότητας",
+  "ui.sessionTurn.status.fallback": "Μοντέλο εφέδρας",
   "mcp.auth.interactiveForm": "Ο διακομιστής MCP Ο {{name}} απαιτεί μια διαδραστική φόρμα ελέγχου ταυτότητας",
   "server.connect.title": "Σύνδεση σε διακομιστή",
   "server.connect.description": "Εισαγάγετε τη διεύθυνση του διακομιστή και τον κωδικό πρόσβασης για να ξεκινήσετε.",

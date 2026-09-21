@@ -26,3 +26,27 @@ export function resolveSessionComposerSelection(
       : historical,
   }
 }
+
+export type ComposerModelPair = {
+  readonly model: { readonly providerID: string; readonly modelID: string }
+  readonly variant?: string
+}
+
+export function swapModelPair(input: {
+  readonly primary?: ComposerModelPair
+  readonly fallback?: ComposerModelPair
+  readonly primaryVariants: readonly string[]
+  readonly fallbackVariants: readonly string[]
+}) {
+  if (!input.fallback) return
+  const primaryVariant = input.fallback.variant && input.fallbackVariants.includes(input.fallback.variant)
+    ? input.fallback.variant
+    : undefined
+  const fallbackVariant = input.primary?.variant && input.primaryVariants.includes(input.primary.variant)
+    ? input.primary.variant
+    : undefined
+  return {
+    primary: { model: input.fallback.model, variant: primaryVariant },
+    fallback: input.primary ? { model: input.primary.model, variant: fallbackVariant } : null,
+  }
+}

@@ -784,6 +784,7 @@ export const dict = {
   "server.action.authenticate": "אימות",
   "server.status.connecting": "מתחבר באמצעות SSH…",
   "server.status.authentication": "נדרש אימות",
+  "ui.sessionTurn.status.fallback": "Fallback",
   "mcp.auth.interactiveForm": "שרת MCP בשם \u2068{{name}}\u2069 דורש טופס אימות אינטראקטיבי",
   "server.connect.title": "התחברות לשרת",
   "server.connect.description": "יש להזין את כתובת השרת והסיסמה כדי להתחיל.",

@@ -1,7 +1,7 @@
 import { batch, createEffect, createMemo, on } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { ComposerControls } from "./adapter"
-import { useLocal, type ModelKey, type ModelSelection } from "@/providers/models/selection"
+import { createFallbackModelSelection, useLocal, type ModelKey, type ModelSelection } from "@/providers/models/selection"
 import { useWorkspaceLocation } from "@/workspaces/location"
 import { useProviders } from "@/providers/catalog/providers"
 import { useData } from "@/runtime/server/current"
@@ -10,12 +10,38 @@ import { useModels } from "@/providers/models/models"
 import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "@/providers/models/variant"
 import { useComposerState } from "./persistence"
 import { useConfiguredModel } from "@/providers/models/configured"
+import { swapModelPair } from "@/session/composer/selection"
 
 export function createComposerControls(input: { model?: ModelSelection } = {}) {
   const local = useLocal()
   const sdk = useWorkspaceLocation()
   const data = useData()
   const providers = useProviders(() => sdk().directory)
+  const selection = input.model ?? local.model
+  const fallback = createFallbackModelSelection()
+  const swap = () => {
+    const primary = selection.current()
+    const backup = fallback.current()
+    if (!backup) return
+    const pair = swapModelPair({
+      primary: primary
+        ? {
+            model: { providerID: primary.provider.id, modelID: primary.id },
+            variant: selection.variant.current(),
+          }
+        : undefined,
+      fallback: {
+        model: { providerID: backup.provider.id, modelID: backup.id },
+        variant: fallback.variant.current(),
+      },
+      primaryVariants: selection.variant.list(),
+      fallbackVariants: fallback.variant.list(),
+    })
+    if (!pair) return
+    fallback.set(pair.fallback?.model, { variant: pair.fallback?.variant ?? null })
+    selection.set(pair.primary.model)
+    selection.variant.set(pair.primary.variant)
+  }
 
   return createMemo<ComposerControls>(() => {
     return {
@@ -27,10 +53,12 @@ export function createComposerControls(input: { model?: ModelSelection } = {}) {
         select: local.agent.set,
       },
       model: {
-        selection: input.model ?? local.model,
+        selection,
+        fallback,
+        swap,
         paid: providers.paid().length > 0,
         loading:
-          !(input.model ?? local.model).ready() ||
+          !selection.ready() ||
           (local.agent.visible() && data.location.agent.list({ directory: sdk().directory }) === undefined) ||
           !providers.ready(),
       },

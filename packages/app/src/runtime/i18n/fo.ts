@@ -770,6 +770,7 @@ export const dict = {
   "server.action.authenticate": "Staðfesta",
   "server.status.connecting": "Samband yvir SSH...",
   "server.status.authentication": "Staðfesting krevst",
+  "ui.sessionTurn.status.fallback": "Faramodell",
   "mcp.auth.interactiveForm": "MCP ambætarin {{name}} krevur eitt samvirkið sannroyndarblað",
   "server.connect.title": "Set samband við ein ambætara",
   "server.connect.description": "Skriva tína ambætaraadressu og loyniorð fyri at byrja.",

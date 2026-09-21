@@ -94,6 +94,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "Unošenje izmjena",
   "ui.sessionTurn.status.runningCommands": "Pokretanje komandi",
   "ui.sessionTurn.status.thinking": "Razmišljanje",
+  "ui.sessionTurn.status.fallback": "Rezervni model",
   "ui.sessionTurn.status.thinkingWithTopic": "Razmišljanje - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Sređivanje misli",
   "ui.sessionTurn.status.consideringNextSteps": "Razmatranje sljedećih koraka",

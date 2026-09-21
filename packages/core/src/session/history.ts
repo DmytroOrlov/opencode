@@ -38,6 +38,13 @@ export const latestCompaction = Effect.fnUntraced(function* (
         eq(SessionMessageTable.session_id, sessionID),
         eq(SessionMessageTable.type, "compaction"),
         sql`json_extract(${SessionMessageTable.data}, '$.status') = 'completed'`,
+        or(
+          and(
+            sql`json_extract(${SessionMessageTable.data}, '$.candidateID') is null`,
+            sql`json_extract(${SessionMessageTable.data}, '$.summaryID') is null`,
+          ),
+          sql`json_extract(${SessionMessageTable.data}, '$.published') = 1`,
+        ),
         boundary === "latest"
           ? undefined
           : or(
@@ -103,7 +110,14 @@ const messageEntries = Effect.fnUntraced(function* (
   // Skipped native checkpoints are not textual summaries. Their original transcript remains available.
   return entries.filter(
     (entry) =>
-      !(entry.message.type === "system" && native && entry.seq < native.seq) && replayable(entry.message, boundary),
+      !(entry.message.type === "system" && native && entry.seq < native.seq) &&
+      replayable(entry.message, boundary) &&
+      !(
+        entry.message.type === "compaction" &&
+        entry.message.status !== "failed" &&
+        (entry.message.candidateID !== undefined || entry.message.summaryID !== undefined) &&
+        entry.message.published !== true
+      ),
   )
 })
 

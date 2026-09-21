@@ -236,7 +236,16 @@ export const Assistant = Schema.Struct({
   }),
 }).annotate({ identifier: "Session.Message.Assistant" })
 
-const CompactionBase = { type: Schema.tag("compaction"), ...Base }
+const CompactionBase = {
+  type: Schema.tag("compaction"),
+  ...Base,
+  /** Present on compactions prepared with the candidate/publication protocol. */
+  candidateID: ID.pipe(optional),
+  /** Identity of the generated summary/checkpoint paired with this candidate. */
+  summaryID: ID.pipe(optional),
+  /** Set only by the durable Compaction.Published projector. */
+  published: Schema.Boolean.pipe(optional),
+}
 
 /** Usage of the compaction request itself, not the size of the resulting context. */
 const CompactionUsage = {

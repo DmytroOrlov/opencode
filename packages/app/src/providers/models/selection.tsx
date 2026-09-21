@@ -3,7 +3,7 @@ import { base64Encode } from "@opencode/util/encode"
 import { useParams } from "@solidjs/router"
 import { batch, createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
-import { Schema, SchemaGetter } from "effect"
+import { Option, Schema, SchemaGetter } from "effect"
 import { useModels } from "@/providers/models/models"
 import { useSettings } from "@/settings/model"
 import { useProviders } from "@/providers/catalog/providers"
@@ -12,11 +12,18 @@ import { Persistence } from "@/runtime/persistence/schema"
 import { hasCustomAgent, resolveAgent } from "./agent"
 import { cycleModelVariant, getConfiguredAgentVariant, resolveModelVariant } from "./variant"
 import { useWorkspaceLocation } from "@/workspaces/location"
-import { useData } from "@/runtime/server/current"
+import { useData, useServer } from "@/runtime/server/current"
 import { normalizeAgentList } from "@/runtime/server/global-sync/utils"
 import { useServerSDK } from "@/runtime/server/client"
 import { ScopedKey, type ServerScope } from "@/runtime/server/scope"
 import { useConfiguredModel } from "./configured"
+import { ConfigModel } from "@opencode/schema/config/model"
+import { useLanguage } from "@/runtime/i18n/language"
+import { showToast } from "@/shell/notifications/toast"
+import { formatServerError } from "@/runtime/server/errors"
+import { Model } from "@opencode/schema/model"
+import { Provider } from "@opencode/schema/provider"
+import { fallbackUpdateState } from "./fallback-update"
 
 const ModelKeySchema = Schema.Struct({
   providerID: Schema.String,
@@ -550,3 +557,109 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
 export type ModelSelection = Omit<ReturnType<typeof useLocal>["model"], "trackSessionCommit"> &
   Partial<Pick<ReturnType<typeof useLocal>["model"], "trackSessionCommit">>
+
+type FallbackSelection = ModelSelection & {
+  enabled: () => boolean
+  set: (item: ModelKey | undefined, options?: { recent?: boolean; variant?: string | null }) => void
+}
+
+/** Global fallback config is separate from V2's per-session primary selection. */
+export function createFallbackModelSelection(): FallbackSelection {
+  const models = useModels()
+  const server = useServer()
+  const language = useLanguage()
+  const fallbackUpdate = fallbackUpdateState<ConfigModel.Selection | null>(server.ctx.sync, (value) =>
+    server.ctx.sync.updateConfig({ fallback: value }),
+  )
+  const optimistic = fallbackUpdate.optimistic
+
+  const raw = () => {
+    const update = optimistic()
+    return update ? update.value : server.ctx.sync.data.config.fallback
+  }
+  const configured = () => {
+    const value = raw()
+    if (value === null) return undefined
+    if (value === undefined)
+      return {
+        providerID: Provider.ID.make("mlx"),
+        model: Model.ID.make("qwen3.8-27b"),
+        variant: Model.VariantID.make("xhigh"),
+      } satisfies ConfigModel.Selection
+    return Option.getOrUndefined(Schema.decodeUnknownOption(ConfigModel.Selection)(value))
+  }
+  const current = () => {
+    const value = configured()
+    return value ? models.find({ providerID: value.providerID, modelID: value.model }) : undefined
+  }
+  const save = (value: ConfigModel.Selection | null) =>
+    fallbackUpdate.save(value, (error) => {
+        showToast({
+          title: language.t("common.requestFailed"),
+          description: formatServerError(error, language.t),
+        })
+    })
+
+  const variant = {
+    configured: () => configured()?.variant,
+    selected: () => configured()?.variant,
+    current() {
+      const model = current()
+      return resolveModelVariant({
+        variants: this.list(),
+        selected: this.selected() ?? null,
+        configured: undefined,
+        preferred: model ? models.variant.get({ providerID: model.provider.id, modelID: model.id }) : undefined,
+      })
+    },
+    list: () => Object.keys(current()?.variants ?? {}),
+    set(value: string | undefined) {
+      const selected = configured()
+      if (!selected) return
+      save({ ...selected, variant: value ? Model.VariantID.make(value) : undefined })
+    },
+    cycle() {
+      const variants = this.list()
+      if (variants.length === 0) return
+      this.set(cycleModelVariant({ variants, selected: this.current() ?? null, configured: undefined }))
+    },
+  }
+
+  return {
+    enabled: () => raw() !== null,
+    ready: Object.assign(() => models.ready(), { promise: models.ready.promise }),
+    current,
+    recent: createMemo(() => models.recent.list().map(models.find).filter((item): item is NonNullable<typeof item> => !!item)),
+    list: models.list,
+    cycle(direction) {
+      const recent = models.recent.list().map(models.find).filter((item): item is NonNullable<typeof item> => !!item)
+      const selected = current()
+      if (!selected || recent.length === 0) return
+      const index = recent.findIndex((item) => item.provider.id === selected.provider.id && item.id === selected.id)
+      const next = recent[(index + direction + recent.length) % recent.length]
+      if (next) this.set({ providerID: next.provider.id, modelID: next.id }, { recent: true })
+    },
+    set(item: ModelKey | undefined, options?: { recent?: boolean; variant?: string | null }) {
+      if (item && !models.find(item)) return
+      const previous = configured()
+      const same = item && previous?.providerID === item.providerID && previous.model === item.modelID
+      const selectedVariant = options && Object.hasOwn(options, "variant") ? options.variant : same ? previous?.variant : undefined
+      save(
+        item
+          ? {
+              providerID: Provider.ID.make(item.providerID),
+              model: Model.ID.make(item.modelID),
+              variant: selectedVariant ? Model.VariantID.make(selectedVariant) : undefined,
+            }
+          : null,
+      )
+      if (item) {
+        models.setVisibility(item, true)
+        if (options?.recent) models.recent.push(item)
+      }
+    },
+    visible: models.visible,
+    setVisibility: models.setVisibility,
+    variant,
+  }
+}

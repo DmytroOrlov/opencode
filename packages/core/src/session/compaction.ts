@@ -29,7 +29,7 @@ import { Token } from "../util/token.js"
 import type { SessionContext } from "./context.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
-import type { SessionMessage } from "./message.js"
+import { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
 import { SessionProviderContext } from "./provider-context.js"
 import { SessionRunnerModel } from "./runner/model.js"
@@ -52,9 +52,21 @@ export type Editor = {
 
 export type Trigger =
   /** `overflow`: the provider just rejected this context as too long. */
-  | { readonly reason: "auto" | "overflow"; readonly context: SessionContext.Loaded }
+  | {
+      readonly reason: "auto" | "overflow"
+      readonly context: SessionContext.Loaded
+      readonly candidateID?: SessionMessage.ID
+      readonly started?: boolean
+    }
   /** `inputID` is the `/compact` inbox item, whose message shows the outcome. */
-  | { readonly reason: "manual"; readonly context: SessionContext.Loaded; readonly inputID: SessionMessage.ID }
+  | {
+      readonly reason: "manual"
+      readonly context: SessionContext.Loaded
+      readonly inputID: SessionMessage.ID
+      readonly candidateID?: SessionMessage.ID
+      /** The runner atomically publishes InboxDelivered and Started before invoking compaction. */
+      readonly started?: boolean
+    }
 
 export type Outcome =
   /** Only `auto` skips: the context fits, or automatic compaction is off. */
@@ -67,6 +79,9 @@ export interface Interface extends State.Transformable<Editor> {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCompaction") {}
+
+// V2 historically uses the delivered inbox ID for the running compaction row.
+export const manualCandidateID = (inputID: SessionMessage.ID) => inputID
 
 /** A summary fills `text` and `recent`; a native compaction fills `providerContext`. */
 type Result = {
@@ -210,6 +225,18 @@ export const layer = Layer.effect(
       if (trigger.reason !== "manual" && !settings.auto) return { status: "skipped" }
       if (trigger.reason === "auto" && !due(context, calculateCeiling(context.model.limit, settings.buffer)))
         return { status: "skipped" }
+      const owned = {
+        ...trigger,
+        candidateID: trigger.candidateID ?? (trigger.reason === "manual" ? manualCandidateID(trigger.inputID) : SessionMessage.ID.create()),
+      }
+      if (!owned.started)
+        yield* bus.publish(SessionEvent.Compaction.Started, {
+          sessionID: context.session.id,
+          reason: trigger.reason === "manual" ? "manual" : "auto",
+          recent: "",
+          inputID: trigger.reason === "manual" ? trigger.inputID : undefined,
+          candidateID: owned.candidateID,
+        })
       const native = context.model.compaction?.type === "native"
       const agent = native ? undefined : yield* agents.get(Agent.ID.make("compaction"))
       const model =
@@ -227,7 +254,7 @@ export const layer = Layer.effect(
       const budget =
         trigger.reason === "overflow" ? Math.min(cap, Math.floor(estimateContext(context) * SHRINK_STEPS[0])) : cap
 
-      const selected = model === context.model ? trigger : { ...trigger, context: { ...context, model } }
+      const selected = model === context.model ? owned : { ...owned, context: { ...context, model } }
       const compaction = native
         ? compactNatively(selected, budget, settings.keep)
         : summarize(selected, budget, settings.keep)
@@ -389,10 +416,6 @@ export const layer = Layer.effect(
       send: (request: LLMRequest) => Effect.Effect<Result, AIError | Failure>,
     ): Effect.fn.Return<Result, Failure> {
       const context = trigger.context
-      // The runner opened the manual compaction's message when it delivered the `/compact` item.
-      if (trigger.reason !== "manual") {
-        yield* bus.publish(SessionEvent.Compaction.Started, { sessionID: context.session.id, reason: "auto", recent })
-      }
       if (prepared.event.result) return yield* fromHook(context, prepared.event.result, recent)
 
       const policy = yield* SessionRunnerRetry.policy(context.session.id)
@@ -634,11 +657,29 @@ export const layer = Layer.effect(
           sessionID,
           reason,
           inputID: trigger.reason === "manual" ? trigger.inputID : undefined,
+          candidateID: trigger.candidateID,
           error: outcome.error,
           ...usage,
         })
         return { status: "failed", error: outcome.error }
       }
+
+      if (outcome.providerContext)
+        yield* SessionProviderContext.validate(outcome.providerContext).pipe(Effect.asVoid, Effect.orDie)
+      if (!outcome.providerContext && !outcome.text.trim()) {
+        const error = { type: "compaction.failed", message: "Compaction produced no usable summary" } as const
+        yield* bus.publish(SessionEvent.Compaction.Failed, {
+          sessionID,
+          reason,
+          inputID: trigger.reason === "manual" ? trigger.inputID : undefined,
+          candidateID: trigger.candidateID,
+          error,
+          ...usage,
+        })
+        return { status: "failed", error }
+      }
+
+      const summaryID = SessionMessage.ID.create()
 
       yield* bus.publish(
         SessionEvent.Compaction.Ended,
@@ -650,10 +691,15 @@ export const layer = Layer.effect(
           providerContext: outcome.providerContext,
           text: outcome.text,
           recent: outcome.recent,
+          candidateID: trigger.candidateID,
+          summaryID,
           ...usage,
         },
         { metadata: outcome.metadata },
       )
+      const candidateID = trigger.candidateID
+      if (!candidateID) return yield* Effect.die(new Error("Compaction candidate identity was not established"))
+      yield* bus.publish(SessionEvent.Compaction.Published, { sessionID, candidateID, summaryID })
       return { status: "completed" }
     })
 

@@ -335,6 +335,7 @@ export type ProviderSettings = {
   chunkTimeout?: number | false
   mlxTelemetry?: boolean
   splashTelemetry?: boolean
+  splashAdaptiveSseTimeout?: boolean
   compaction?: ProviderCompaction
   transport?: ProviderTransport
 } & { [x: string]: any }
@@ -343,6 +344,7 @@ export type ConfigProviderSettings = {
   timeout?: number | false
   headerTimeout?: number | false
   chunkTimeout?: number | false
+  splashAdaptiveSseTimeout?: boolean
   compaction?: ProviderCompaction
   transport?: ProviderTransport
 } & { [x: string]: JsonValue | null }
@@ -387,6 +389,9 @@ export type SessionMessageCompactionRunning = {
   id: SessionMessageID
   metadata?: { [x: string]: JsonValue }
   time: { created: number }
+  candidateID?: SessionMessageID
+  summaryID?: SessionMessageID
+  published?: boolean
   status: "running"
   reason: "auto" | "manual"
   summary: string
@@ -497,6 +502,9 @@ export type SessionMessageCompactionFailed = {
   id: SessionMessageID
   metadata?: { [x: string]: JsonValue }
   time: { created: number }
+  candidateID?: SessionMessageID
+  summaryID?: SessionMessageID
+  published?: boolean
   status: "failed"
   reason: "auto" | "manual"
   error: SessionStructuredError
@@ -1343,7 +1351,23 @@ export type SessionCompactionStarted = {
   type: "session.compaction.started"
   durable: { aggregateID: string; seq: EventSeq; version: 1 }
   location?: LocationRef
-  data: { sessionID: SessionID; reason: "auto" | "manual"; recent: string; inputID?: SessionMessageID }
+  data: {
+    sessionID: SessionID
+    reason: "auto" | "manual"
+    recent: string
+    inputID?: SessionMessageID
+    candidateID?: SessionMessageID
+  }
+}
+
+export type SessionCompactionPublished = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.compaction.published"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; candidateID: SessionMessageID; summaryID: SessionMessageID }
 }
 
 export type SessionCompactionFailed = {
@@ -1358,6 +1382,7 @@ export type SessionCompactionFailed = {
     reason: "auto" | "manual"
     error: SessionStructuredError
     inputID?: SessionMessageID
+    candidateID?: SessionMessageID
     cost?: MoneyUSD
     tokens?: TokenUsageInfo
   }
@@ -2035,6 +2060,9 @@ export type SessionMessageCompactionCompleted = {
   id: SessionMessageID
   metadata?: { [x: string]: JsonValue }
   time: { created: number }
+  candidateID?: SessionMessageID
+  summaryID?: SessionMessageID
+  published?: boolean
   status: "completed"
   reason: "auto" | "manual"
   model?: ModelRef
@@ -2063,6 +2091,8 @@ export type SessionCompactionEnded = {
     recent: string
     cost?: MoneyUSD
     tokens?: TokenUsageInfo
+    candidateID?: SessionMessageID
+    summaryID?: SessionMessageID
   }
 }
 
@@ -2161,6 +2191,7 @@ export type ConfigEntry =
         $schema?: string
         shell?: string
         model?: string | { providerID: string; model: string; variant?: string }
+        fallback?: string | { providerID: string; model: string; variant?: string } | null
         default_agent?: string
         update?: "disable" | "notify" | "auto"
         share?: "manual" | "auto" | "disabled"
@@ -2535,6 +2566,7 @@ export type SessionEventDurable =
   | SessionRetryScheduled
   | SessionCompactionStarted
   | SessionCompactionEnded
+  | SessionCompactionPublished
   | SessionCompactionFailed
   | SessionRevertStaged
   | SessionRevertCleared
@@ -2605,6 +2637,7 @@ export type V2Event =
   | SessionCompactionStarted
   | SessionCompactionDelta
   | SessionCompactionEnded
+  | SessionCompactionPublished
   | SessionCompactionFailed
   | SessionRevertStaged
   | SessionRevertCleared
@@ -3456,6 +3489,9 @@ export type SessionImportInput = {
               readonly id: string
               readonly metadata?: { readonly [x: string]: JsonValue }
               readonly time: { readonly created: number }
+              readonly candidateID?: string
+              readonly summaryID?: string
+              readonly published?: boolean
               readonly status: "running"
               readonly reason: "auto" | "manual"
               readonly summary: string
@@ -3466,6 +3502,9 @@ export type SessionImportInput = {
               readonly id: string
               readonly metadata?: { readonly [x: string]: JsonValue }
               readonly time: { readonly created: number }
+              readonly candidateID?: string
+              readonly summaryID?: string
+              readonly published?: boolean
               readonly status: "completed"
               readonly reason: "auto" | "manual"
               readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
@@ -3497,6 +3536,9 @@ export type SessionImportInput = {
               readonly id: string
               readonly metadata?: { readonly [x: string]: JsonValue }
               readonly time: { readonly created: number }
+              readonly candidateID?: string
+              readonly summaryID?: string
+              readonly published?: boolean
               readonly status: "failed"
               readonly reason: "auto" | "manual"
               readonly error: {
@@ -3799,6 +3841,9 @@ export type SessionImportInput = {
               readonly id: string
               readonly metadata?: { readonly [x: string]: JsonValue }
               readonly time: { readonly created: number }
+              readonly candidateID?: string
+              readonly summaryID?: string
+              readonly published?: boolean
               readonly status: "running"
               readonly reason: "auto" | "manual"
               readonly summary: string
@@ -3809,6 +3854,9 @@ export type SessionImportInput = {
               readonly id: string
               readonly metadata?: { readonly [x: string]: JsonValue }
               readonly time: { readonly created: number }
+              readonly candidateID?: string
+              readonly summaryID?: string
+              readonly published?: boolean
               readonly status: "completed"
               readonly reason: "auto" | "manual"
               readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
@@ -3840,6 +3888,9 @@ export type SessionImportInput = {
               readonly id: string
               readonly metadata?: { readonly [x: string]: JsonValue }
               readonly time: { readonly created: number }
+              readonly candidateID?: string
+              readonly summaryID?: string
+              readonly published?: boolean
               readonly status: "failed"
               readonly reason: "auto" | "manual"
               readonly error: {
@@ -4142,6 +4193,9 @@ export type SessionImportInput = {
               readonly id: string
               readonly metadata?: { readonly [x: string]: JsonValue }
               readonly time: { readonly created: number }
+              readonly candidateID?: string
+              readonly summaryID?: string
+              readonly published?: boolean
               readonly status: "running"
               readonly reason: "auto" | "manual"
               readonly summary: string
@@ -4152,6 +4206,9 @@ export type SessionImportInput = {
               readonly id: string
               readonly metadata?: { readonly [x: string]: JsonValue }
               readonly time: { readonly created: number }
+              readonly candidateID?: string
+              readonly summaryID?: string
+              readonly published?: boolean
               readonly status: "completed"
               readonly reason: "auto" | "manual"
               readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
@@ -4183,6 +4240,9 @@ export type SessionImportInput = {
               readonly id: string
               readonly metadata?: { readonly [x: string]: JsonValue }
               readonly time: { readonly created: number }
+              readonly candidateID?: string
+              readonly summaryID?: string
+              readonly published?: boolean
               readonly status: "failed"
               readonly reason: "auto" | "manual"
               readonly error: {
@@ -6831,6 +6891,15 @@ export type ConfigGetOutput = Array<ConfigEntry>
 
 export type ConfigShellsOutput = Array<ConfigShellOption>
 
-export type ConfigUpdateInput = { readonly shell: { readonly shell: string | null }["shell"] }
+export type ConfigUpdateInput = {
+  readonly shell?: {
+    readonly shell?: string | null
+    readonly fallback?: { readonly providerID: string; readonly model: string; readonly variant?: string } | null
+  }["shell"]
+  readonly fallback?: {
+    readonly shell?: string | null
+    readonly fallback?: { readonly providerID: string; readonly model: string; readonly variant?: string } | null
+  }["fallback"]
+}
 
 export type ConfigUpdateOutput = void

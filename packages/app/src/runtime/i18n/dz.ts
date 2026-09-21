@@ -788,6 +788,7 @@ export const dict = {
   "server.action.authenticate": "བདེན་བཤད་འབད།",
   "server.status.connecting": "SSH བརྒྱུད་དེ་མཐུད་དོ...",
   "server.status.authentication": "བདེན་བཤད་འབད་དགོ",
+  "ui.sessionTurn.status.fallback": "Fallback",
   "mcp.auth.interactiveForm": "MCP སར་བར་ {{name}} ལུ་ འབྲེལ་མཐུན་བདེན་བཤད་འབྲི་ཤོག་ཅིག་དགོཔ་ཨིན།",
   "server.connect.title": "སར་བར་ཅིག་ལུ་མཐུད།",
   "server.connect.description": "འགོ་བཙུགས་ནིའི་དོན་ལུ་ ཁྱོད་རའི་སར་བར་ཁ་བྱང་དང་ཆོག་ཡིག་བཙུགས།",

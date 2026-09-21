@@ -59,6 +59,8 @@ import { IdentityPlugin } from "@opencode/core/plugin/identity"
 import { QuestionTool } from "@opencode/core/tool/plugin/question"
 import { Agent } from "@opencode/core/agent"
 import { Config } from "@opencode/core/config"
+import { FallbackRuntimeIntent } from "@opencode/core/config/fallback-runtime-intent"
+import { SessionGenerationAdmission } from "@opencode/core/session/generation-admission"
 import { Document, Info } from "@opencode/schema/config"
 import { ConfigCompaction } from "@opencode/schema/config/compaction"
 import { Tool } from "@opencode/core/tool"
@@ -121,6 +123,8 @@ const fakeIdentity = identity("fake", "fake-model")
 const replacementIdentity = identity("fake", "replacement")
 const gptIdentity = identity("openai", "gpt-5")
 const replacementModel = testModel("replacement")
+const fallbackModel = testModel("fallback-model")
+const selection = (id: string) => ({ providerID: Provider.ID.make("fake"), model: ID.make(id) })
 const compactModel = testModel("compact", { context: 4_000, output: 50 })
 const fullOutputModel = testModel("full-output", { context: 262_144, output: 262_144 })
 const unknownContextModel = testModel("unknown-context", { context: 0, output: 32_000 })
@@ -323,7 +327,12 @@ const layer = Layer.unwrap(
       resolve: (session) =>
         state.modelResolveHook.pipe(
           Effect.map(() => {
-            const selected = session.model?.id === "replacement" ? replacementModel : state.currentModel
+            const selected =
+              session.model?.id === "replacement"
+                ? replacementModel
+                : session.model?.id === "fallback-model"
+                  ? fallbackModel
+                  : state.currentModel
             return SessionRunnerModel.resolved(selected, {
               capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
               cost: [],
@@ -484,6 +493,8 @@ const layer = Layer.unwrap(
         LayerNodePlatform.llmClient,
         SessionRunnerLLM.node,
         SessionExecution.node,
+        SessionGenerationAdmission.node,
+        FallbackRuntimeIntent.node,
         Session.node,
       ]),
       [
@@ -5477,6 +5488,32 @@ describe("SessionRunnerLLM", () => {
       )
     })
   }
+
+  scenario("reads fallback intent after backoff and snapshots the dispatched model", function* (s) {
+    yield* s.admit("Retry with a fallback")
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered on fallback", "fallback-recovery"))
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("fallback-model"))
+
+    const dispatched = yield* s.llm.gate
+    yield* TestClock.adjust("10 seconds")
+    yield* dispatched.started
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel])
+
+    // A later accepted update cannot retarget the already-created request.
+    yield* intent.stage(selection("fake/replacement"))
+    yield* dispatched.release
+    yield* Fiber.join(run)
+
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel])
+    expect(yield* s.context).toMatchObject([
+      { type: "user" },
+      Expected.assistant({ finish: "stop" }, [Expected.text("Recovered on fallback")]),
+    ])
+  })
 
   scenario("does not start another physical attempt after interruption during retry backoff", function* (s) {
     yield* s.admit("Interrupt retry backoff")

@@ -773,6 +773,7 @@ export const dict = {
   "server.action.authenticate": "ផ្ទៀងផ្ទាត់",
   "server.status.connecting": "កំពុងតភ្ជាប់តាម SSH…",
   "server.status.authentication": "ត្រូវការការផ្ទៀងផ្ទាត់",
+  "ui.sessionTurn.status.fallback": "ម៉ូដែលបម្រុង",
   "common.color.orange": "ពណ៌ទឹកក្រូច",
   "common.color.yellow": "លឿង",
   "common.color.cyan": "សាយ៉ាន់",

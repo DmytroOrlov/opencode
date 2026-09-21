@@ -1079,6 +1079,7 @@ export type SessionLogOutput =
             readonly reason: "auto" | "manual"
             readonly recent: string
             readonly inputID?: SessionMessage.ID | undefined
+            readonly candidateID?: SessionMessage.ID | undefined
           }
         }
       | {
@@ -1120,6 +1121,23 @@ export type SessionLogOutput =
                   readonly cache: { readonly read: number; readonly write: number }
                 }
               | undefined
+            readonly candidateID?: SessionMessage.ID | undefined
+            readonly summaryID?: SessionMessage.ID | undefined
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.compaction.published"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly candidateID: SessionMessage.ID
+            readonly summaryID: SessionMessage.ID
           }
         }
       | {
@@ -1141,6 +1159,7 @@ export type SessionLogOutput =
               readonly response?: { readonly body: string } | undefined
             }
             readonly inputID?: SessionMessage.ID | undefined
+            readonly candidateID?: SessionMessage.ID | undefined
             readonly cost?: Money.USD | undefined
             readonly tokens?:
               | {
@@ -2253,9 +2272,15 @@ export type ConfigShellsOutput = ReadonlyArray<{
 }>
 export type ConfigShellsOperation<E = never> = () => Effect.Effect<ConfigShellsOutput, E>
 
-export type ConfigUpdateInput = { readonly shell: string | null }
+export type ConfigUpdateInput = {
+  readonly shell?: string | null | undefined
+  readonly fallback?:
+    | { readonly providerID: string; readonly model: string; readonly variant?: string | undefined }
+    | null
+    | undefined
+}
 export type ConfigUpdateOutput = void
-export type ConfigUpdateOperation<E = never> = (input: ConfigUpdateInput) => Effect.Effect<ConfigUpdateOutput, E>
+export type ConfigUpdateOperation<E = never> = (input?: ConfigUpdateInput) => Effect.Effect<ConfigUpdateOutput, E>
 
 export interface ConfigApi<E = never> {
   readonly get: ConfigGetOperation<E>

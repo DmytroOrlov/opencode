@@ -785,6 +785,7 @@ export const dict = {
   "server.action.authenticate": "تصدیق کرو",
   "server.status.connecting": "SSH تے جڑنا...",
   "server.status.authentication": "توثیق درکار اے۔",
+  "ui.sessionTurn.status.fallback": "فال بیک ماڈل",
   "common.color.orange": "کینو",
   "common.color.yellow": "پیلا",
   "common.color.cyan": "سیان",

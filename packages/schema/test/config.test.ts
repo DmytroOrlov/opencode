@@ -63,6 +63,36 @@ describe("Config.Entry", () => {
     })
   })
 
+  test("preserves omitted, selected, and explicit-null fallback config states", () => {
+    const absent = Schema.decodeUnknownSync(Config.Info)({})
+    expect(absent.fallback).toBeUndefined()
+    expect(Schema.encodeSync(Config.Info)(absent)).not.toHaveProperty("fallback")
+
+    const selected = Schema.decodeUnknownSync(Config.Info)({
+      fallback: { providerID: "mlx", model: "qwen3.8-27b", variant: "xhigh" },
+    })
+    expect(Schema.encodeSync(Config.Info)(selected).fallback).toEqual({
+      providerID: "mlx",
+      model: "qwen3.8-27b",
+      variant: "xhigh",
+    })
+
+    const disabled = Schema.decodeUnknownSync(Config.Info)({ fallback: null })
+    expect(disabled.fallback).toBeNull()
+    expect(Schema.encodeSync(Config.Info)(disabled)).toHaveProperty("fallback", null)
+
+    const omittedPatch = Schema.decodeUnknownSync(Config.Patch)({})
+    expect(omittedPatch).not.toHaveProperty("fallback")
+    expect(Schema.encodeSync(Config.Patch)(omittedPatch)).not.toHaveProperty("fallback")
+    expect(
+      Schema.encodeSync(
+        Config.Patch,
+      )(Schema.decodeUnknownSync(Config.Patch)({ fallback: { providerID: "mlx", model: "qwen3.8-27b", variant: "xhigh" } })),
+    ).toHaveProperty("fallback", { providerID: "mlx", model: "qwen3.8-27b", variant: "xhigh" })
+    expect(Schema.decodeUnknownSync(Config.Patch)({ fallback: null }).fallback).toBeNull()
+    expect(Schema.encodeSync(Config.Patch)({ fallback: null })).toHaveProperty("fallback", null)
+  })
+
   test("accepts disabled, fixed, and random web search selection", () => {
     const decode = Schema.decodeUnknownSync(Config.Info)
 

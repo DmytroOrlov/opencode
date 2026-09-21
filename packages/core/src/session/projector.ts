@@ -1,10 +1,11 @@
 export * as SessionProjector from "./projector.js"
 
 import { and, asc, desc, eq, gt, gte, inArray, isNull, lt, lte, or, sql } from "drizzle-orm"
-import { DateTime, Effect, Layer, Schema, Stream } from "effect"
+import { DateTime, Effect, Layer, Result, Schema, Stream, Struct } from "effect"
 import path from "path"
 import { Database } from "../database/database.js"
 import { Bus } from "../bus.js"
+import { EventTable } from "../event/sql.js"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Agent } from "@opencode/schema/agent"
 import { Model } from "@opencode/schema/model"
@@ -24,6 +25,7 @@ import { Project } from "@opencode/schema/project"
 import { AbsolutePath, RelativePath } from "../schema.js"
 import type { SessionSchema } from "./schema.js"
 import { ProjectTable } from "../project/sql.js"
+import { SessionProviderContext } from "./provider-context.js"
 
 type DatabaseService = Database.Interface["db"]
 type MessageEvent = Exclude<
@@ -211,21 +213,46 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
       .pipe(Effect.orDie)
     if (rows.length === 0) break
 
-    yield* db
-      .insert(SessionMessageTable)
-      .values(
-        rows.map((row) => ({
-          id: SessionMessage.ID.make(`${SessionMessage.ID.fromEvent(event.id)}_${row.seq}`),
-          session_id: event.data.sessionID,
-          type: row.type,
-          seq: row.seq,
-          time_created: row.time_created,
-          time_updated: row.time_updated,
-          data: row.data,
-        })),
-      )
-      .run()
-      .pipe(Effect.orDie)
+    const forked = yield* Effect.forEach(rows, (row) =>
+      Effect.gen(function* () {
+        const id = SessionMessage.ID.make(`${SessionMessage.ID.fromEvent(event.id)}_${row.seq}`)
+        const message = decodeMessage({ ...row.data, id: row.id, type: row.type })
+        if (message.type !== "compaction") return { row, id, data: row.data }
+        const legacy =
+          message.candidateID === undefined && message.summaryID === undefined && message.published === undefined
+        if (legacy) return { row, id, data: row.data }
+        if (
+          message.status !== "completed" ||
+          message.candidateID !== row.id ||
+          message.summaryID === undefined ||
+          message.published !== true ||
+          (!message.providerContext && !message.summary.trim())
+        )
+          return undefined
+        if (message.providerContext) {
+          const valid = yield* SessionProviderContext.validate(message.providerContext).pipe(Effect.result)
+          if (Result.isFailure(valid)) return undefined
+        }
+        const summaryID = SessionMessage.ID.make(`${id}_summary`)
+        const encoded = encodeMessage({ ...message, id, candidateID: id, summaryID, published: true })
+        return { row, id, data: Struct.omit(encoded, ["id", "type"]) as typeof row.data }
+      }),
+    )
+    const values = forked.flatMap((copy) =>
+      copy
+        ? [{
+            id: copy.id,
+            session_id: event.data.sessionID,
+            type: copy.row.type,
+            seq: copy.row.seq,
+            time_created: copy.row.time_created,
+            time_updated: copy.row.time_updated,
+            data: copy.data,
+          }]
+        : [],
+    )
+    if (values.length > 0)
+      yield* db.insert(SessionMessageTable).values(values).run().pipe(Effect.orDie)
 
     cursor = rows.at(-1)!.seq
   }
@@ -362,7 +389,7 @@ function run(db: DatabaseService, event: MessageEvent) {
           return message.type === "shell" ? message : undefined
         })
       },
-      getCompaction() {
+      getCompaction(candidateID) {
         return Effect.gen(function* () {
           const row = yield* db
             .select()
@@ -371,7 +398,8 @@ function run(db: DatabaseService, event: MessageEvent) {
               and(
                 eq(SessionMessageTable.session_id, event.data.sessionID),
                 eq(SessionMessageTable.type, "compaction"),
-                sql`json_extract(${SessionMessageTable.data}, '$.status') = 'running'`,
+                candidateID ? eq(SessionMessageTable.id, candidateID) : undefined,
+                candidateID ? undefined : sql`json_extract(${SessionMessageTable.data}, '$.status') = 'running'`,
               ),
             )
             .orderBy(desc(SessionMessageTable.seq))
@@ -382,6 +410,20 @@ function run(db: DatabaseService, event: MessageEvent) {
           const message = decodeRow(row)
           return message.type === "compaction" ? message : undefined
         })
+      },
+      hasCompactionCandidate(candidateID) {
+        return db
+          .select({ id: EventTable.id })
+          .from(EventTable)
+          .where(
+            and(
+              eq(EventTable.aggregate_id, event.data.sessionID),
+              eq(EventTable.type, Bus.versionedType(SessionEvent.Compaction.Started.type, 1)),
+              sql`json_extract(${EventTable.data}, '$.candidateID') = ${candidateID}`,
+            ),
+          )
+          .get()
+          .pipe(Effect.orDie, Effect.map((row) => row !== undefined))
       },
       updateAssistant: updateMessage,
       updateShell: updateMessage,
@@ -728,6 +770,15 @@ const layer = Layer.effectDiscard(
     yield* bus.project(SessionEvent.RetryScheduled, (event) => run(db, event))
     yield* bus.project(SessionEvent.Compaction.Started, (event) => run(db, event))
     yield* bus.project(SessionEvent.Compaction.Ended, (event) =>
+      Effect.gen(function* () {
+        yield* run(db, event)
+        // Legacy ended events are themselves the publication fact. New candidate pairs
+        // advance the instruction epoch only when their exact Published event is applied.
+        if (event.data.candidateID === undefined)
+          yield* InstructionState.advanceEpoch(db, event.data.sessionID, event.durable.seq)
+      }),
+    )
+    yield* bus.project(SessionEvent.Compaction.Published, (event) =>
       Effect.gen(function* () {
         yield* run(db, event)
         yield* InstructionState.advanceEpoch(db, event.data.sessionID, event.durable.seq)

@@ -21,12 +21,17 @@ import { SessionStore } from "../store.js"
 import { SessionMessageTable } from "../sql.js"
 import { SessionTitle } from "../title.js"
 import { toSessionError } from "../to-session-error.js"
+import { Config } from "../../config.js"
+import { ConfigFallback } from "../../config/fallback.js"
+import { FallbackRuntimeIntent } from "../../config/fallback-runtime-intent.js"
+import { Model } from "@opencode/schema/model"
 import { DrainResult, Service, type Interface } from "./index.js"
 import { Snapshot } from "../../snapshot.js"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { llmClient } from "../../effect/app-node-platform.js"
 import { StepFailedError } from "../error.js"
 import { SessionRunnerRetry } from "./retry.js"
+import { SessionRunnerModel } from "./model.js"
 import { SessionStep } from "./step.js"
 import { ToolOutput } from "../../tool-output.js"
 import { Plugin } from "../../plugin.js"
@@ -47,6 +52,8 @@ const layer = Layer.effect(
     const compaction = yield* SessionCompaction.Service
     const plugins = yield* Plugin.Service
     const title = yield* SessionTitle.Service
+    const config = yield* Config.Service
+    const fallbackIntent = yield* FallbackRuntimeIntent.Service
     const steps = yield* SessionStep.make
     // Title generation starts once input is visible and must not delay model execution.
     const titles = yield* FiberMap.make<SessionSchema.ID, void, never>()
@@ -85,11 +92,19 @@ const layer = Layer.effect(
                     sessionID,
                     entering || !continuing ? "input" : "steer",
                   )
-                  if (next?.type === "compaction")
+                  if (next?.type === "compaction") {
+                    const candidateID = SessionCompaction.manualCandidateID(next.id)
                     yield* bus.publishAll([
                       [SessionEvent.InboxDelivered, { sessionID, inboxID: next.id }],
-                      [SessionEvent.Compaction.Started, { sessionID, reason: "manual", recent: "", inputID: next.id }],
+                      [SessionEvent.Compaction.Started, {
+                        sessionID,
+                        reason: "manual",
+                        recent: "",
+                        inputID: next.id,
+                        candidateID,
+                      }],
                     ])
+                  }
                   if (next?.type === "move")
                     yield* restore(
                       Effect.gen(function* () {
@@ -110,6 +125,7 @@ const layer = Layer.effect(
               if (pending?.type === "move")
                 return DrainResult.Moved({ continuation: continuing ? { step } : undefined })
               if (pending?.type === "compaction") {
+                const candidateID = SessionCompaction.manualCandidateID(pending.id)
                 const compacted = yield* restore(
                   Effect.gen(function* () {
                     const selected = yield* context.select(sessionID)
@@ -124,6 +140,8 @@ const layer = Layer.effect(
                     return yield* compaction.compact({
                       reason: "manual",
                       inputID: pending.id,
+                      candidateID,
+                      started: true,
                       context: {
                         session: selected.session,
                         agent: selected.agent,
@@ -139,6 +157,7 @@ const layer = Layer.effect(
                         sessionID,
                         reason: "manual",
                         inputID: pending.id,
+                        candidateID,
                         error: toSessionError(error),
                       }),
                     ),
@@ -152,6 +171,7 @@ const layer = Layer.effect(
                       ? { type: "aborted", message: "Compaction cancelled" }
                       : { type: "compaction.failed", message: Cause.pretty(compacted.cause) },
                     inputID: pending.id,
+                    candidateID: SessionCompaction.manualCandidateID(pending.id),
                   })
                   return yield* Effect.failCause(compacted.cause)
                 }
@@ -210,16 +230,51 @@ const layer = Layer.effect(
       let initial: SessionContext.Loaded | undefined = first
       let recoverOverflow = true
       let recoverContinuation = true
+      let nextModel: SessionRunnerModel.Resolved | undefined
+      let recoveryPending = false
+      const usedModels = new Set<string>()
+      const modelKey = (model: SessionRunnerModel.Resolved) => `${model.ref.providerID}/${model.ref.id}`
+      const chooseFallback = Effect.fnUntraced(function* (
+        session: SessionSchema.Info,
+        current: SessionRunnerModel.Resolved,
+      ) {
+        const intent = yield* fallbackIntent.current()
+        const selection =
+          intent.override.type === "some"
+            ? intent.override.value
+            : ConfigFallback.resolve(Config.latest(yield* config.entries(), "fallback"))
+        if (!selection) return current
+        const fallback = yield* context
+          .resolveModel({
+            ...session,
+            model: Model.Ref.make({
+              providerID: selection.providerID,
+              id: selection.model,
+              ...(selection.variant === undefined ? {} : { variant: selection.variant }),
+            }),
+          })
+          .pipe(Effect.orElseSucceed(() => undefined))
+        if (!fallback || modelKey(fallback) === modelKey(current) || usedModels.has(modelKey(fallback))) return current
+        usedModels.add(modelKey(fallback))
+        return fallback
+      })
       while (true) {
         // Reuse boundary preparation once; retries refresh context without delivering more input.
-        const loaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
+        const selected = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
         initial = undefined
-        const compacted = yield* compaction.compact({ reason: "auto", context: loaded })
+        const preflight = { ...selected, model: nextModel ?? selected.model }
+        const compacted = yield* compaction.compact({ reason: "auto", context: preflight })
         if (compacted.status === "failed") return yield* new StepFailedError({ error: compacted.error })
         if (compacted.status === "completed") {
           assistantMessageID = SessionMessage.ID.create()
           continue
         }
+        if (recoveryPending) {
+          nextModel = yield* chooseFallback(selected.session, preflight.model)
+          recoveryPending = false
+        }
+        const loaded = { ...selected, model: nextModel ?? preflight.model }
+        usedModels.add(modelKey(loaded.model))
         const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
         const transcript = SessionModelRequest.baseTranscript({
           agent: loaded.agent.info,
@@ -269,18 +324,21 @@ const layer = Layer.effect(
         })
         const completed = yield* SessionStep.Outcome.$match(outcome, {
           Completed: (outcome) => Effect.succeed(outcome.needsContinuation),
-          Retry: (outcome) =>
-            retry.wait({
+          Retry: Effect.fnUntraced(function* (outcome) {
+            yield* retry.wait({
               decision: outcome.decision,
               error: outcome.error,
               assistantMessageID,
-            }),
+            })
+            recoveryPending = true
+          }),
           Continue: Effect.fnUntraced(function* (outcome) {
             yield* retry.wait({
               decision: outcome.decision,
               error: outcome.error,
               assistantMessageID,
             })
+            recoveryPending = true
             yield* bus.publish(SessionEvent.Synthetic, { sessionID, text: CONTINUE_AFTER_INCOMPLETE_STREAM })
             assistantMessageID = SessionMessage.ID.create()
           }),
@@ -365,6 +423,8 @@ export const node = makeLocationNode({
     SessionContext.node,
     SessionModelTransport.node,
     SessionStore.node,
+    Config.node,
+    FallbackRuntimeIntent.node,
     SessionCompaction.node,
     Plugin.node,
     SessionTitle.node,

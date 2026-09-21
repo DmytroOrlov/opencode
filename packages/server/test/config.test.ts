@@ -91,6 +91,31 @@ it.live("updates the global shell without replacing unrelated JSONC", () =>
     expect(text).toContain('"model": "provider/model"')
     expect(text).toContain('"shell": "/bin/zsh"')
 
+    const fallbackResponse = yield* Effect.promise(() =>
+      fetch(new URL("/api/experimental/config", server.base), {
+        method: "PATCH",
+        headers: { ...server.headers, "content-type": "application/json" },
+        body: JSON.stringify({ fallback: { providerID: "openai", model: "gpt-test", variant: "high" } }),
+      }),
+    )
+    expect(fallbackResponse.status).toBe(204)
+    const fallbackText = yield* Effect.promise(() => fs.readFile(config, "utf8"))
+    expect(fallbackText).toContain('"shell": "/bin/zsh"')
+    expect(fallbackText).toContain('"fallback": {')
+    expect(fallbackText).toContain('"providerID": "openai"')
+
+    const disabledResponse = yield* Effect.promise(() =>
+      fetch(new URL("/api/experimental/config", server.base), {
+        method: "PATCH",
+        headers: { ...server.headers, "content-type": "application/json" },
+        body: JSON.stringify({ fallback: null }),
+      }),
+    )
+    expect(disabledResponse.status).toBe(204)
+    const disabledText = yield* Effect.promise(() => fs.readFile(config, "utf8"))
+    expect(disabledText).toContain('"shell": "/bin/zsh"')
+    expect(disabledText).toContain('"fallback": null')
+
     const shells = yield* Effect.promise(() =>
       fetch(new URL("/api/config/shell", server.base), { headers: server.headers }),
     )

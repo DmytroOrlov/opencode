@@ -2,6 +2,7 @@ export * as SessionRunCoordinator from "./run-coordinator.js"
 
 import { Deferred, Effect, Exit, Fiber, FiberSet, Scope } from "effect"
 import type { Promotable } from "./inbox.js"
+import { SessionGenerationAdmission } from "./generation-admission.js"
 
 /** Serializes execution for each key while allowing different keys to run concurrently. */
 export interface Coordinator<Key, E, Reason = never> {
@@ -59,6 +60,8 @@ type Execution<E, Reason> = {
  */
 export const make = <Key, E, Reason = never>(options: {
   readonly drain: (key: Key, force: boolean, scope: Promotable) => Effect.Effect<void, E>
+  /** Holds shared generation admission for this complete busy period, including settlement. */
+  readonly admission?: { readonly acquireShared: Effect.Effect<SessionGenerationAdmission.Lease> }
   /** Runs once when a process-local busy period begins, before its first drain. */
   readonly started?: (key: Key) => Effect.Effect<void>
   /**
@@ -96,8 +99,17 @@ export const make = <Key, E, Reason = never>(options: {
       // Drains start one tick after wake; callers observe progress through events or run.
       execution.owner = fork(
         Effect.yieldNow.pipe(
-          Effect.andThen(Effect.uninterruptible(options.started?.(key) ?? Effect.void)),
-          Effect.andThen(loop(key, execution, force)),
+          Effect.andThen(
+            Effect.suspend(() =>
+              (options.admission?.acquireShared ?? Effect.succeed({ release: Effect.void })).pipe(
+                Effect.flatMap((lease) =>
+                  Effect.uninterruptible(options.started?.(key) ?? Effect.void)
+                    .pipe(Effect.andThen(loop(key, execution, force)))
+                    .pipe(Effect.ensuring(lease.release)),
+                ),
+              ),
+            ),
+          ),
           Effect.onExit((exit) =>
             Effect.sync(() => {
               execution.owner = undefined

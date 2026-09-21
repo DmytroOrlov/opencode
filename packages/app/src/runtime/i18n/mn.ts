@@ -779,6 +779,7 @@ export const dict = {
   "server.action.authenticate": "Баталгаажуулах",
   "server.status.connecting": "SSH-р холбож байна…",
   "server.status.authentication": "Нэвтрэх хэрэгтэй",
+  "ui.sessionTurn.status.fallback": "Нөөц модель",
   "common.color.orange": "улбар шар",
   "common.color.yellow": "шар",
   "common.color.cyan": "цэнхэр ногоон",

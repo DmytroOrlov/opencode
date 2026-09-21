@@ -779,6 +779,7 @@ export const dict = {
   "server.action.authenticate": "प्रमाणित",
   "server.status.connecting": "SSH से कनेक्ट हो रहा है…",
   "server.status.authentication": "प्रमाणित करना",
+  "ui.sessionTurn.status.fallback": "फ़ॉलबैक",
   "common.color.orange": "नारंगी",
   "common.color.yellow": "पीला",
   "common.color.cyan": "सियान",

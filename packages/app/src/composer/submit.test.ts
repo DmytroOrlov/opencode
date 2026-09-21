@@ -42,7 +42,7 @@ function controls(): ComposerControls {
       visible: true,
       select() {},
     },
-    model: { selection, paid: true, loading: false },
+    model: { selection, fallback: { ...selection, enabled: () => false }, swap() {}, paid: true, loading: false },
   }
 }
 

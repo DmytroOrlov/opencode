@@ -783,6 +783,7 @@ export const dict = {
   "server.action.authenticate": "Xác thực",
   "server.status.connecting": "Đang kết nối qua SSH…",
   "server.status.authentication": "Cần xác thực",
+  "ui.sessionTurn.status.fallback": "Mô hình dự phòng",
   "common.color.orange": "cam",
   "common.color.yellow": "vàng",
   "common.color.cyan": "xanh lơ",

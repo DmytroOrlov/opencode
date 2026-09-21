@@ -86,6 +86,7 @@ export const dict: Record<string, string> = {
   "ui.sessionTurn.status.makingEdits": "सम्पादन गर्दै",
   "ui.sessionTurn.status.runningCommands": "चलिरहेको आदेशहरू",
   "ui.sessionTurn.status.thinking": "सोच्दै",
+  "ui.sessionTurn.status.fallback": "फलब्याक मोडेल",
   "ui.sessionTurn.status.thinkingWithTopic": "सोच - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "विचारहरू जम्मा गर्दै",
   "ui.sessionTurn.status.consideringNextSteps": "अर्को चरणहरू विचार गर्दै",

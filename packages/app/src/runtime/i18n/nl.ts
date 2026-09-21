@@ -16,6 +16,7 @@ export const dict = {
   "server.action.authenticate": "Authenticeren",
   "server.status.connecting": "Verbinding maken via SSH…",
   "server.status.authentication": "Authenticatie vereist",
+  "ui.sessionTurn.status.fallback": "Terugvalmodel",
   "mcp.auth.interactiveForm": "MCP-server {{name}} vereist een interactief authenticatieformulier",
   "server.connect.title": "Maak verbinding met een server",
   "server.connect.description": "Voer uw serveradres en wachtwoord in om aan de slag te gaan.",

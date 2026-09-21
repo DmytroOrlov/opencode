@@ -32,6 +32,9 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   model: ConfigModel.Selection.pipe(optional).annotate({
     description: "Default model to use when no session or agent model is selected",
   }),
+  fallback: Schema.NullOr(ConfigModel.Selection).pipe(optional).annotate({
+    description: "Fallback model to use after a retryable provider failure; null disables fallback",
+  }),
   default_agent: Schema.String.pipe(optional).annotate({
     description: "Default primary agent to use when no session agent is selected",
   }),
@@ -110,7 +113,14 @@ export class Info extends Schema.Class<Info>("Config.Info")({
 }) {}
 
 export const Patch = Schema.Struct({
-  shell: Schema.NullOr(Schema.String),
+  shell: Schema.NullOr(Schema.String).pipe(optional),
+  fallback: Schema.NullOr(
+    Schema.Struct({
+      providerID: Schema.String,
+      model: Schema.String,
+      variant: Schema.String.pipe(optional),
+    }),
+  ).pipe(optional),
 }).annotate({ identifier: "Config.Patch" })
 export interface Patch extends Schema.Schema.Type<typeof Patch> {}
 

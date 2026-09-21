@@ -342,13 +342,21 @@ const compactManually = (
   Effect.gen(function* () {
     const bus = yield* Bus.Service
     const compaction = yield* SessionCompaction.Service
+    const candidateID = SessionCompaction.manualCandidateID(inputID)
     yield* bus.publish(SessionEvent.Compaction.Started, {
       sessionID: session.id,
       reason: "manual",
       recent: "",
       inputID,
+      candidateID,
     })
-    return yield* compaction.compact({ reason: "manual", context: loaded(session, messages), inputID })
+    return yield* compaction.compact({
+      reason: "manual",
+      context: loaded(session, messages),
+      inputID,
+      candidateID,
+      started: true,
+    })
   })
 
 /** The recent text a manual compaction keeps when the latest exchange is one tool call with this output. */
@@ -494,6 +502,7 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
       { type: Bus.versionedType(SessionEvent.Compaction.Started.type, 1) },
       { type: Bus.versionedType(SessionEvent.UsageRecorded.type, 1) },
       { type: Bus.versionedType(SessionEvent.Compaction.Ended.type, 1) },
+      { type: Bus.versionedType(SessionEvent.Compaction.Published.type, 1) },
     ])
   }),
 )
@@ -545,6 +554,7 @@ it.effect("compaction hooks can supply the summary instead of the model", () =>
     ).toEqual([
       { type: Bus.versionedType(SessionEvent.Compaction.Started.type, 1) },
       { type: Bus.versionedType(SessionEvent.Compaction.Ended.type, 1) },
+      { type: Bus.versionedType(SessionEvent.Compaction.Published.type, 1) },
     ])
   }),
 )

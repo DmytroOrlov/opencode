@@ -773,6 +773,7 @@ export const dict = {
   "server.action.authenticate": "აუთენტიფიკაცია",
   "server.status.connecting": "კავშირის დამყარება SSH-ის საშუალებით…",
   "server.status.authentication": "ავთენტიფიკაცია საჭირო არის",
+  "ui.sessionTurn.status.fallback": "სარეზერვო მოდელი",
   "common.color.orange": "ნარინჯისფერი",
   "common.color.yellow": "ყვითელი",
   "common.color.cyan": "ცისფერი",

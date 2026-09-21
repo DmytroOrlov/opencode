@@ -84,6 +84,7 @@ export const dict: Record<string, string> = {
   "ui.sessionTurn.status.makingEdits": "Խմբագրում",
   "ui.sessionTurn.status.runningCommands": "Գործող հրամաններ",
   "ui.sessionTurn.status.thinking": "Մտածում",
+  "ui.sessionTurn.status.fallback": "Պահուստային մոդել",
   "ui.sessionTurn.status.thinkingWithTopic": "Մտածում - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Մտքերի հավաքում",
   "ui.sessionTurn.status.consideringNextSteps": "Հաշվի առնելով հաջորդ քայլերը",

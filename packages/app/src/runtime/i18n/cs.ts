@@ -788,6 +788,7 @@ export const dict = {
   "server.action.authenticate": "Ověřit",
   "server.status.connecting": "Připojování přes SSH…",
   "server.status.authentication": "Je vyžadováno ověření",
+  "ui.sessionTurn.status.fallback": "Záložní model",
   "common.color.orange": "oranžová",
   "common.color.yellow": "žlutá",
   "common.color.cyan": "azurová",

@@ -2,7 +2,7 @@ import { describe, expect } from "bun:test"
 import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
-import { DateTime, Effect, Layer, Stream } from "effect"
+import { DateTime, Effect, Layer, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { Money } from "@opencode/schema/money"
 import { Shell } from "@opencode/schema/shell"
@@ -29,7 +29,7 @@ import { SessionExecution } from "@opencode/core/session/execution"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
 import { SessionEvent } from "@opencode/core/session/event"
-import { SessionTable } from "@opencode/core/session/sql"
+import { SessionInboxTable, SessionMessageTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { SessionTransfer } from "@opencode/core/session/transfer"
 import { Workspace } from "@opencode/core/workspace"
@@ -621,6 +621,58 @@ describe("Session.create", () => {
 
       expect(forked.title).toBeUndefined()
       expect(row?.title).toBeNull()
+    }),
+  )
+
+  it.effect("remaps published compaction references while keeping pending work on the source", () =>
+    Effect.gen(function* () {
+      const session = yield* Session.Service
+      const bus = yield* Bus.Service
+      const { db } = yield* Database.Service
+      const parent = yield* session.create({ location, title: "Compaction source" })
+      yield* session.prompt({ sessionID: parent.id, text: "Published history", resume: false })
+      yield* SessionInbox.promote(db, bus, parent.id, "steer")
+      const candidateID = SessionMessage.ID.create()
+      const summaryID = SessionMessage.ID.create()
+      const model = Model.Ref.make({ id: Model.ID.make("compaction-model"), providerID: Provider.ID.make("test") })
+
+      yield* bus.publish(SessionEvent.Compaction.Started, {
+        sessionID: parent.id,
+        reason: "manual",
+        recent: "recent context",
+        candidateID,
+      })
+      yield* bus.publish(SessionEvent.Compaction.Ended, {
+        sessionID: parent.id,
+        reason: "manual",
+        model,
+        text: "## Objective\n- completed work",
+        recent: "recent context",
+        candidateID,
+        summaryID,
+      })
+      yield* bus.publish(SessionEvent.Compaction.Published, { sessionID: parent.id, candidateID, summaryID })
+      const pending = yield* session.prompt({ sessionID: parent.id, text: "Still pending", resume: false })
+
+      const forked = yield* session.fork({ sessionID: parent.id })
+      const copied = yield* db
+        .select({ id: SessionMessageTable.id, type: SessionMessageTable.type, data: SessionMessageTable.data })
+        .from(SessionMessageTable)
+        .where(and(eq(SessionMessageTable.session_id, forked.id), eq(SessionMessageTable.type, "compaction")))
+        .get()
+        .pipe(Effect.orDie)
+      const copiedMessage = copied
+        ? Schema.decodeUnknownSync(SessionMessage.Info)({ ...copied.data, id: copied.id, type: copied.type })
+        : undefined
+      if (copiedMessage?.type !== "compaction") return yield* Effect.die(new Error("Expected forked compaction"))
+      expect(copiedMessage.published).toBe(true)
+      expect(copiedMessage.candidateID).toBe(copiedMessage.id)
+      expect(copiedMessage.summaryID).not.toBe(summaryID)
+      expect(copiedMessage.candidateID).not.toBe(candidateID)
+      expect(yield* SessionInbox.find(db, pending.id)).toMatchObject({ sessionID: parent.id })
+      expect(
+        yield* db.select({ id: SessionInboxTable.id }).from(SessionInboxTable).where(eq(SessionInboxTable.session_id, forked.id)).all(),
+      ).toEqual([])
     }),
   )
 

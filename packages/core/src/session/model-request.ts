@@ -315,6 +315,9 @@ export const layer = Layer.effect(
         model: route === base.model.route ? base.model : LanguageModel.update(base.model, { route }),
         http: new HttpOptions({
           ...base.http,
+          splashAdaptiveSseTimeout: model.splashAdaptiveSseTimeout,
+          splashAdaptiveEndpoint:
+            typeof route.endpoint.baseURL === "string" ? route.endpoint.baseURL : undefined,
           headers: Object.keys(modelHook.headers).length === 0 ? undefined : modelHook.headers,
         }),
       })

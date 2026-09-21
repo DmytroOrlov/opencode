@@ -16,6 +16,8 @@ export type ComposerControls = {
   }
   model: {
     selection: ModelSelection
+    fallback: ModelSelection & { enabled: () => boolean }
+    swap: () => void
     paid: boolean
     loading: boolean
   }

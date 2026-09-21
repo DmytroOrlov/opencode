@@ -777,6 +777,7 @@ export const dict = {
   "server.action.authenticate": "Հաստատել",
   "server.status.connecting": "Կապ հաստատում SSH-ի միջոցով…",
   "server.status.authentication": "Պայմանավորվածություն պահանջվում է",
+  "ui.sessionTurn.status.fallback": "Պահուստային մոդել",
   "common.color.orange": "նարնջագույն",
   "common.color.yellow": "դեղին",
   "common.color.cyan": "փիրուզագույն",

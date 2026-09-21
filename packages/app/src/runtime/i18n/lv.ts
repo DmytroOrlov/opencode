@@ -782,6 +782,7 @@ export const dict = {
   "server.action.authenticate": "Autentificēt",
   "server.status.connecting": "Savienojuma izveide, izmantojot SSH…",
   "server.status.authentication": "Nepieciešama autentifikācija",
+  "ui.sessionTurn.status.fallback": "Rezerves modelis",
   "mcp.auth.interactiveForm": "MCP serverim {{name}} ir nepieciešama interaktīva autentifikācijas veidlapa",
   "server.connect.title": "Izveidojiet savienojumu ar serveri",
   "server.connect.description": "Lai sāktu, ievadiet servera adresi un paroli.",

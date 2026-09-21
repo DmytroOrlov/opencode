@@ -790,6 +790,7 @@ export const dict = {
   "server.action.authenticate": "認証",
   "server.status.connecting": "SSHで接続中…",
   "server.status.authentication": "認証が必要です",
+  "ui.sessionTurn.status.fallback": "フォールバック",
   "common.color.orange": "オレンジ",
   "common.color.yellow": "黄色",
   "common.color.cyan": "シアン",

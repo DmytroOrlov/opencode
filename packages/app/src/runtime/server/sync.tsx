@@ -19,6 +19,7 @@ import type { ServerApi } from "@/runtime/server/api"
 import { toggleMcp } from "./global-sync/mcp"
 import { createConnectionSync, reconnectOrder } from "./server-sync/connection"
 import { usePlatform } from "@/runtime/platform/platform"
+import type { ConfigUpdateInput } from "@opencode/client/promise"
 import type { Data } from "@opencode/client/solid"
 import { createWorktreeInventory, withWorktreeInventory, worktreeInventoryViewKey } from "@/workspaces/inventory"
 
@@ -39,7 +40,7 @@ export const loadLspQuery = (scope: ServerScope, directory: string) =>
 
 function makeQueryOptionsApi(scope: ServerScope, serverAPI: () => ServerApi) {
   return {
-    globalConfig: () => loadGlobalConfigQuery(scope),
+    globalConfig: () => loadGlobalConfigQuery(scope, serverAPI().config),
     path: () => loadPathQuery(scope, null, serverAPI().location),
     lsp: (directory: PathKey) => loadLspQuery(scope, directory),
   }
@@ -287,17 +288,14 @@ export function createServerSyncContextInner(serverSDK: ServerSDK, data: Data) {
   }
 
   const updateConfigMutation = useMutation(() => ({
-    mutationFn: async (config: Config) => {
-      // TODO: Restore config updates when the V2 client exposes a config API.
-      // await serverSDK.api.config.update({ config })
-      throw new Error(`Config updates are unavailable: ${Object.keys(config).length} fields were not saved`)
-    },
-    onSuccess: () => {
-      bootstrap.refetch()
+    mutationFn: async (config: ConfigUpdateInput) => serverSDK.api.config.update(config),
+    onSuccess: async () => {
+      await bootstrap.refetch()
       data.location.provider.invalidate()
       data.location.model.invalidate()
       void Promise.all([data.location.provider.sync(), data.location.model.sync()])
     },
+    onError: () => queryClient.invalidateQueries({ queryKey: [serverSDK.scope, "config"] }),
   }))
 
   return {

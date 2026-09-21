@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionRunCoordinator } from "@opencode/core/session/run-coordinator"
+import { SessionGenerationAdmission } from "@opencode/core/session/generation-admission"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(Layer.empty)
@@ -681,6 +682,30 @@ describe("SessionRunCoordinator", () => {
       yield* Deferred.await(completed)
 
       expect(runs).toBe(limit)
+    }),
+  )
+
+  it.effect("cancels a run parked at shared admission and releases the next exclusive owner", () =>
+    Effect.gen(function* () {
+      const admission = yield* SessionGenerationAdmission.make
+      const protectedConfigUpdate = yield* admission.acquireExclusive
+      const drained = yield* Deferred.make<void>()
+      const coordinator = yield* SessionRunCoordinator.make<string, never, string>({
+        admission,
+        drain: () => Deferred.succeed(drained, undefined),
+      })
+      const run = yield* coordinator.run("session").pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(yield* coordinator.isActive("session")).toBe(true)
+      expect(yield* Deferred.isDone(drained)).toBe(false)
+
+      expect(yield* coordinator.interrupt("session", "user")).toBe(true)
+      yield* coordinator.awaitIdle("session")
+      yield* protectedConfigUpdate.release
+      const next = yield* admission.acquireExclusive
+      yield* next.release
+      expect(yield* Deferred.isDone(drained)).toBe(false)
+      expect(Exit.isFailure(yield* Fiber.await(run))).toBe(true)
     }),
   )
 })

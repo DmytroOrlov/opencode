@@ -858,6 +858,7 @@ export const dict = {
   "server.action.authenticate": "Аутентифицироваться",
   "server.status.connecting": "Подключение по SSH…",
   "server.status.authentication": "Требуется аутентификация",
+  "ui.sessionTurn.status.fallback": "Fallback",
   "common.color.orange": "оранжевый",
   "common.color.yellow": "желтый",
   "common.color.cyan": "голубой",

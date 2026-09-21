@@ -65,6 +65,10 @@ export class HttpOptions extends Schema.Class<HttpOptions>("AI.HttpOptions")({
   headerTimeout: Schema.optional(HttpTimeout),
   /** Time allowed between streamed response chunks once headers have arrived. */
   chunkTimeout: Schema.optional(HttpTimeout),
+  /** Enables request-local Splash idle-time calibration for eligible loopback endpoints. */
+  splashAdaptiveSseTimeout: Schema.optional(Schema.Boolean),
+  /** Effective configured endpoint used to constrain adaptive calibration to the same origin. */
+  splashAdaptiveEndpoint: Schema.optional(Schema.String),
 }) {}
 
 export namespace HttpOptions {
@@ -86,9 +90,34 @@ export const mergeHttpOptions = (...items: ReadonlyArray<HttpOptions | undefined
   const timeout = items.findLast((item) => item?.timeout !== undefined)?.timeout
   const headerTimeout = items.findLast((item) => item?.headerTimeout !== undefined)?.headerTimeout
   const chunkTimeout = items.findLast((item) => item?.chunkTimeout !== undefined)?.chunkTimeout
-  if (!body && !headers && !query && timeout === undefined && headerTimeout === undefined && chunkTimeout === undefined)
+  const splashAdaptiveSseTimeout = items.findLast((item) => item?.splashAdaptiveSseTimeout !== undefined)
+    ?.splashAdaptiveSseTimeout
+  const splashAdaptiveIndex = items.findLastIndex((item) => item?.splashAdaptiveSseTimeout !== undefined)
+  const chunkTimeoutIndex = items.findLastIndex((item) => item?.chunkTimeout !== undefined)
+  const splashAdaptiveEndpoint = items.findLast((item) => item?.splashAdaptiveEndpoint !== undefined)
+    ?.splashAdaptiveEndpoint
+  if (
+    !body &&
+    !headers &&
+    !query &&
+    timeout === undefined &&
+    headerTimeout === undefined &&
+    chunkTimeout === undefined &&
+    splashAdaptiveSseTimeout === undefined &&
+    splashAdaptiveEndpoint === undefined
+  )
     return undefined
-  return new HttpOptions({ body, headers, query, timeout, headerTimeout, chunkTimeout })
+  return new HttpOptions({
+    body,
+    headers,
+    query,
+    timeout,
+    headerTimeout,
+    chunkTimeout,
+    splashAdaptiveSseTimeout:
+      splashAdaptiveIndex < chunkTimeoutIndex ? false : splashAdaptiveSseTimeout,
+    splashAdaptiveEndpoint,
+  })
 }
 
 export class GenerationOptions extends Schema.Class<GenerationOptions>("LLM.GenerationOptions")({

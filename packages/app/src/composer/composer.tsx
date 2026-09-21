@@ -12,6 +12,7 @@ import { DialogSelectModelUnpaid } from "@/providers/models/unpaid"
 import { formatKeybind, useCommand } from "@/shell/commands/command"
 import { useLanguage } from "@/runtime/i18n/language"
 import type { ComposerModel } from "./model"
+import type { ModelSelection } from "@/providers/models/selection"
 
 export function Composer(props: {
   class?: string
@@ -46,6 +47,8 @@ export function Composer(props: {
             model={props.model.model.selection}
             provider={props.model.model.selection.current()?.provider}
             modelName={props.model.model.selection.current()?.name ?? language.t("dialog.model.select.title")}
+            fallback={props.model.model.fallback}
+            swap={props.model.model.swap}
             onClose={props.model.restoreFocus}
             onUnpaidClick={() => dialog.show(() => <DialogSelectModelUnpaid model={props.model.model.selection} />)}
           />
@@ -61,11 +64,14 @@ function ComposerModelControl(props: {
   title: string
   keybind: string[]
   model: ComposerModel["model"]["selection"]
+  fallback: ModelSelection & { enabled: () => boolean }
+  swap: () => void
   provider?: { id: string; canonical?: string; name: string }
   modelName: string
   onClose: () => void
   onUnpaidClick: () => void
 }) {
+  const language = useLanguage()
   const shouldAnimate = createMemo<boolean>((previous) => previous ?? props.loading)
   const mobile = createMediaQuery("(max-width: 767px)")
 
@@ -88,55 +94,109 @@ function ComposerModelControl(props: {
 
   return (
     <Show when={!props.loading}>
-      <Tooltip
-        inactive={mobile()}
-        placement="top"
-        gutter={4}
-        value={
-          <>
-            {props.title}
-            <Keybind keys={props.keybind} variant="neutral" />
-          </>
-        }
-      >
-        <Show
-          when={props.paid || mobile()}
-          fallback={
-            <Button
-              data-action="composer-model"
-              data-control-type="dialog"
-              variant="ghost-muted"
-              size="normal"
-              class="min-w-0 max-w-[220px] justify-start ![font-weight:440] group !px-0"
-              classList={{ "animate-in fade-in": shouldAnimate() }}
-              style={{ height: "28px" }}
-              onClick={props.onUnpaidClick}
-            >
-              {content()}
-            </Button>
+      <div class="flex min-w-0 items-center gap-2">
+        <Tooltip
+          inactive={mobile()}
+          placement="top"
+          gutter={4}
+          value={
+            <>
+              {props.title}
+              <Keybind keys={props.keybind} variant="neutral" />
+            </>
           }
         >
-          <ModelSelectorPopover
-            model={props.model}
-            unpaid={!props.paid}
-            trigger={(triggerProps) => (
+          <Show
+            when={props.paid || mobile()}
+            fallback={
               <Button
-                {...triggerProps}
+                data-action="composer-model"
+                data-control-type="dialog"
                 variant="ghost-muted"
                 size="normal"
-                style={{ height: "28px" }}
                 class="min-w-0 max-w-[220px] justify-start ![font-weight:440] group !px-0"
                 classList={{ "animate-in fade-in": shouldAnimate() }}
-                data-action="composer-model"
-                data-control-type={mobile() ? "drawer" : "popover"}
+                style={{ height: "28px" }}
+                onClick={props.onUnpaidClick}
               >
                 {content()}
               </Button>
-            )}
-            onClose={props.onClose}
-          />
-        </Show>
-      </Tooltip>
+            }
+          >
+            <ModelSelectorPopover
+              model={props.model}
+              unpaid={!props.paid}
+              trigger={(triggerProps) => (
+                <Button
+                  {...triggerProps}
+                  variant="ghost-muted"
+                  size="normal"
+                  style={{ height: "28px" }}
+                  class="min-w-0 max-w-[220px] justify-start ![font-weight:440] group !px-0"
+                  classList={{ "animate-in fade-in": shouldAnimate() }}
+                  data-action="composer-model"
+                  data-control-type={mobile() ? "drawer" : "popover"}
+                >
+                  {content()}
+                </Button>
+              )}
+              onClose={props.onClose}
+            />
+          </Show>
+        </Tooltip>
+        <div class="flex min-w-0 items-center gap-1">
+          <Tooltip placement="top" gutter={4} value={language.t("ui.sessionTurn.status.fallback")}>
+            <ModelSelectorPopover
+              model={props.fallback}
+              trigger={(triggerProps) => (
+                <Button
+                  {...triggerProps}
+                  variant="ghost-muted"
+                  size="normal"
+                  style={{ height: "28px" }}
+                  class="min-w-0 max-w-[170px] justify-start truncate ![font-weight:440] group !px-0"
+                  aria-label={language.t("ui.sessionTurn.status.fallback")}
+                  data-action="composer-fallback-model"
+                >
+                  <span class="truncate">
+                    {props.fallback.current()?.name ?? language.t("ui.sessionTurn.status.fallback")}
+                  </span>
+                  <span class="-ml-0.5 -mr-1 flex shrink-0">
+                    <Icon name="chevron-down" />
+                  </span>
+                </Button>
+              )}
+              onClose={props.onClose}
+            />
+          </Tooltip>
+          <Button
+            variant="ghost-muted"
+            size="normal"
+            style={{ height: "28px" }}
+            class="!px-1"
+            disabled={!props.fallback.current()}
+            aria-label={language.t("ui.sessionTurn.action.swapFallback")}
+            title={language.t("ui.sessionTurn.action.swapFallback")}
+            data-action="composer-fallback-swap"
+            onClick={props.swap}
+          >
+            ⇄
+          </Button>
+          <Button
+            variant="ghost-muted"
+            size="normal"
+            style={{ height: "28px" }}
+            class="!px-1"
+            disabled={!props.fallback.enabled()}
+            aria-label={`${language.t("ui.sessionTurn.status.fallback")} · ${language.t("common.clear")}`}
+            title={language.t("common.clear")}
+            data-action="composer-fallback-clear"
+            onClick={() => props.fallback.set(undefined)}
+          >
+            ×
+          </Button>
+        </div>
+      </div>
     </Show>
   )
 }

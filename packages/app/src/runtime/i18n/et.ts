@@ -766,6 +766,7 @@ export const dict = {
   "server.action.authenticate": "Autentida",
   "server.status.connecting": "Ühendamine üle SSH…",
   "server.status.authentication": "Nõutav autentimine",
+  "ui.sessionTurn.status.fallback": "Varumudel",
   "mcp.auth.interactiveForm": "MCP server {{name}} nõuab interaktiivset autentimisvormi",
   "server.connect.title": "Ühendage serveriga",
   "server.connect.description": "Alustamiseks sisestage oma serveri aadress ja parool.",

@@ -3,6 +3,7 @@ import fs from "fs/promises"
 import { describe, expect, test } from "bun:test"
 import { Arbitrary, Effect, Fiber, Layer, Logger, Schema, Stream } from "effect"
 import { Config } from "@opencode/core/config"
+import { ConfigFallback } from "@opencode/core/config/fallback"
 import { Directory, Document, type Entry, Event, Info } from "@opencode/schema/config"
 import { ConfigModel } from "@opencode/schema/config/model"
 import { ConfigProvider } from "@opencode/schema/config/provider"
@@ -85,6 +86,59 @@ const provider = {
 }
 
 describe("Config", () => {
+  it.live("persists fallback null without changing shell and preserves null on reload", () =>
+    Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
+      Effect.flatMap((tmp) =>
+        Effect.gen(function* () {
+          const global = path.join(tmp.path, "global")
+          const project = path.join(tmp.path, "project")
+          const file = path.join(global, "opencode.jsonc")
+          const initial = "{}\n"
+          yield* Effect.promise(() => Promise.all([fs.mkdir(project, { recursive: true }), fs.mkdir(global)]))
+          yield* Effect.promise(() => fs.writeFile(file, initial))
+
+          return yield* Effect.gen(function* () {
+            const config = yield* Config.Service
+            if (!config.update) throw new Error("Config updates are unavailable")
+            const first = yield* config.entries()
+            expect(Config.latest(first, "fallback")).toBeUndefined()
+            expect(ConfigFallback.resolve(Config.latest(first, "fallback"))).toEqual(ConfigFallback.LEGACY_MODEL_FALLBACK)
+
+            const selectedFallback = { providerID: "openai", model: "gpt-test", variant: "high" }
+            yield* config.update({ shell: "/bin/zsh", fallback: selectedFallback })
+            const selected = yield* config.entries()
+            expect(Config.latest(selected, "fallback")).toMatchObject({
+              providerID: "openai",
+              model: "gpt-test",
+              variant: "high",
+            })
+
+            yield* Effect.promise(() =>
+              fs.writeFile(file, '{\n  // keep this comment\n  "username": "kept"\n}\n'),
+            )
+            yield* config.update({ shell: "/bin/bash", fallback: selectedFallback })
+            const commented = yield* Effect.promise(() => fs.readFile(file, "utf8"))
+            expect(commented).toContain('"shell": "/bin/bash"')
+            expect(commented).toContain('"fallback": {')
+            expect(commented).toContain('"username": "kept"')
+            expect(commented).toContain("keep this comment")
+
+            yield* config.update({ shell: null, fallback: null })
+            const saved = yield* Effect.promise(() => fs.readFile(file, "utf8"))
+            expect(saved).not.toContain('"shell":')
+            expect(saved).toContain('"username": "kept"')
+            expect(saved).toContain('"fallback": null')
+            expect(saved).toContain("keep this comment")
+
+            const reloaded = yield* config.entries()
+            expect(Config.latest(reloaded, "fallback")).toBeNull()
+            expect(ConfigFallback.resolve(Config.latest(reloaded, "fallback"))).toBeNull()
+          }).pipe(Effect.provide(testLayer(project, global)))
+        }),
+      ),
+    ),
+  )
+
   it.live("excludes home-level claude and agents directories when global is disabled", () =>
     Effect.acquireDisposable(Effect.promise(() => tmpdir())).pipe(
       Effect.flatMap((tmp) => {

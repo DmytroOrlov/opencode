@@ -834,6 +834,7 @@ export const dict = {
   "server.action.authenticate": "ตรวจสอบสิทธิ์",
   "server.status.connecting": "กำลังเชื่อมต่อผ่าน SSH…",
   "server.status.authentication": "ต้องมีการตรวจสอบสิทธิ์",
+  "ui.sessionTurn.status.fallback": "โมเดลสำรอง",
   "common.color.orange": "ส้ม",
   "common.color.yellow": "เหลือง",
   "common.color.cyan": "ฟ้า",

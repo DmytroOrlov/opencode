@@ -831,6 +831,7 @@ export const dict = {
   "server.action.authenticate": "验证",
   "server.status.connecting": "正在通过 SSH 连接…",
   "server.status.authentication": "需要身份验证",
+  "ui.sessionTurn.status.fallback": "备用模型",
   "common.color.orange": "橙色",
   "common.color.yellow": "黄色",
   "common.color.cyan": "青色",

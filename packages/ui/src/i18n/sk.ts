@@ -112,6 +112,7 @@ export const dict: Record<string, string> = {
   "ui.sessionTurn.status.makingEdits": "Úpravy",
   "ui.sessionTurn.status.runningCommands": "Spúšťanie príkazov",
   "ui.sessionTurn.status.thinking": "Premýšľanie",
+  "ui.sessionTurn.status.fallback": "Záložný model",
   "ui.sessionTurn.status.thinkingWithTopic": "Premýšľanie – {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Zhromažďovanie myšlienok",
   "ui.sessionTurn.status.consideringNextSteps": "Zvažovanie ďalších krokov",

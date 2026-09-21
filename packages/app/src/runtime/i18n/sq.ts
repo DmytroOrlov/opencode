@@ -772,6 +772,7 @@ export const dict = {
   "server.action.authenticate": "Autentifiko",
   "server.status.connecting": "Po lidhet me SSH…",
   "server.status.authentication": "Kërkohet vërtetimi",
+  "ui.sessionTurn.status.fallback": "Model rezervë",
   "mcp.auth.interactiveForm": "Serveri MCP {{name}} kërkon një formular vërtetimi interaktiv",
   "server.connect.title": "Lidhu me një server",
   "server.connect.description": "Futni adresën dhe fjalëkalimin e serverit tuaj për të filluar.",

@@ -11,6 +11,7 @@ export const Settings = Schema.StructWithRest(
     timeout: Schema.Union([Schema.Finite, Schema.Literal(false)]).pipe(optional),
     headerTimeout: Schema.Union([Schema.Finite, Schema.Literal(false)]).pipe(optional),
     chunkTimeout: Schema.Union([Schema.Finite, Schema.Literal(false)]).pipe(optional),
+    splashAdaptiveSseTimeout: Schema.Boolean.pipe(optional),
     compaction: Provider.Compaction.pipe(optional),
     transport: Provider.Transport.pipe(optional),
   }),

@@ -757,6 +757,7 @@ export const dict = {
   "server.action.authenticate": "ያረጋግጡ",
   "server.status.connecting": "በSSH በመገናኘት ላይ...",
   "server.status.authentication": "ማረጋገጫ ያስፈልጋል",
+  "ui.sessionTurn.status.fallback": "ተተኪ ሞዴል",
   "common.color.orange": "ብርቱካናማ",
   "common.color.yellow": "ቢጫ",
   "common.color.cyan": "ሳይያን",

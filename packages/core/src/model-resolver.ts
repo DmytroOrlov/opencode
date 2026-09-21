@@ -127,6 +127,7 @@ export interface Resolved {
   /** Explicit opt-ins for provider telemetry observers; never forwarded to providers. */
   readonly mlxTelemetry?: boolean
   readonly splashTelemetry?: boolean
+  readonly splashAdaptiveSseTimeout?: boolean
 }
 
 export interface Interface {
@@ -243,7 +244,10 @@ const resolveCatalogModel = Effect.fn("ModelResolver.resolveCatalogModel")(funct
         // Timeouts are transport policy, so they land on the route's HTTP defaults instead of package settings.
         defaults: {
           ...runtime.defaults,
-          http: mergeHttpOptions(runtime.defaults?.http, new HttpOptions(Provider.timeouts(configured))),
+          http: mergeHttpOptions(
+            runtime.defaults?.http,
+            new HttpOptions(Provider.timeouts(configured, resolved.providerID)),
+          ),
         },
       })
     },
@@ -408,6 +412,7 @@ export const layer = Layer.effect(
         chunkTimeout: Provider.timeout(provider?.settings?.chunkTimeout),
         mlxTelemetry: runtimeInfo.settings?.mlxTelemetry,
         splashTelemetry: runtimeInfo.settings?.splashTelemetry,
+        splashAdaptiveSseTimeout: provider?.settings?.splashAdaptiveSseTimeout,
       }
     })
     return Service.of({

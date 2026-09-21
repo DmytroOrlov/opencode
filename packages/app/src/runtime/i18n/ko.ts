@@ -785,6 +785,7 @@ export const dict = {
   "server.action.authenticate": "인증",
   "server.status.connecting": "SSH로 연결 중…",
   "server.status.authentication": "인증 필요",
+  "ui.sessionTurn.status.fallback": "폴백",
   "common.color.orange": "주황색",
   "common.color.yellow": "노란색",
   "common.color.cyan": "청록색",

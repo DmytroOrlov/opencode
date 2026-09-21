@@ -786,6 +786,7 @@ export const dict = {
   "server.action.authenticate": "احراز هویت",
   "server.status.connecting": "در حال اتصال از طریق SSH…",
   "server.status.authentication": "احراز هویت الزامی است",
+  "ui.sessionTurn.status.fallback": "مدل جایگزین",
   "mcp.auth.interactiveForm": "سرور MCP با نام \u2068{{name}}\u2069 به فرم احراز هویت تعاملی نیاز دارد",
   "server.connect.title": "اتصال به سرور",
   "server.connect.description": "برای شروع، نشانی سرور و گذرواژه را وارد کنید.",

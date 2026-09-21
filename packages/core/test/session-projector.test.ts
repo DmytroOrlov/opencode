@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { DateTime, Effect, Fiber, Option, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
-import { asc, eq, sql } from "drizzle-orm"
+import { and, asc, eq, sql } from "drizzle-orm"
 import { Database } from "@opencode/core/database/database"
 import { Agent } from "@opencode/core/agent"
 import { LayerNode } from "@opencode/util/effect/layer-node"
@@ -204,6 +204,215 @@ describe("SessionProjector", () => {
       })
       // A committed revert resets the fold cache so the next boundary establishes a new epoch.
       expect(yield* db.select().from(InstructionStateTable).get().pipe(Effect.orDie)).toBeUndefined()
+    }),
+  )
+
+  it.effect("rejects deleted compaction candidates and late terminal events transactionally", () =>
+    Effect.gen(function* () {
+      const db = yield* seedSession()
+      const bus = yield* Bus.Service
+      const candidateID = SessionMessage.ID.create()
+      const summaryID = SessionMessage.ID.create()
+      const modelRef = Model.Ref.make({ id: Model.ID.make("compaction-model"), providerID: Provider.ID.make("test") })
+
+      yield* bus.publish(SessionEvent.Compaction.Started, {
+        sessionID,
+        reason: "manual",
+        recent: "recent",
+        candidateID,
+      })
+      yield* bus.publish(SessionEvent.RevertEvent.Committed, { sessionID, to: candidateID })
+
+      const beforeEvents = yield* db
+        .select({ id: EventTable.id })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+      const beforeSequence = yield* Bus.latestSequence(db, sessionID)
+      expect(
+        (yield* Effect.exit(
+          bus.publish(SessionEvent.Compaction.Ended, {
+          sessionID,
+          reason: "manual",
+          model: modelRef,
+          text: "late summary",
+          recent: "recent",
+          candidateID,
+          summaryID,
+          }),
+        ))._tag,
+      ).toBe("Failure")
+      expect(
+        (yield* Effect.exit(
+          bus.publish(SessionEvent.Compaction.Failed, {
+          sessionID,
+          reason: "manual",
+          error: { type: "compaction.failed", message: "late failure" },
+          candidateID,
+          }),
+        ))._tag,
+      ).toBe("Failure")
+      expect(
+        (yield* Effect.exit(bus.publish(SessionEvent.Compaction.Published, { sessionID, candidateID, summaryID })))._tag,
+      ).toBe("Failure")
+      expect(
+        (yield* Effect.exit(
+          bus.publish(SessionEvent.Compaction.Started, {
+          sessionID,
+          reason: "manual",
+          recent: "replayed candidate",
+          candidateID,
+          }),
+        ))._tag,
+      ).toBe("Failure")
+
+      expect(
+        yield* db
+          .select({ id: SessionMessageTable.id })
+          .from(SessionMessageTable)
+          .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.id, candidateID)))
+          .get()
+          .pipe(Effect.orDie),
+      ).toBeUndefined()
+      expect(
+        yield* db
+          .select({ id: EventTable.id })
+          .from(EventTable)
+          .where(eq(EventTable.aggregate_id, sessionID))
+          .all()
+          .pipe(Effect.orDie),
+      ).toEqual(beforeEvents)
+      expect(yield* Bus.latestSequence(db, sessionID)).toBe(beforeSequence)
+    }),
+  )
+
+  it.effect("rolls back an invalid compaction publication without changing the candidate", () =>
+    Effect.gen(function* () {
+      const db = yield* seedSession()
+      const bus = yield* Bus.Service
+      const candidateID = SessionMessage.ID.create()
+      const summaryID = SessionMessage.ID.create()
+      const modelRef = Model.Ref.make({ id: Model.ID.make("compaction-model"), providerID: Provider.ID.make("test") })
+
+      yield* bus.publish(SessionEvent.Compaction.Started, {
+        sessionID,
+        reason: "manual",
+        recent: "recent",
+        candidateID,
+      })
+      yield* bus.publish(SessionEvent.Compaction.Ended, {
+        sessionID,
+        reason: "manual",
+        model: modelRef,
+        text: "validated summary",
+        recent: "recent",
+        candidateID,
+        summaryID,
+      })
+      const beforeSequence = yield* Bus.latestSequence(db, sessionID)
+      const beforeEvents = yield* db
+        .select({ id: EventTable.id })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+
+      expect(
+        (yield* Effect.exit(
+          bus.publish(SessionEvent.Compaction.Published, {
+            sessionID,
+            candidateID,
+            summaryID: SessionMessage.ID.create(),
+          }),
+        ))._tag,
+      ).toBe("Failure")
+      const row = yield* db
+        .select({ data: SessionMessageTable.data })
+        .from(SessionMessageTable)
+        .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.id, candidateID)))
+        .get()
+        .pipe(Effect.orDie)
+      expect(row?.data).toMatchObject({ status: "completed", candidateID, summaryID, published: false })
+      expect(
+        yield* db
+          .select({ id: EventTable.id })
+          .from(EventTable)
+          .where(eq(EventTable.aggregate_id, sessionID))
+          .all()
+          .pipe(Effect.orDie),
+      ).toEqual(beforeEvents)
+      expect(yield* Bus.latestSequence(db, sessionID)).toBe(beforeSequence)
+    }),
+  )
+
+  it.effect("forks only published compaction pairs with fork-owned references", () =>
+    Effect.gen(function* () {
+      const db = yield* seedSession()
+      const bus = yield* Bus.Service
+      const inbox = yield* SessionInbox.Service
+      const candidateID = SessionMessage.ID.create()
+      const summaryID = SessionMessage.ID.create()
+      const forkID = Session.ID.create()
+      const pendingID = SessionMessage.ID.create()
+      const modelRef = Model.Ref.make({ id: Model.ID.make("compaction-model"), providerID: Provider.ID.make("test") })
+
+      yield* bus.publish(SessionEvent.Compaction.Started, {
+        sessionID,
+        reason: "manual",
+        recent: "recent",
+        candidateID,
+      })
+      yield* bus.publish(SessionEvent.Compaction.Ended, {
+        sessionID,
+        reason: "manual",
+        model: modelRef,
+        text: "published summary",
+        recent: "recent",
+        candidateID,
+        summaryID,
+      })
+      yield* bus.publish(SessionEvent.Compaction.Published, { sessionID, candidateID, summaryID })
+      const parentCandidate = yield* db
+        .select({ seq: SessionMessageTable.seq })
+        .from(SessionMessageTable)
+        .where(and(eq(SessionMessageTable.session_id, sessionID), eq(SessionMessageTable.id, candidateID)))
+        .get()
+        .pipe(Effect.orDie)
+      yield* inbox.admit({
+        id: pendingID,
+        sessionID,
+        item: { type: "user", payload: { text: "pending source work" }, delivery: "queue" },
+      })
+
+      const forkEvent = yield* bus.publish(SessionEvent.Forked, {
+        sessionID: forkID,
+        parentID: sessionID,
+        boundary: { type: "through", messageID: candidateID },
+      })
+      const forkedCompaction = yield* db
+        .select({ id: SessionMessageTable.id, type: SessionMessageTable.type, data: SessionMessageTable.data })
+        .from(SessionMessageTable)
+        .where(and(eq(SessionMessageTable.session_id, forkID), eq(SessionMessageTable.type, "compaction")))
+        .get()
+        .pipe(Effect.orDie)
+      expect(forkedCompaction).toMatchObject({
+        id: `${SessionMessage.ID.fromEvent(forkEvent.id)}_${parentCandidate?.seq}`,
+        data: { published: true },
+      })
+      const forkedMessage = forkedCompaction
+        ? Schema.decodeUnknownSync(SessionMessage.Info)({
+            ...forkedCompaction.data,
+            id: forkedCompaction.id,
+            type: forkedCompaction.type,
+          })
+        : undefined
+      if (forkedMessage?.type !== "compaction") return yield* Effect.die(new Error("Expected forked compaction"))
+      expect(forkedMessage.candidateID).toBe(forkedMessage.id)
+      expect(forkedMessage.summaryID).not.toBe(summaryID)
+      expect(forkedMessage.candidateID).not.toBe(candidateID)
+      expect(yield* SessionInbox.find(db, pendingID)).toMatchObject({ sessionID, id: pendingID })
+      expect(yield* inbox.list(forkID)).toEqual([])
     }),
   )
 

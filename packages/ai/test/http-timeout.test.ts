@@ -1,8 +1,9 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Deferred, Effect, Fiber } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { HttpOptions, LLM, mergeHttpOptions } from "../src/index.js"
 import { LLMClient } from "../src/route.js"
+import { adaptiveTimeout, sameLoopbackOrigin } from "../src/route/transport/http.js"
 import { configure } from "../src/providers/openai.js"
 import { dynamicResponse } from "./lib/http.js"
 import { deltaChunk, finishChunk } from "./lib/openai-chunks.js"
@@ -49,7 +50,76 @@ const stalledServer = Effect.gen(function* () {
   return { layer, stalled, resume: () => resume() }
 })
 
+const longHealthyServer = Effect.gen(function* () {
+  const first = yield* Deferred.make<void>()
+  const second = yield* Deferred.make<void>()
+  let releaseFirst = () => {}
+  let releaseSecond = () => {}
+  const firstReleased = new Promise<void>((resolve) => (releaseFirst = resolve))
+  const secondReleased = new Promise<void>((resolve) => (releaseSecond = resolve))
+  let index = 0
+  const encoder = new TextEncoder()
+  const layer = dynamicResponse((input) =>
+    Effect.sync(() =>
+      input.respond(
+        new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            if (index === 0) {
+              index++
+              Deferred.doneUnsafe(first, Effect.void)
+              await firstReleased
+              controller.enqueue(encoder.encode(sseRaw(`data: ${JSON.stringify(deltaChunk({ content: "Hello" }))}`)))
+              return
+            }
+            Deferred.doneUnsafe(second, Effect.void)
+            await secondReleased
+            controller.enqueue(encoder.encode(sseEvents(finishChunk("stop"))))
+            controller.close()
+          },
+        }),
+        SSE,
+      ),
+    ),
+  )
+  return { layer, first, second, releaseFirst: () => releaseFirst(), releaseSecond: () => releaseSecond() }
+})
+
 describe("HTTP transport timeouts", () => {
+  test("uses the Splash 30–300 second policy after excluding the slowest qualifying read", () => {
+    expect(adaptiveTimeout([1_000, 2_000, 3_000, 4_200, 30_000])).toBe(42_000)
+    expect(adaptiveTimeout([100, 200, 300, 400, 500])).toBe(30_000)
+    expect(adaptiveTimeout([40_000, 41_000, 42_000, 50_000, 90_000])).toBe(300_000)
+  })
+
+  test("requires the same HTTP(S) loopback origin for Splash calibration", () => {
+    expect(sameLoopbackOrigin("http://127.0.0.1:3000/v1", "http://127.0.0.1:3000/chat/completions")).toBe(true)
+    expect(sameLoopbackOrigin("http://localhost:3000/v1", "http://localhost:3001/chat/completions")).toBe(false)
+    expect(sameLoopbackOrigin("http://127.0.0.1:3000/v1", "https://127.0.0.1:3000/chat/completions")).toBe(false)
+    expect(sameLoopbackOrigin("https://api.example.test/v1", "https://api.example.test/v1/chat/completions")).toBe(
+      false,
+    )
+    expect(sameLoopbackOrigin("http://127.999.0.1/v1", "http://127.999.0.1/v1/chat/completions")).toBe(false)
+  })
+
+  it.effect("allows a healthy generation to exceed the default idle timeout when each read is timely", () =>
+    Effect.gen(function* () {
+      const server = yield* longHealthyServer
+      const fiber = yield* LLMClient.generate(LLM.request({ model, prompt: "Hello" })).pipe(
+        Effect.provide(server.layer),
+        Effect.forkChild({ startImmediately: true }),
+      )
+      yield* Deferred.await(server.first)
+      yield* TestClock.adjust("2 minutes")
+      server.releaseFirst()
+      yield* Deferred.await(server.second)
+      yield* TestClock.adjust("2 minutes")
+      server.releaseSecond()
+      const response = yield* Fiber.join(fiber)
+
+      expect(response.text).toBe("Hello")
+    }),
+  )
+
   it.effect("fails when response headers take longer than five minutes", () =>
     Effect.gen(function* () {
       const fiber = yield* LLMClient.generate(LLM.request({ model, prompt: "Hello" })).pipe(

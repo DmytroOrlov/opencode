@@ -773,6 +773,7 @@ export const dict = {
   "server.action.authenticate": "Hakyky tassyklamak",
   "server.status.connecting": "SSH-e birikmek…",
   "server.status.authentication": "Hakyky tassyklamak zerur",
+  "ui.sessionTurn.status.fallback": "Rezerv model",
   "common.color.orange": "mämişi",
   "common.color.yellow": "sary",
   "common.color.cyan": "firuze",

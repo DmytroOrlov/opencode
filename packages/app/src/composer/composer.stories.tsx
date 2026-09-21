@@ -96,6 +96,8 @@ function ComposerStory(props: {
     },
   } satisfies ModelSelection
 
+  const fallbackSelection = { ...modelSelection, enabled: () => true }
+
   const commands: ComposerSuggestion[] = [
     { id: "command.test", kind: "command", label: "/test", trigger: "test", title: "Run tests" },
     { id: "command.review", kind: "command", label: "/review", trigger: "review", title: "Review changes" },
@@ -217,7 +219,7 @@ function ComposerStory(props: {
 
   const model = {
     ...editor,
-    model: { selection: modelSelection, paid: true, loading: false },
+    model: { selection: modelSelection, fallback: fallbackSelection, swap() {}, paid: true, loading: false },
   } satisfies ComposerModel
 
   onMount(() => {

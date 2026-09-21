@@ -773,6 +773,7 @@ export const dict = {
   "server.action.authenticate": "Staðfesta",
   "server.status.connecting": "Tengist yfir SSH…",
   "server.status.authentication": "Auðkenning krafist",
+  "ui.sessionTurn.status.fallback": "Vararmódel",
   "mcp.auth.interactiveForm": "MCP þjónn {{name}} krefst gagnvirks auðkenningareyðublaðs",
   "server.connect.title": "Tengstu við netþjón",
   "server.connect.description": "Sláðu inn netþjóninn þinn og lykilorð til að byrja.",

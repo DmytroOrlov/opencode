@@ -781,6 +781,7 @@ export const dict = {
   "server.action.authenticate": "Autentifikasiya et",
   "server.status.connecting": "SSH üzərindən qoşulur…",
   "server.status.authentication": "Doğrulama tələb olunur",
+  "ui.sessionTurn.status.fallback": "Ehtiyat model",
   "common.color.orange": "narıncı",
   "common.color.yellow": "sarı",
   "common.color.cyan": "firuzəyi",

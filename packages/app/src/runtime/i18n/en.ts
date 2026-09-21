@@ -12,6 +12,8 @@ export const dict = {
   "server.action.authenticate": "Authenticate",
   "server.status.connecting": "Connecting over SSH…",
   "server.status.authentication": "Authentication required",
+  "ui.sessionTurn.status.fallback": "Fallback",
+  "ui.sessionTurn.action.swapFallback": "Swap primary and fallback models",
   "server.tlsCa.mode.bundled": "CA:BUNDLED",
   "server.tlsCa.mode.system": "CA:SYSTEM",
   "server.tlsCa.mode.unknown": "CA:UNKNOWN",

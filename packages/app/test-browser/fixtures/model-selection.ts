@@ -53,7 +53,10 @@ let active: ReturnType<typeof fixture>
 
 mock.module("@solidjs/router", () => ({ useParams: () => active.state.route }))
 
-mock.module("@/runtime/server/current", () => ({ useData: () => active.data }))
+mock.module("@/runtime/server/current", () => ({
+  useData: () => active.data,
+  useServer: () => ({ ctx: { sync: { data: { config: { fallback: undefined } }, updateConfig: async () => {} } } }),
+}))
 
 mock.module("@/runtime/server/client", () => ({ useServerSDK: () => active.sdk }))
 

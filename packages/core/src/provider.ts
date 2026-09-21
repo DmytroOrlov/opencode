@@ -160,10 +160,12 @@ const CORE_KEYS = [
   "headerTimeout",
   "mlxTelemetry",
   "splashTelemetry",
+  "splashAdaptiveSseTimeout",
+  "splashAdaptiveEndpoint",
   "timeout",
   "transport",
 ] as const
-const PROVIDER_ONLY_KEYS = ["chunkTimeout", "headerTimeout", "timeout", "transport"] as const
+const PROVIDER_ONLY_KEYS = ["chunkTimeout", "headerTimeout", "splashAdaptiveSseTimeout", "timeout", "transport"] as const
 
 export function nativeSettings(settings: Settings): Settings {
   return Struct.omit(settings, CORE_KEYS)
@@ -184,11 +186,12 @@ export function timeout(value: unknown) {
 }
 
 /** Request timeouts from provider settings, resolved for every route. `timeout` has no default. */
-export function timeouts(settings: Readonly<Record<string, unknown>>) {
+export function timeouts(settings: Readonly<Record<string, unknown>>, providerID?: string) {
   return {
     timeout: timeout(settings.timeout),
     headerTimeout: timeout(settings.headerTimeout) ?? DEFAULT_TIMEOUT_MS,
-    chunkTimeout: timeout(settings.chunkTimeout) ?? DEFAULT_TIMEOUT_MS,
+    chunkTimeout: timeout(settings.chunkTimeout) ?? (providerID === "opencode-go" ? 150_000 : DEFAULT_TIMEOUT_MS),
+    splashAdaptiveSseTimeout: settings.splashAdaptiveSseTimeout === true && settings.chunkTimeout === undefined,
   }
 }
 

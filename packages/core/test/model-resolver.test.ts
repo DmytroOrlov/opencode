@@ -82,6 +82,35 @@ function withConfigEnv<A, E, R>(env: Record<string, string>, effect: () => Effec
 }
 
 describe("ModelResolver", () => {
+  it.effect("resolves provider-specific chunk defaults and explicit timeout overrides", () =>
+    Effect.gen(function* () {
+      const resolve = (providerID: Provider.ID, settings: ModelOptions["settings"] = {}) =>
+        ModelResolver.fromCatalogModel(
+          model("@opencode/ai/providers/openai-compatible", {
+            providerID,
+            settings: { baseURL: "https://provider.example/v1", ...settings },
+          }),
+          undefined,
+          {
+            loadPackage: () =>
+              Effect.succeed({
+                model: () => LanguageModel.make({ id: "test-model", provider: "test", route: OpenAIChat.route }),
+              }),
+          },
+        )
+
+      const opencodeGo = yield* resolve(Provider.ID.make("opencode-go"))
+      const generic = yield* resolve(Provider.ID.make("other-provider"))
+      const explicit = yield* resolve(Provider.ID.make("opencode-go"), { chunkTimeout: 12_345 })
+      const disabled = yield* resolve(Provider.ID.make("opencode-go"), { chunkTimeout: false })
+
+      expect(opencodeGo.defaults?.http?.chunkTimeout).toBe(150_000)
+      expect(generic.defaults?.http?.chunkTimeout).toBe(300_000)
+      expect(explicit.defaults?.http?.chunkTimeout).toBe(12_345)
+      expect(disabled.defaults?.http?.chunkTimeout).toBe(false)
+    }),
+  )
+
   it.effect("constructs native Azure requests with deployment IDs and projected resource URLs", () =>
     Effect.gen(function* () {
       const responses = yield* ModelResolver.fromCatalogModel(

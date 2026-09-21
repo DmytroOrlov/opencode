@@ -844,6 +844,7 @@ export const dict = {
   "server.action.authenticate": "Autentificiraj",
   "server.status.connecting": "Povezivanje putem SSH-a…",
   "server.status.authentication": "Potrebna je autentifikacija",
+  "ui.sessionTurn.status.fallback": "Rezervni model",
   "common.color.orange": "narandžasta",
   "common.color.yellow": "žuta",
   "common.color.cyan": "cijan",

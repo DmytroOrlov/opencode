@@ -119,13 +119,26 @@ export const httpJson = <Body, Frame>(input: HttpJsonInput<Body, Frame>): HttpJs
       )
       const http = RequestExecutor.responseHttp(response)
       const remaining = Duration.subtract(total, Duration.millis((yield* Clock.currentTimeMillis) - started))
+      const source = RequestExecutor.responseStream(response)
+      const chunkTimeout = request.http?.chunkTimeout
+      const defaultChunkTimeout = chunkTimeout === false ? undefined : chunkTimeout ?? DEFAULT_HTTP_TIMEOUT_MS
+      const adaptive =
+        request.http?.splashAdaptiveSseTimeout === true &&
+        defaultChunkTimeout !== undefined &&
+        sameLoopbackOrigin(request.http.splashAdaptiveEndpoint, prepared.request.url)
       return {
         frames: prepared.framing.frame(
-          RequestExecutor.responseStream(response).pipe(
-            Stream.timeoutOrElse({
-              duration: timeoutDuration(request.http?.chunkTimeout),
-              orElse: () => Stream.fail(timeout("read", "Timed out waiting for response data", http)),
-            }),
+          (adaptive
+            ? adaptiveReadTimeout(source, defaultChunkTimeout, (duration) =>
+                timeout("read", "Timed out waiting for response data", http),
+              )
+            : source.pipe(
+                Stream.timeoutOrElse({
+                  duration: timeoutDuration(chunkTimeout),
+                  orElse: () => Stream.fail(timeout("read", "Timed out waiting for response data", http)),
+                }),
+              )
+          ).pipe(
             Stream.interruptWhen(
               Effect.sleep(remaining).pipe(
                 Effect.andThen(Effect.fail(timeout("read", "Timed out waiting for the response to complete", http))),
@@ -138,6 +151,65 @@ export const httpJson = <Body, Frame>(input: HttpJsonInput<Body, Frame>): HttpJs
       }
     }),
 })
+
+const adaptiveReadTimeout = <E, R>(
+  source: Stream.Stream<Uint8Array, E, R>,
+  providerTimeout: number,
+  onTimeout: (duration: number) => AIError,
+) =>
+  Stream.transformPull(source, (pull) =>
+    Effect.sync(() => {
+      const samples: number[] = []
+      let current = providerTimeout
+      return Effect.gen(function* () {
+        const started = yield* Clock.currentTimeMillis
+        const chunk = yield* pull.pipe(
+          Effect.timeoutOrElse({
+            duration: Duration.millis(current),
+            orElse: () => Effect.fail(onTimeout(current)),
+          }),
+        )
+        const elapsed = (yield* Clock.currentTimeMillis) - started
+        if (elapsed >= 100 && chunk.some((bytes) => bytes.byteLength > 0)) {
+          samples.push(elapsed)
+          if (samples.length > 5) samples.shift()
+          if (samples.length === 5) current = adaptiveTimeout(samples)
+        }
+        return chunk
+      })
+    }),
+  )
+
+export const sameLoopbackOrigin = (configured: string | undefined, actual: string) => {
+  if (configured === undefined) return false
+  try {
+    const expected = new URL(configured)
+    const request = new URL(actual)
+    return (
+      (expected.protocol === "http:" || expected.protocol === "https:") &&
+      expected.origin === request.origin &&
+      loopback(expected.hostname) &&
+      loopback(request.hostname)
+    )
+  } catch {
+    return false
+  }
+}
+
+const loopback = (hostname: string) =>
+  hostname === "localhost" ||
+  hostname.endsWith(".localhost") ||
+  hostname === "::1" ||
+  hostname === "[::1]" ||
+  (hostname.startsWith("127.") &&
+    hostname.split(".").length === 4 &&
+    hostname.split(".").every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255))
+
+export const adaptiveTimeout = (samples: readonly number[]) => {
+  const ordered = [...samples].sort((left, right) => left - right)
+  const basis = ordered.at(-2) ?? 0
+  return Math.min(300_000, Math.max(30_000, basis * 10))
+}
 
 const timeoutDuration = (value: HttpTimeout | undefined) =>
   value === false ? Duration.infinity : Duration.millis(value ?? DEFAULT_HTTP_TIMEOUT_MS)

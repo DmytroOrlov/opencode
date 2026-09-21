@@ -823,6 +823,7 @@ export const dict = {
   "server.action.authenticate": "驗證",
   "server.status.connecting": "正在透過 SSH 連線…",
   "server.status.authentication": "需要驗證",
+  "ui.sessionTurn.status.fallback": "備用模型",
   "common.color.orange": "橙色",
   "common.color.yellow": "黃色",
   "common.color.cyan": "青色",

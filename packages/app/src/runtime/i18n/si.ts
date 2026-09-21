@@ -774,6 +774,7 @@ export const dict = {
   "server.action.authenticate": "සත්‍යාපනය කරන්න",
   "server.status.connecting": "SSH හරහා සම්බන්ධ වෙමින්…",
   "server.status.authentication": "සත්‍යාපනය අවශ්‍යයි",
+  "ui.sessionTurn.status.fallback": "විකල්ප ආකෘතිය",
   "common.color.orange": "දොඩම්",
   "common.color.yellow": "කහ",
   "common.color.cyan": "සියන්",

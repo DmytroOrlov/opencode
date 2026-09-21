@@ -844,6 +844,7 @@ export const dict = {
   "server.action.authenticate": "Autentikasikan",
   "server.status.connecting": "Menghubungkan melalui SSH…",
   "server.status.authentication": "Diperlukan autentikasi",
+  "ui.sessionTurn.status.fallback": "Model cadangan",
   "common.color.orange": "oranye",
   "common.color.yellow": "kuning",
   "common.color.cyan": "sian",

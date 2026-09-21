@@ -772,6 +772,7 @@ export const dict = {
   "server.action.authenticate": "ຢືນຢັນຕົວຕົນ",
   "server.status.connecting": "ກໍາລັງເຊື່ອມຕໍ່ຜ່ານ SSH...",
   "server.status.authentication": "ຕ້ອງການການຢືນຢັນຕົວຕົນ",
+  "ui.sessionTurn.status.fallback": "ໂມເດວສຳຮອງ",
   "common.color.orange": "ສີສົ້ມ",
   "common.color.yellow": "ເຫຼືອງ",
   "common.color.cyan": "ສີຟ້າອ່ອນ",

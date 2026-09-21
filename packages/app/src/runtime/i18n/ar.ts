@@ -824,6 +824,7 @@ export const dict = {
   "server.action.authenticate": "مصادقة",
   "server.status.connecting": "جارٍ الاتصال عبر SSH…",
   "server.status.authentication": "المصادقة مطلوبة",
+  "ui.sessionTurn.status.fallback": "نموذج احتياطي",
   "mcp.auth.interactiveForm": "يتطلب خادم MCP المسمى \u2068{{name}}\u2069 نموذج مصادقة تفاعليًا",
   "server.connect.title": "الاتصال بخادم",
   "server.connect.description": "أدخل عنوان الخادم وكلمة المرور للبدء.",

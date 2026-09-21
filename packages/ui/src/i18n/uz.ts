@@ -86,6 +86,7 @@ export const dict: Record<string, string> = {
   "ui.sessionTurn.status.makingEdits": "Tahrirlar qilish",
   "ui.sessionTurn.status.runningCommands": "Ishlaydigan buyruqlar",
   "ui.sessionTurn.status.thinking": "Fikrlash",
+  "ui.sessionTurn.status.fallback": "Zaxira model",
   "ui.sessionTurn.status.thinkingWithTopic": "Fikrlash - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Fikrlarni yig'ish",
   "ui.sessionTurn.status.consideringNextSteps": "Keyingi qadamlarni hisobga olgan holda",

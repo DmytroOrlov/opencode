@@ -15,9 +15,12 @@ import { Location } from "./location.js"
 import { AbsolutePath } from "./schema.js"
 import { ConfigVariable } from "./config/variable.js"
 import { ConfigNormalize } from "./config/normalize.js"
+import { ConfigModel } from "@opencode/schema/config/model"
 import { ConfigDiscovery } from "./config/discovery.js"
 import { ConfigWatch } from "./config/watch.js"
 import { WellKnown } from "./wellknown.js"
+import { SessionGenerationAdmission } from "./session/generation-admission.js"
+import { FallbackRuntimeIntent } from "./config/fallback-runtime-intent.js"
 
 export function latest<K extends keyof Info>(entries: readonly Entry[], key: K): Info[K] | undefined {
   return entries.findLast((entry): entry is Document => entry.type === "document" && entry.info[key] !== undefined)
@@ -97,6 +100,8 @@ export const layer = (options?: Options) =>
       const credentials = yield* Credential.Service
       const globalService = yield* Global.Service
       const wellknown = yield* WellKnown.Service
+      const admission = yield* SessionGenerationAdmission.Service
+      const fallbackIntent = yield* FallbackRuntimeIntent.Service
       const reloadLock = Semaphore.makeUnsafe(1)
       const updateLock = Semaphore.makeUnsafe(1)
       const decodeOptions = { errors: "all", onExcessProperty: "ignore" } as const
@@ -326,28 +331,55 @@ export const layer = (options?: Options) =>
       )
       yield* reloadLock.withPermit(reconcile(initial))
 
-      const update = Effect.fn("Config.update")(
-        function* (patch: Patch) {
+      const update = Effect.fn("Config.update")(function* (patch: Patch) {
+        const hasFallback = Object.hasOwn(patch, "fallback")
+        const fallback = hasFallback
+          ? patch.fallback === null
+            ? null
+            : Schema.decodeUnknownSync(ConfigModel.Selection)(patch.fallback)
+          : undefined
+        const fallbackRevision = Object.hasOwn(patch, "fallback")
+          ? yield* fallbackIntent.stage(fallback ?? null)
+          : undefined
+        const persist = admission.acquireExclusive.pipe(
+          Effect.flatMap((lease) =>
+            Effect.gen(function* () {
           const directory = initial.global ?? AbsolutePath.make(globalService.config)
           const candidates = ConfigDiscovery.names.map((name) => path.join(directory, name))
           const filepath =
             (yield* Effect.filter(candidates, fs.isFile)).at(-1) ?? path.join(directory, "opencode.jsonc")
           const text = (yield* fs.readFileStringSafe(filepath)) ?? "{}\n"
+          const formattingOptions = { formattingOptions: { tabSize: 2, insertSpaces: true } } as const
           const updated = yield* Effect.try({
-            try: () =>
-              applyEdits(
-                text,
-                modify(text, ["shell"], patch.shell ?? undefined, {
-                  formattingOptions: { tabSize: 2, insertSpaces: true },
-                }),
-              ),
+            try: () => {
+              const shellUpdated = Object.hasOwn(patch, "shell")
+                ? applyEdits(text, modify(text, ["shell"], patch.shell ?? undefined, formattingOptions))
+                : text
+              return Object.hasOwn(patch, "fallback")
+                ? applyEdits(
+                    shellUpdated,
+                    modify(shellUpdated, ["fallback"], fallback, formattingOptions),
+                  )
+                : shellUpdated
+            },
             catch: (cause) => new FSUtil.FileSystemError({ method: "config.update", cause }),
           })
           yield* fs.writeWithDirs(filepath, updated.endsWith("\n") ? updated : `${updated}\n`)
+          yield* reload().pipe(
+            Effect.provideService(FSUtil.Service, fs),
+            Effect.provideService(Global.Service, globalService),
+            Effect.provideService(Location.Service, location),
+          )
           yield* requestReload
-        },
-        (effect) => updateLock.withPermit(effect),
-      )
+            }).pipe(Effect.ensuring(lease.release)),
+          ),
+        )
+        return yield* updateLock.withPermit(persist).pipe(
+          Effect.onExit(() =>
+            fallbackRevision === undefined ? Effect.void : fallbackIntent.clearIfCurrent(fallbackRevision),
+          ),
+        )
+      })
 
       return Service.of({
         entries: Effect.fnUntraced(function* () {
@@ -368,7 +400,17 @@ export function configured(options?: Options) {
   return makeLocationNode({
     service: Service,
     layer: layer(options),
-    deps: [Watcher.node, Bus.node, FSUtil.node, Global.node, Location.node, Credential.node, WellKnown.node],
+    deps: [
+      Watcher.node,
+      Bus.node,
+      FSUtil.node,
+      Global.node,
+      Location.node,
+      Credential.node,
+      WellKnown.node,
+      SessionGenerationAdmission.node,
+      FallbackRuntimeIntent.node,
+    ],
   })
 }
 

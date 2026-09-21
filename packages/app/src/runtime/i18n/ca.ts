@@ -786,6 +786,7 @@ export const dict = {
   "server.action.authenticate": "Autenticar",
   "server.status.connecting": "S'està connectant a través de SSH…",
   "server.status.authentication": "Cal autenticació",
+  "ui.sessionTurn.status.fallback": "Model de reserva",
   "mcp.auth.interactiveForm": "El servidor MCP {{name}} requereix un formulari d'autenticació interactiu",
   "server.connect.title": "Connecta't a un servidor",
   "server.connect.description": "Introduïu l'adreça del servidor i la contrasenya per començar.",
