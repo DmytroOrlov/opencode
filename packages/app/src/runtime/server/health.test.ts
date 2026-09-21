@@ -6,8 +6,8 @@ const server: ServerConnection.HttpBase = {
   url: "http://localhost:4096",
 }
 
-const info = (version = "1.2.3") =>
-  Response.json({ version, pid: 1, urls: [server.url], paths: { tmp: "/tmp/opencode" } })
+const info = (version = "1.2.3", tlsCaMode?: "bundled" | "system") =>
+  Response.json({ version, pid: 1, urls: [server.url], paths: { tmp: "/tmp/opencode" }, ...(tlsCaMode ? { tlsCaMode } : {}) })
 
 function abortFromInput(input: RequestInfo | URL, init?: RequestInit) {
   if (init?.signal) return init.signal
@@ -25,13 +25,25 @@ describe("checkServerHealth", () => {
       const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
       requests.push({ path: url.pathname, authorization: new Headers(init?.headers).get("authorization") })
 
-      return info("2.0.0")
+      return info("2.0.0", "system")
     }) as typeof globalThis.fetch
 
-    expect(await checkServerHealth({ ...server, password }, fetch)).toEqual({ healthy: true, version: "2.0.0" })
+    expect(await checkServerHealth({ ...server, password }, fetch)).toEqual({
+      healthy: true,
+      version: "2.0.0",
+      tlsCaMode: "system",
+    })
     expect(requests).toEqual([
       { path: "/api/info", authorization: password ? `Basic ${btoa(`opencode:${password}`)}` : null },
     ])
+  })
+
+  test("keeps the CA mode unknown when an older server omits metadata", async () => {
+    const fetch = (async () => info("1.0.0")) as unknown as typeof globalThis.fetch
+    const result = await checkServerHealth(server, fetch)
+
+    expect(result).toEqual({ healthy: true, version: "1.0.0" })
+    expect("tlsCaMode" in result).toBe(false)
   })
 
   test("reports rejected credentials without retrying", async () => {

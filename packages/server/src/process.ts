@@ -8,6 +8,7 @@ import { hasPtyConnectTicketURL } from "@opencode/protocol/groups/pty"
 import { hasPersistentPtyConnectTicketURL } from "@opencode/protocol/groups/persistent-pty"
 import { isPairingConnectURL } from "@opencode/protocol/groups/server"
 import { Global } from "@opencode/util/global"
+import { getVerifiedTlsCaMode } from "@opencode/util/tls-ca"
 import { Cause, Context, Effect, Exit, Latch, Layer, Option, Ref, Scope } from "effect"
 import { HttpMiddleware, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { NetAddress } from "effect/net"
@@ -50,6 +51,10 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(
   transform?: Transform,
   remoteURLs?: () => ReadonlyArray<string>,
 ) {
+  const tlsCaMode = yield* Effect.try({
+    try: () => getVerifiedTlsCaMode(),
+    catch: (cause) => new Error("Server cannot listen before effective TLS CA policy is verified", { cause }),
+  })
   const password = options.password
   if (!password) return yield* Effect.fail(new Error("Missing server password"))
   const hostname = options.hostname ?? "127.0.0.1"
@@ -65,7 +70,7 @@ export const start = Effect.fn("ServerProcess.start")(function* <E, R>(
   }
   const urls = () => [...localURLs(), ...(remoteURLs?.() ?? [])]
   const application = yield* Ref.make(Option.none<App>())
-  const app = dispatch(password, status, application, options.app?.version ?? "unknown", urls, Global.Path.tmp)
+  const app = dispatch(password, status, application, options.app?.version ?? "unknown", urls, Global.Path.tmp, tlsCaMode)
   // Request fibers may continue inbound trace context, but must not inherit the server startup parent.
   yield* bound.http
     .serve(
@@ -177,6 +182,7 @@ function dispatch(
   version: string,
   urls: () => ReadonlyArray<string>,
   tmp: string,
+  tlsCaMode: "bundled" | "system",
 ): App {
   const auth = ServerAuth.Config.of({ password: Option.some(password), username: "opencode" })
   return Effect.gen(function* () {
@@ -187,7 +193,7 @@ function dispatch(
     const ready = state.type === "ready" && Option.isSome(app)
     if (request.method === "GET" && url.pathname === "/api/info" && !ready) {
       if (!(yield* authorizedRequest(request, auth))) return unauthorizedResponse(request)
-      return yield* infoResponse(status, version, urls, tmp)
+      return yield* infoResponse(status, version, urls, tmp, tlsCaMode)
     }
     if (
       !isPairingConnectURL(url) &&
@@ -205,10 +211,11 @@ const infoResponse = Effect.fnUntraced(function* (
   version: string,
   urls: () => ReadonlyArray<string>,
   tmp: string,
+  tlsCaMode: "bundled" | "system",
 ) {
   const state = yield* status.current
   return HttpServerResponse.jsonUnsafe(
-    { version, pid: process.pid, urls: urls(), paths: { tmp } },
+    { version, pid: process.pid, urls: urls(), paths: { tmp }, tlsCaMode },
     {
       status: state.type === "ready" ? 200 : state.type === "failed" ? 500 : 503,
       headers: state.type === "starting" || state.type === "stopping" ? { "retry-after": "1" } : undefined,

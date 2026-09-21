@@ -5,6 +5,7 @@ export type ServerInfo = {
   pid: number
   urls: Array<string>
   paths: { tmp: string }
+  tlsCaMode?: "bundled" | "system" | undefined
   capabilities?: { persistentPty?: boolean | undefined } | undefined
 }
 

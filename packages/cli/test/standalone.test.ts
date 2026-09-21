@@ -17,13 +17,14 @@ test("standalone server exits when its owner is killed", async () => {
     readLine(owner.stdout, "STANDALONE_READY "),
     Bun.sleep(10_000).then(() => undefined),
   ])
-  const [, rawPID, url, status] = line?.split(" ") ?? []
+  const [, rawPID, url, status, tlsCaMode] = line?.split(" ") ?? []
   const pid = Number(rawPID)
 
   try {
     expect(pid).toBeGreaterThan(0)
     expect(url).toStartWith("http://127.0.0.1:")
     expect(status).toBe("200")
+    expect(tlsCaMode).toBe("bundled")
     expect(running(pid)).toBe(true)
 
     owner.kill("SIGKILL")

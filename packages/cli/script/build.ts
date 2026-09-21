@@ -178,7 +178,6 @@ export default { path: file, version: ${JSON.stringify(opencodePty.version)}, sh
       execArgv: [
         "--smol",
         `--user-agent=opencode/${Script.channel}/${Script.version}/cli`,
-        "--use-system-ca",
         "--no-warnings",
         "--",
       ],

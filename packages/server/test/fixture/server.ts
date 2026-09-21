@@ -1,8 +1,10 @@
 import { Effect } from "effect"
 import { HttpServer } from "effect/http"
+import { verifyTlsCaMode } from "@opencode/util/tls-ca"
 import { ServerProcess } from "../../src/process"
 
 export const startServer = Effect.fnUntraced(function* (directory: string) {
+  verifyTlsCaMode("bundled")
   const server = yield* ServerProcess.start<never, never>({
     hostname: "127.0.0.1",
     port: 0,

@@ -34,6 +34,7 @@ import { rootSession } from "@/shell/routes/session"
 import { TitlebarItem } from "@opencode/gui-extensions/sdk"
 import { useExtensionHost } from "@/runtime/extension/host"
 import { TitlebarItems, useTitlebarItems } from "@/runtime/extension/titlebar-items"
+import { caBadgeMapping } from "@/shell/titlebar/titlebar-ca-badge"
 import devIcon from "../../../../desktop/icons/dev/64x64.png"
 import betaIcon from "../../../../desktop/icons/beta/64x64.png"
 
@@ -274,6 +275,12 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
             }
 
             const currentTab = () => matchRoute(layout.route())
+            const currentCaMode = () => {
+              const tab = currentTab()
+              if (!tab) return
+              return global.servers.health[tab.server]?.tlsCaMode
+            }
+            const caBadge = createMemo(() => caBadgeMapping(currentCaMode()))
 
             createEffect(() => {
               const route = layout.route()
@@ -766,6 +773,14 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                 <Show when={!props.verticalTabs}>
                   <div class="relative z-20 flex shrink-0 items-center justify-end gap-0 overflow-visible">
                     <TitlebarItems items={titlebarItems} />
+                    <Tooltip placement="bottom" value={language.t(caBadge().tooltipKey)}>
+                      <span
+                        class={`rounded-[4px] px-1.5 py-1 text-[10px] font-semibold leading-3 ${caBadge().className}`}
+                        role="status"
+                      >
+                        {language.t(caBadge().labelKey)}
+                      </span>
+                    </Tooltip>
                     <TitlebarRightMount />
                   </div>
                 </Show>

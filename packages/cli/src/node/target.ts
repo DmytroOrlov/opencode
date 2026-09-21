@@ -36,7 +36,7 @@ export const shellParserWasmAssets = {
   bash: "tree-sitter-bash/tree-sitter-bash.wasm",
   powershell: "tree-sitter-powershell/tree-sitter-powershell.wasm",
 } as const
-export const nodeExecArgv = ["--experimental-ffi", "--use-system-ca", "--disable-warning=ExperimentalWarning"] as const
+export const nodeExecArgv = ["--experimental-ffi", "--use-bundled-ca", "--disable-warning=ExperimentalWarning"] as const
 
 export const attentionSoundAssets = [
   "@opencode/ui/audio/bip-bop-01.mp3",

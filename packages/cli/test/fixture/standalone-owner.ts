@@ -1,9 +1,11 @@
 import { Effect } from "effect"
 import { Service } from "@opencode/client/effect/service"
+import { verifyTlsCaMode } from "@opencode/util/tls-ca"
 import path from "node:path"
 import { Standalone } from "../../src/services/standalone"
 
 process.chdir(path.join(import.meta.dir, "../../../.."))
+verifyTlsCaMode("bundled")
 
 await Effect.runPromise(
   Effect.scoped(
@@ -14,7 +16,8 @@ await Effect.runPromise(
       const response = yield* Effect.promise(() =>
         fetch(new URL("/api/info", endpoint.url), { headers: Service.headers(endpoint) }),
       )
-      console.log(`STANDALONE_READY ${endpoint.pid} ${endpoint.url} ${response.status}`)
+      const info = (yield* Effect.promise(() => response.json())) as { tlsCaMode?: string }
+      console.log(`STANDALONE_READY ${endpoint.pid} ${endpoint.url} ${response.status} ${info.tlsCaMode}`)
       return yield* Effect.never
     }),
   ),

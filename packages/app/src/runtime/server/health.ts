@@ -8,6 +8,7 @@ import { createStore, reconcile } from "solid-js/store"
 export type ServerHealth = {
   healthy: boolean
   version?: string
+  tlsCaMode?: "bundled" | "system"
   incompatible?: boolean
   checking?: boolean
   unauthorized?: boolean
@@ -122,7 +123,10 @@ export async function checkServerHealth(
       headers,
     })
       .server.info({ signal })
-      .then((status) => ({ data: { healthy: true as const, version: status.version } }))
+      .then((status) => {
+        const data = { healthy: true as const, version: status.version }
+        return { data: status.tlsCaMode ? { ...data, tlsCaMode: status.tlsCaMode } : data }
+      })
       .catch((error) => ({ error }))
 
     if ("data" in current) return current.data
