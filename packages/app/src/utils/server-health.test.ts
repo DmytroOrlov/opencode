@@ -12,12 +12,20 @@ function abortFromInput(input: RequestInfo | URL, init?: RequestInit) {
   return undefined
 }
 
+function headerFromInput(input: RequestInfo | URL, init?: RequestInit, name?: string): string | undefined {
+  const h = init?.headers
+  if (h instanceof Headers) return (h as Headers).get(name ?? "") ?? undefined
+  if (typeof h === "object" && h !== null) return (h as Record<string, string>)[name ?? ""]
+  if (input instanceof Request) return input.headers.get(name ?? "") ?? undefined
+  return undefined
+}
+
 describe("checkServerHealth", () => {
-  test("returns healthy response with version", async () => {
+  test("returns healthy response with version and tlsCaMode", async () => {
     let request: URL | undefined
     const fetch = (async (input: RequestInfo | URL) => {
       request = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
-      return new Response(JSON.stringify({ healthy: true, version: "1.2.3" }), {
+      return new Response(JSON.stringify({ healthy: true, version: "1.2.3", tlsCaMode: "system" }), {
         status: 200,
         headers: { "content-type": "application/json" },
       })
@@ -25,34 +33,90 @@ describe("checkServerHealth", () => {
 
     const result = await checkServerHealth(server, fetch)
 
-    expect(result).toEqual({ healthy: true, version: "1.2.3" })
-    expect(request?.pathname).toBe("/api/health")
+    expect(result).toEqual({ healthy: true, version: "1.2.3", tlsCaMode: "system" })
+    expect(request?.pathname).toBe("/global/health")
   })
 
-  test("falls back to the V1 health endpoint", async () => {
+  test("v2 success does not call legacy health", async () => {
     const paths: string[] = []
     const fetch = (async (input: RequestInfo | URL) => {
       const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
       paths.push(url.pathname)
-      if (url.pathname === "/api/health") return new Response(undefined, { status: 404 })
-      return Response.json({ healthy: true, version: "1.18.4" })
+      return Response.json({ healthy: true, version: "1.2.3", tlsCaMode: "system" })
     }) as unknown as typeof globalThis.fetch
 
-    expect(await checkServerHealth(server, fetch)).toEqual({ healthy: true, version: "1.18.4" })
-    expect(paths).toEqual(["/api/health", "/global/health"])
+    const result = await checkServerHealth(server, fetch)
+
+    expect(result).toEqual({ healthy: true, version: "1.2.3", tlsCaMode: "system" })
+    expect(paths).toEqual(["/global/health"])
   })
 
-  test("falls back when the current health response is malformed", async () => {
+  test("falls back to legacy health when v2 fails", async () => {
     const paths: string[] = []
     const fetch = (async (input: RequestInfo | URL) => {
       const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
       paths.push(url.pathname)
-      if (url.pathname === "/api/health") return Response.json({})
+      if (url.pathname === "/global/health") return new Response(undefined, { status: 404 })
       return Response.json({ healthy: true, version: "1.18.4" })
     }) as unknown as typeof globalThis.fetch
 
     expect(await checkServerHealth(server, fetch)).toEqual({ healthy: true, version: "1.18.4" })
-    expect(paths).toEqual(["/api/health", "/global/health"])
+    expect(paths).toEqual(["/global/health", "/api/health"])
+  })
+
+  test("legacy success returns no tlsCaMode", async () => {
+    const fetch = (async (input: RequestInfo | URL) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
+      if (url.pathname === "/global/health") return new Response(undefined, { status: 404 })
+      return Response.json({ healthy: true, version: "1.18.4" })
+    }) as unknown as typeof globalThis.fetch
+
+    const result = await checkServerHealth(server, fetch)
+    expect(result).toEqual({ healthy: true, version: "1.18.4" })
+    expect("tlsCaMode" in result).toBe(false)
+  })
+
+  test("authentication is present on both /global/health and /api/health", async () => {
+    const authServer: ServerConnection.HttpBase = {
+      url: "http://localhost:4096",
+      username: "user",
+      password: "pass",
+    }
+    const auths: Record<string, string> = {}
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
+      const auth = headerFromInput(input, init, "Authorization")
+      if (auth) auths[url.pathname] = auth
+      if (url.pathname === "/global/health") return new Response(undefined, { status: 404 })
+      return Response.json({ healthy: true, version: "1.18.4" })
+    }) as unknown as typeof globalThis.fetch
+
+    const result = await checkServerHealth(authServer, fetch)
+    expect(result).toEqual({ healthy: true, version: "1.18.4" })
+    expect(auths["/global/health"]).toBe("Basic dXNlcjpwYXNz")
+    expect(auths["/api/health"]).toBe("Basic dXNlcjpwYXNz")
+  })
+
+  test("retries when v2 fails and legacy throws transport error", async () => {
+    let legacyCalls = 0
+    const paths: string[] = []
+    const fetch = (async (input: RequestInfo | URL) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
+      paths.push(url.pathname)
+      if (url.pathname === "/global/health") return new Response(undefined, { status: 404 })
+      legacyCalls++
+      if (legacyCalls === 1) throw new TypeError("network error")
+      return Response.json({ healthy: true, version: "1.0.0" })
+    }) as unknown as typeof globalThis.fetch
+
+    const result = await checkServerHealth(server, fetch, {
+      retryCount: 2,
+      retryDelayMs: 1,
+    })
+
+    expect(result).toEqual({ healthy: true, version: "1.0.0" })
+    expect(legacyCalls).toBe(2)
+    expect(paths).toEqual(["/global/health", "/api/health", "/global/health", "/api/health"])
   })
 
   test("allows slow servers thirty seconds by default", async () => {

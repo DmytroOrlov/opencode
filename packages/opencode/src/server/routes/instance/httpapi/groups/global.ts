@@ -9,9 +9,15 @@ import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "e
 import semver from "semver"
 import { described } from "./metadata"
 
+const TlsCaMode = Schema.Union([
+  Schema.Literal("system"),
+  Schema.Literal("bundled"),
+]).annotate({ identifier: "TlsCaMode" })
+
 const GlobalHealth = Schema.Struct({
   healthy: Schema.Literal(true),
   version: Schema.String,
+  tlsCaMode: TlsCaMode,
 })
 
 const SyncEventSchemas = EventManifest.Latest.values()

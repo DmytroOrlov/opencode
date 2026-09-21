@@ -2,10 +2,11 @@ import { usePlatform } from "@/context/platform"
 import { ServerConnection } from "@/context/server"
 import { authTokenFromCredentials, createSdkForServer } from "./server"
 import { ClientError, OpenCode } from "@opencode-ai/client"
+import type { TlsCaMode } from "@opencode-ai/sdk/v2/client"
 import { Accessor, createEffect, onCleanup } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 
-export type ServerHealth = { healthy: boolean; version?: string }
+export type ServerHealth = { healthy: boolean; version?: string; tlsCaMode?: TlsCaMode }
 
 interface CheckServerHealthOptions {
   timeoutMs?: number
@@ -85,7 +86,19 @@ export async function checkServerHealth(
       .catch(() => ({ healthy: false }))
   }
   const attempt = async (count: number): Promise<ServerHealth> => {
-    const current = await OpenCode.make({
+    const v2 = await createSdkForServer({ server, fetch, signal })
+      .global.health()
+      .then(
+        (x) =>
+          x.error
+            ? { error: x.error }
+            : ({ data: { healthy: x.data?.healthy === true, version: x.data?.version, tlsCaMode: x.data?.tlsCaMode } } as const),
+      )
+      .catch((error) => ({ error }))
+    if (v2 && "data" in v2) return v2.data as unknown as ServerHealth
+    if (signal?.aborted) return { healthy: false }
+
+    const legacy = await OpenCode.make({
       baseUrl: server.url,
       fetch,
       headers: server.password
@@ -97,17 +110,14 @@ export async function checkServerHealth(
       .health.get({ signal })
       .then((x) =>
         typeof x.healthy === "boolean"
-          ? { data: { healthy: x.healthy, version: x.version } }
+          ? ({ data: { healthy: x.healthy, version: x.version } } as const)
           : { error: new Error("Invalid health response") },
       )
       .catch((error) => ({ error }))
-    if ("data" in current && current.data) return current.data
+    if (legacy && "data" in legacy) return legacy.data as unknown as ServerHealth
     if (signal?.aborted) return { healthy: false }
 
-    return createSdkForServer({ server, fetch, signal })
-      .global.health()
-      .then((x) => (x.error ? next(count, x.error) : { healthy: x.data?.healthy === true, version: x.data?.version }))
-      .catch((error) => next(count, error))
+    return next(count, legacy && "error" in legacy ? legacy.error : new Error("Health check failed"))
   }
   return attempt(0).finally(() => timeout?.clear?.())
 }

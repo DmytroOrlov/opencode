@@ -149,6 +149,8 @@ export type MoveSessionError = {
   }
 }
 
+export type TlsCaMode = "system" | "bundled"
+
 export type SnapshotFileDiff = {
   file?: string
   patch?: string
@@ -7249,6 +7251,7 @@ export type GlobalHealthResponses = {
   200: {
     healthy: true
     version: string
+    tlsCaMode: TlsCaMode
   }
 }
 

@@ -4,6 +4,7 @@ import { EffectBridge } from "@/effect/bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { getTlsCaMode, type TlsCaMode } from "@/tls-ca-mode"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Effect, Queue } from "effect"
 import * as Stream from "effect/Stream"
@@ -57,6 +58,16 @@ function eventResponse() {
   })
 }
 
+export function globalHealthResult(
+  resolveTlsCaMode: () => TlsCaMode = getTlsCaMode,
+) {
+  return {
+    healthy: true as const,
+    version: InstallationVersion,
+    tlsCaMode: resolveTlsCaMode(),
+  }
+}
+
 export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handlers) =>
   Effect.gen(function* () {
     const config = yield* Config.Service
@@ -64,7 +75,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const bridge = yield* EffectBridge.make()
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
-      return { healthy: true as const, version: InstallationVersion }
+      return globalHealthResult()
     })
 
     const event = Effect.fn("GlobalHttpApi.event")(function* () {
