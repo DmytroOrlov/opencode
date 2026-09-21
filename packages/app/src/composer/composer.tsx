@@ -199,7 +199,7 @@ function ComposerModelControl(props: {
               data-control-type="dialog"
               variant="ghost-muted"
               size="normal"
-              class="min-w-0 max-w-[60cqw] justify-start ![font-weight:440]"
+              class="min-w-0 max-w-[60cqw] justify-start ![font-weight:440] !px-0"
               classList={{ "animate-in fade-in": shouldAnimate() }}
               style={{ height: "28px" }}
               aria-busy={pending() || undefined}
@@ -226,7 +226,7 @@ function ComposerModelControl(props: {
                 variant="ghost-muted"
                 size="normal"
                 style={{ height: "28px" }}
-                class="min-w-0 max-w-[60cqw] justify-start ![font-weight:440]"
+                class="min-w-0 max-w-[60cqw] justify-start ![font-weight:440] !px-0"
                 classList={{ "animate-in fade-in": shouldAnimate() }}
                 data-action="composer-model"
                 data-control-type="drawer"
