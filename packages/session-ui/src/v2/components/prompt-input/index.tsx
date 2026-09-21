@@ -222,6 +222,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
                   title={i18n.t("ui.promptInput.chooseAgent")}
                   keybind={["Mod", "."]}
                   control={control}
+                  class="!px-0"
                 />
               )}
             </Show>
@@ -249,6 +250,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
                     title={i18n.t("ui.promptInput.chooseVariant")}
                     keybind={["Shift", "Mod", "D"]}
                     control={control}
+                    class="!px-0"
                   />
                 </Show>
               )}
@@ -529,6 +531,7 @@ function PromptInputV2ConfiguredSelect(props: {
   keybind?: string[]
   control: PromptInputV2SelectControl
   model?: boolean
+  class?: string
 }) {
   const current = () => props.control.current()
   const providerID = () => props.control.options().find((option) => option.id === current())?.providerID
@@ -538,6 +541,7 @@ function PromptInputV2ConfiguredSelect(props: {
       keybind={props.control.keybind?.() ?? props.keybind}
       options={props.control.options()}
       current={current()}
+      class={props.class}
       currentIcon={
         <Show when={props.model && providerID()}>
           <ProviderIcon id={providerID()!} class="size-4 shrink-0 opacity-60" />
