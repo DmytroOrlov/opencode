@@ -42,6 +42,7 @@ export interface BasicToolProps {
   triggerHref?: string
   triggerAsLink?: boolean
   clickable?: boolean
+  throughput?: string
 }
 
 const SPRING = { type: "spring" as const, visualDuration: 0.35, bounce: 0 }
@@ -248,6 +249,9 @@ export function BasicTool(props: BasicToolProps) {
           </Switch>
         </div>
       </div>
+      <Show when={props.throughput}>
+        <span data-slot="basic-tool-tool-throughput">{`\u00B7 ${props.throughput}`}</span>
+      </Show>
       <Show when={hasChildren() && !props.hideDetails && !props.locked && (!pending() || props.allowOpenWhilePending)}>
         <Collapsible.Arrow />
       </Show>
@@ -325,12 +329,14 @@ export function GenericTool(props: {
   status?: string
   hideDetails?: boolean
   input?: Record<string, unknown>
+  throughput?: string
 }) {
   const i18n = useI18n()
 
   return (
     <BasicTool
       icon="mcp"
+      throughput={props.throughput}
       status={props.status}
       trigger={{
         title: i18n.t("ui.basicTool.called", { tool: props.tool }),

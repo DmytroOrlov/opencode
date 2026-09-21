@@ -57,6 +57,14 @@ import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { Popover as KobaltePopover } from "@kobalte/core/popover"
 import { normalize } from "@opencode-ai/session-ui/session-diff"
+import {
+  completedGenerationRates,
+  formatThinkingTelemetry,
+  selectGenerationRateTargets,
+  selectGenerationTelemetry,
+  type GenerationRateEntry,
+  type GenerationTelemetrySnapshot,
+} from "@opencode-ai/session-ui/generation-telemetry"
 import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { shouldMarkBoundaryGesture, normalizeWheelDelta } from "@/pages/session/message-gesture"
 import { SessionContextUsage } from "@/components/session-context-usage"
@@ -129,12 +137,22 @@ const markBoundaryGesture = (input: {
   }
 }
 
-function TimelineThinkingRow(props: { reasoningHeading?: string; showReasoningSummaries: boolean }) {
+function TimelineThinkingRow(props: {
+  reasoningHeading?: string
+  showReasoningSummaries: boolean
+  telemetry?: GenerationTelemetrySnapshot
+}) {
   const language = useLanguage()
 
   return (
     <div data-slot="session-turn-thinking">
-      <TextShimmer text={language.t("ui.sessionTurn.status.thinking")} />
+      <TextShimmer
+        text={formatThinkingTelemetry(
+          language.t("ui.sessionTurn.status.thinking"),
+          props.telemetry,
+          language.locale(),
+        )}
+      />
       <Show when={!props.showReasoningSummaries}>
         <TextReveal text={props.reasoningHeading} class="session-turn-thinking-heading" travel={25} duration={700} />
       </Show>
@@ -972,6 +990,30 @@ export function MessageTimeline(props: {
     }
   }
 
+  const allAssistantMessages = createMemo(() => {
+    const result: AssistantMessage[] = []
+    for (const messages of assistantMessagesByParent().values()) result.push(...messages)
+    return result
+  })
+
+  const frozenRates = createMemo(() =>
+    selectGenerationRateTargets(
+      timelineRows().flatMap((item): GenerationRateEntry[] => {
+        if (item._tag !== "AssistantPart") return []
+        const group = item.group
+        if (group.type === "context") {
+          const messageID = group.refs[0]?.messageID
+          if (!messageID) return []
+          return [{ key: group.key, messageID, kind: "tool" }]
+        }
+        const part = getMsgPart(group.ref.messageID, group.ref.partID)
+        if (part?.type !== "tool" && part?.type !== "text") return []
+        return [{ key: group.key, messageID: group.ref.messageID, kind: part.type }]
+      }),
+      completedGenerationRates(allAssistantMessages(), sync().data.generation_telemetry, language.locale()),
+    ),
+  )
+
   const renderAssistantPartGroup = (row: Accessor<TimelineRowMap["AssistantPart"]>, onSizeChange?: () => void) => {
     if (row().group.type === "context") {
       const parts = createMemo(() => {
@@ -994,6 +1036,7 @@ export function MessageTimeline(props: {
           busy={
             workingTurn(row().userMessageID) && lastAssistantGroupKey().get(row().userMessageID) === row().group.key
           }
+          throughput={frozenRates().get(row().group.key)}
           onSizeChange={onSizeChange}
         />
       )
@@ -1032,6 +1075,7 @@ export function MessageTimeline(props: {
                 deferToolContent
                 virtualizeDiff={false}
                 onContentRendered={onSizeChange}
+                throughput={frozenRates().get(row().group.key)}
               />
             )}
           </Show>
@@ -1180,12 +1224,18 @@ export function MessageTimeline(props: {
       }
       case "Thinking": {
         const thinkingRow = row as Accessor<TimelineRowByTag<"Thinking">>
+        const telemetry = () =>
+          selectGenerationTelemetry(
+            assistantMessagesByParent().get(thinkingRow().userMessageID) ?? emptyAssistantMessages,
+            sessionID() ? sync().data.generation_telemetry[sessionID()!] : undefined,
+          )
         return (
           <TimelineRowFrame row={thinkingRow}>
             <div data-slot="session-turn-message-container" class="w-full px-4 md:px-5">
               <TimelineThinkingRow
                 reasoningHeading={thinkingRow().reasoningHeading}
                 showReasoningSummaries={settings.general.showReasoningSummaries()}
+                telemetry={telemetry()}
               />
             </div>
           </TimelineRowFrame>

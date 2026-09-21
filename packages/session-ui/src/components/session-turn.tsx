@@ -26,6 +26,7 @@ import { TextReveal } from "@opencode-ai/ui/text-reveal"
 import { createAutoScroll } from "@opencode-ai/ui/hooks"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
 import { normalize } from "./session-diff"
+import { formatThinkingTelemetry, selectGenerationTelemetry } from "./generation-telemetry"
 
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value)
@@ -375,6 +376,12 @@ export function SessionTurn(
     if (showReasoningSummaries()) return assistantVisible() === 0
     return true
   })
+  const thinkingTelemetry = createMemo(() =>
+    selectGenerationTelemetry(assistantMessages(), data.store.generation_telemetry?.[props.sessionID]),
+  )
+  const thinkingText = createMemo(() =>
+    formatThinkingTelemetry(i18n.t("ui.sessionTurn.status.thinking"), thinkingTelemetry(), i18n.locale()),
+  )
 
   const autoScroll = createAutoScroll({
     working,
@@ -421,7 +428,7 @@ export function SessionTurn(
               </Show>
               <Show when={showThinking()}>
                 <div data-slot="session-turn-thinking">
-                  <TextShimmer text={i18n.t("ui.sessionTurn.status.thinking")} />
+                  <TextShimmer text={thinkingText()} />
                   <Show when={!showReasoningSummaries()}>
                     <TextReveal
                       text={reasoningHeading()}
