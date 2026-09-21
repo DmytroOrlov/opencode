@@ -4,6 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import path from "path"
 import { tool, type ModelMessage } from "ai"
+import type { LanguageModelV3, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -14,13 +15,16 @@ import { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 
-import { testEffect } from "../lib/effect"
+import { testEffect, pollWithTimeout } from "../lib/effect"
+import { ProviderTest } from "../fake/provider"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import type { Agent } from "../../src/agent/agent"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Permission } from "@/permission"
 import { LLMAISDK } from "@/session/llm/ai-sdk"
+import { MLXTelemetry } from "@/session/llm/mlx-telemetry"
 import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -2245,5 +2249,426 @@ describe("session.llm.stream", () => {
         },
       }),
     },
+  )
+})
+
+describe("session.llm.telemetry lifecycle", () => {
+  function startLifecycleMlx() {
+    const encoder = new TextEncoder()
+    const connections: ReadableStreamDefaultController<Uint8Array>[] = []
+    let hits = 0
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        if (new URL(req.url).pathname !== "/events") return new Response("not found", { status: 404 })
+        hits++
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            connections.push(controller)
+            controller.enqueue(encoder.encode("event: stats\ndata: {}\n\n"))
+          },
+          cancel() {},
+        })
+        return new Response(stream, { headers: { "content-type": "text/event-stream" } })
+      },
+    })
+    return {
+      baseURL: `http://localhost:${server.port}/v1`,
+      hits: () => hits,
+      push(frame: string) {
+        for (const connection of connections) {
+          try {
+            connection.enqueue(encoder.encode(frame))
+          } catch {}
+        }
+      },
+      stop: () => server.stop(),
+    }
+  }
+
+  // Provider stub whose setup stage can block or die, simulating a retry that
+  // never reaches stream construction. The stream modes exercise teardown
+  // through LLM.stream rather than calling either telemetry leg directly.
+  const setup = {
+    mode: "block" as "block" | "die" | "stream-fail" | "stream-success" | "stream-block",
+    started: false,
+    returned: false,
+  }
+  const lifecycleLanguage: LanguageModelV3 = {
+    specificationVersion: "v3",
+    provider: "lifecycle",
+    modelId: "lifecycle-model",
+    supportedUrls: {},
+    doGenerate: async () => {
+      throw new Error("lifecycle provider does not generate")
+    },
+    doStream: async ({ abortSignal }) => {
+      let index = 0
+      const wait = (duration: number) => new Promise<void>((resolve) => setTimeout(resolve, duration))
+      const enqueue = (
+        controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+        part: LanguageModelV3StreamPart,
+      ) => {
+        try {
+          controller.enqueue(part)
+        } catch {}
+      }
+      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+        async pull(controller) {
+          if (index++ === 0) {
+            enqueue(controller, { type: "stream-start", warnings: [] })
+            return
+          }
+          if (index === 2) {
+            enqueue(controller, { type: "text-start", id: "lifecycle-text" })
+            return
+          }
+          if (index === 3) {
+            await wait(300)
+            enqueue(controller, {
+              type: "text-delta",
+              id: "lifecycle-text",
+              delta: "a meaningful live generation for telemetry",
+            })
+            return
+          }
+          if (setup.mode === "stream-block") {
+            await new Promise<void>((resolve) => {
+              abortSignal?.addEventListener("abort", () => resolve(), { once: true })
+            })
+            return
+          }
+          if (setup.mode === "stream-fail") {
+            await wait(20)
+            try {
+              controller.error(new Error("lifecycle stream boom"))
+            } catch {}
+            return
+          }
+          enqueue(controller, { type: "text-end", id: "lifecycle-text" })
+          enqueue(controller, {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+              outputTokens: { total: 8, text: 8, reasoning: 0 },
+            },
+          })
+          controller.close()
+        },
+      })
+      return { stream }
+    },
+  }
+  const providerStub = ProviderTest.fake({
+    getLanguage: () =>
+      Effect.sync(() => {
+        setup.started = true
+      }).pipe(
+        Effect.andThen(
+          setup.mode === "block"
+            ? Effect.never
+            : setup.mode === "die"
+              ? Effect.die(new Error("provider setup boom"))
+              : Effect.succeed(lifecycleLanguage),
+        ),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            setup.returned = true
+          }),
+        ),
+      ),
+  })
+  const itLifecycle = testEffect(
+    AppNodeBuilder.build(LayerNode.group([LLM.node, EventV2Bridge.node]), [[Provider.node, providerStub.layer]]),
+  )
+  const mlxProviderStub = ProviderTest.fake({ getLanguage: () => Effect.succeed(lifecycleLanguage) })
+  const itMlxLifecycle = testEffect(
+    AppNodeBuilder.build(LayerNode.group([LLM.node, EventV2Bridge.node]), [
+      [Provider.node, mlxProviderStub.layer],
+      [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: true })],
+    ]),
+  )
+
+  type TelemetryEvent = {
+    assistantMessageID: string
+    phase: string
+    done?: boolean
+    tokensPerSecond?: number
+    source?: string
+  }
+
+  function lifecycleInput(
+    assistantMessageID: string,
+    model = providerStub.model,
+    messages: ModelMessage[] = [{ role: "user", content: "Hello" }],
+  ): LLM.StreamInput {
+    const sessionID = SessionID.make("session-telemetry-lifecycle")
+    const agent = {
+      name: "test",
+      mode: "primary",
+      options: {},
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    } satisfies Agent.Info
+    return {
+      user: {
+        id: MessageID.make(`msg_user-${assistantMessageID}`),
+        sessionID,
+        role: "user",
+        time: { created: Date.now() },
+        agent: agent.name,
+        model: { providerID: model.providerID, modelID: model.id },
+      } satisfies SessionV1.User,
+      sessionID,
+      model,
+      agent,
+      system: ["You are a helpful assistant."],
+      messages,
+      tools: {},
+      assistantMessageID,
+    }
+  }
+
+  function recorder(assistantMessageID: string) {
+    return Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const received: TelemetryEvent[] = []
+      const unsub = yield* events.listen((event) => {
+        if (event.type !== SessionV1.Event.Telemetry.type) return Effect.void
+        const data = event.data as unknown as TelemetryEvent & { assistantMessageID?: string }
+        if (String(data.assistantMessageID) !== assistantMessageID) return Effect.void
+        received.push(data)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+      // Previous attempt's frozen terminal for the SAME AssistantMessage.
+      yield* events.publish(SessionV1.Event.Telemetry, {
+        sessionID: SessionID.make("session-telemetry-lifecycle"),
+        assistantMessageID: SessionV1.MessageID.make(assistantMessageID),
+        phase: "decode",
+        tokensPerSecond: 12.5,
+        done: true,
+        source: "fallback",
+      })
+      return received
+    })
+  }
+
+  const terminals = (received: TelemetryEvent[]) => received.filter((item) => item.done === true)
+
+  itLifecycle.instance("retry clears stale terminal telemetry while provider setup still blocks", () =>
+    Effect.gen(function* () {
+      setup.mode = "block"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_block"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const fiber = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain).pipe(Effect.forkScoped)
+
+      yield* pollWithTimeout(
+        Effect.sync(() => (received.some((item) => item.done === false) ? true : undefined)),
+        "stale terminal telemetry was never cleared",
+      )
+      yield* pollWithTimeout(
+        Effect.sync(() => (setup.started ? true : undefined)),
+        "provider setup never started",
+      )
+      // The clear landed while provider setup was still blocked: getLanguage
+      // never returned, so no stream was ever constructed for this attempt.
+      expect(setup.returned).toBe(false)
+      expect(terminals(received).length).toBe(1)
+      expect(received.at(-1)!.done).toBe(false)
+      expect(received.at(-1)!.tokensPerSecond).toBeUndefined()
+      yield* Fiber.interrupt(fiber)
+    }),
+  )
+
+  itLifecycle.instance("provider setup failure keeps the stale terminal cleared without a fake new rate", () =>
+    Effect.gen(function* () {
+      setup.mode = "die"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_fail"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const exit = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain, Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(setup.started).toBe(true)
+
+      yield* pollWithTimeout(
+        Effect.sync(() => (received.some((item) => item.done === false) ? true : undefined)),
+        "stale terminal telemetry was never cleared",
+      )
+      yield* Effect.sleep("100 millis")
+      // Only the seeded stale terminal exists; the failed attempt produced
+      // no bogus terminal rate and did not resurrect anything.
+      expect(terminals(received).length).toBe(1)
+      expect(terminals(received)[0].tokensPerSecond).toBe(12.5)
+      expect(received.at(-1)!.done).toBe(false)
+    }),
+  )
+
+  itLifecycle.instance("cancelling a blocked retry leaves no stale or resurrected telemetry", () =>
+    Effect.gen(function* () {
+      setup.mode = "block"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_cancel"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const fiber = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain).pipe(Effect.forkScoped)
+      yield* pollWithTimeout(
+        Effect.sync(() => (received.some((item) => item.done === false) ? true : undefined)),
+        "stale terminal telemetry was never cleared",
+      )
+
+      yield* Fiber.interrupt(fiber)
+      yield* Effect.sleep("100 millis")
+      // Teardown after interruption must not produce any new terminal: the
+      // reset stays the final state for this AssistantMessage.
+      expect(terminals(received).length).toBe(1)
+      expect(received.at(-1)!.done).toBe(false)
+      expect(received.some((item) => item.source === "provider")).toBe(false)
+    }),
+  )
+
+  itLifecycle.instance("discards fallback telemetry when generic provider setup fails before stream construction", () =>
+    Effect.gen(function* () {
+      setup.mode = "die"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_setup_discard"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const exit = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain, Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(setup.returned).toBe(false)
+      yield* Effect.sleep("100 millis")
+      expect(terminals(received).length).toBe(1)
+      expect(received.at(-1)!.done).toBe(false)
+    }),
+  )
+
+  itMlxLifecycle.instance(
+    "discards an adopted provider source when later native setup fails",
+    () =>
+      Effect.gen(function* () {
+        const mlx = startLifecycleMlx()
+        Object.assign(mlxProviderStub.info.options, {
+          apiKey: "test-key",
+          baseURL: mlx.baseURL,
+          mlxTelemetry: true,
+        })
+        const model = mlxProviderStub.model
+
+        try {
+          yield* Effect.gen(function* () {
+            const events = yield* EventV2Bridge.Service
+            const output: TelemetryEvent[] = []
+            const unsub = yield* events.listen((event) => {
+              if (event.type !== SessionV1.Event.Telemetry.type) return Effect.void
+              const data = event.data as unknown as TelemetryEvent
+              if (String(data.assistantMessageID) !== "msg_telemetry_mlx_setup_discard") return Effect.void
+              output.push(data)
+              return Effect.void
+            })
+            yield* Effect.addFinalizer(() => unsub)
+            yield* events.publish(SessionV1.Event.Telemetry, {
+              sessionID: SessionID.make("session-telemetry-lifecycle"),
+              assistantMessageID: SessionV1.MessageID.make("msg_telemetry_mlx_setup_discard"),
+              phase: "decode",
+              tokensPerSecond: 12.5,
+              done: true,
+              source: "fallback",
+            })
+            const llm = yield* LLM.Service
+            const lateSetupFailureContent = {
+              map: () => {
+                throw new Error("native setup boom")
+              },
+            } as unknown as ModelMessage["content"]
+            const exit = yield* llm
+              .stream(
+                lifecycleInput("msg_telemetry_mlx_setup_discard", model, [
+                  { role: "user", content: lateSetupFailureContent } as ModelMessage,
+                ]),
+              )
+              .pipe(Stream.runDrain, Effect.exit)
+            expect(Exit.isFailure(exit)).toBe(true)
+            expect(mlx.hits()).toBe(1)
+            mlx.push('data: {"req":"late","i":1,"committed":10,"ms":100}\n\n')
+            yield* Effect.sleep("100 millis")
+            expect(output.filter((item) => item.done === true)).toHaveLength(1)
+            expect(output.filter((item) => item.source === "provider")).toHaveLength(0)
+          })
+        } finally {
+          MLXTelemetry.stopAll()
+          mlx.stop()
+        }
+      }),
+  )
+
+  itLifecycle.instance("discards a live fallback rate when the stream fails during consumption", () =>
+    Effect.gen(function* () {
+      setup.mode = "stream-fail"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_stream_fail"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const exit = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain, Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      yield* pollWithTimeout(
+        Effect.sync(() =>
+          received.some(
+            (item) => item.source === "fallback" && item.tokensPerSecond !== undefined && item.done !== true,
+          )
+            ? true
+            : undefined,
+        ),
+        "live fallback telemetry was never published",
+      )
+      expect(terminals(received).length).toBe(1)
+      expect(received.some((item) => item.done === false)).toBe(true)
+    }),
+  )
+
+  itLifecycle.instance("finalizes fallback telemetry exactly once on normal stream completion", () =>
+    Effect.gen(function* () {
+      setup.mode = "stream-success"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_stream_success"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const exit = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain, Effect.exit)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      yield* pollWithTimeout(
+        Effect.sync(() => (received.some((item) => item.done === true) ? true : undefined)),
+        "normal stream never finalized fallback telemetry",
+      )
+      expect(terminals(received).length).toBe(2)
+      expect(terminals(received).at(-1)!.done).toBe(true)
+    }),
+  )
+
+  itLifecycle.instance("discards fallback telemetry on interruption while consuming the stream", () =>
+    Effect.gen(function* () {
+      setup.mode = "stream-block"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_stream_cancel"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const fiber = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain).pipe(Effect.forkScoped)
+      yield* pollWithTimeout(
+        Effect.sync(() =>
+          received.some(
+            (item) => item.source === "fallback" && item.tokensPerSecond !== undefined && item.done !== true,
+          )
+            ? true
+            : undefined,
+        ),
+        "live fallback telemetry was never published before interruption",
+      )
+      yield* Fiber.interrupt(fiber)
+      yield* Effect.sleep("100 millis")
+      expect(terminals(received).length).toBe(1)
+      expect(received.some((item) => item.done === false)).toBe(true)
+    }),
   )
 })

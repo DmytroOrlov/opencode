@@ -1195,6 +1195,7 @@ export type Error = ModelNotFoundError | InitError | NoProvidersError | NoModels
 export interface Interface {
   readonly list: () => Effect.Effect<Record<ProviderV2.ID, Info>>
   readonly getProvider: (providerID: ProviderV2.ID) => Effect.Effect<Info>
+  readonly getEndpoint: (model: Model) => Effect.Effect<string | undefined>
   readonly getModel: (providerID: ProviderV2.ID, modelID: ModelV2.ID) => Effect.Effect<Model, ModelNotFoundError>
   readonly getLanguage: (model: Model) => Effect.Effect<LanguageModelV3, ModelNotFoundError>
   readonly closest: (
@@ -1731,22 +1732,60 @@ const layer = Layer.effect(
 
     const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
 
+    // Single source of truth for the endpoint provider dispatch actually uses:
+    // explicit options.baseURL wins, then model.api.url, with provider var
+    // loaders and env `${var}` substitution applied. Also folds in the
+    // google-vertex anthropic route derivation. resolveSDK applies the result
+    // to the SDK options; getEndpoint exposes the exact same effective value
+    // to consumers (e.g. the mlx-dspark /events telemetry bridge) so a model
+    // configured through provider/model API endpoints attaches telemetry to
+    // the server that is actually serving generation. Mutates the given
+    // options copy in place for the vertex derivation only.
+    function effectiveBaseURL(
+      model: Model,
+      options: Record<string, any>,
+      s: State,
+      envs: Record<string, string | undefined>,
+    ) {
+      if (
+        model.providerID === "google-vertex" &&
+        model.api.npm === "@ai-sdk/google-vertex/anthropic" &&
+        !options.baseURL
+      ) {
+        const baseURL = googleVertexAnthropicBaseURL(
+          typeof options.project === "string" ? options.project : undefined,
+          typeof options.location === "string" ? options.location : undefined,
+        )
+        if (baseURL) options.baseURL = baseURL
+      }
+
+      let url = typeof options["baseURL"] === "string" && options["baseURL"] !== "" ? options["baseURL"] : model.api.url
+      if (!url) return undefined
+
+      const loader = s.varsLoaders[model.providerID]
+      if (loader) {
+        const vars = loader(options)
+        for (const [key, value] of Object.entries(vars)) {
+          const field = "${" + key + "}"
+          url = url.replaceAll(field, value)
+        }
+      }
+
+      url = url.replace(/\$\{([^}]+)\}/g, (item, key) => {
+        const val = envs[String(key)]
+        return val ?? item
+      })
+      return url
+    }
+
     async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
       try {
         const provider = s.providers[model.providerID]
+        // OpenCode backend control options (e.g. `mlxTelemetry`) are stripped
+        // before the SDK cache key and both factory paths so they can never
+        // reach bundled or dynamically loaded provider SDKs.
         const options = { ...provider.options }
-
-        if (
-          model.providerID === "google-vertex" &&
-          model.api.npm === "@ai-sdk/google-vertex/anthropic" &&
-          !options.baseURL
-        ) {
-          const baseURL = googleVertexAnthropicBaseURL(
-            typeof options.project === "string" ? options.project : undefined,
-            typeof options.location === "string" ? options.location : undefined,
-          )
-          if (baseURL) options.baseURL = baseURL
-        }
+        delete options["mlxTelemetry"]
 
         if (model.providerID === "google-vertex" && !model.api.npm.includes("@ai-sdk/openai-compatible")) {
           delete options.fetch
@@ -1756,26 +1795,7 @@ const layer = Layer.effect(
           options["includeUsage"] = true
         }
 
-        const baseURL = iife(() => {
-          let url =
-            typeof options["baseURL"] === "string" && options["baseURL"] !== "" ? options["baseURL"] : model.api.url
-          if (!url) return
-
-          const loader = s.varsLoaders[model.providerID]
-          if (loader) {
-            const vars = loader(options)
-            for (const [key, value] of Object.entries(vars)) {
-              const field = "${" + key + "}"
-              url = url.replaceAll(field, value)
-            }
-          }
-
-          url = url.replace(/\$\{([^}]+)\}/g, (item, key) => {
-            const val = envs[String(key)]
-            return val ?? item
-          })
-          return url
-        })
+        const baseURL = effectiveBaseURL(model, options, s, envs)
 
         if (baseURL !== undefined) options["baseURL"] = baseURL
         if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
@@ -1868,6 +1888,16 @@ const layer = Layer.effect(
     const getProvider = Effect.fn("Provider.getProvider")((providerID: ProviderV2.ID) =>
       InstanceState.use(state, (s) => s.providers[providerID]),
     )
+
+    // The exact endpoint provider dispatch would use for this model (same
+    // resolution as resolveSDK), for backend consumers such as the mlx-dspark
+    // /events telemetry bridge. Reads config options without mutating them.
+    const getEndpoint = Effect.fn("Provider.getEndpoint")(function* (model: Model) {
+      const s = yield* InstanceState.get(state)
+      if (!s.providers[model.providerID]) return undefined
+      const envs = yield* env.all()
+      return effectiveBaseURL(model, { ...s.providers[model.providerID].options }, s, envs)
+    })
 
     const getModel = Effect.fn("Provider.getModel")(function* (providerID: ProviderV2.ID, modelID: ModelV2.ID) {
       const s = yield* InstanceState.get(state)
@@ -2040,7 +2070,7 @@ const layer = Layer.effect(
       }
     })
 
-    return Service.of({ list, getProvider, getModel, getLanguage, closest, getSmallModel, defaultModel })
+    return Service.of({ list, getProvider, getEndpoint, getModel, getLanguage, closest, getSmallModel, defaultModel })
   }),
 )
 

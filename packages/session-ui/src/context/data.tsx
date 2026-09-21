@@ -2,6 +2,7 @@ import type { Message, Session, Part, SnapshotFileDiff, SessionStatus, Provider 
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { PreloadMultiFileDiffResult } from "@pierre/diffs/ssr"
+import type { GenerationTelemetrySnapshot } from "../components/generation-telemetry"
 
 export type NormalizedProviderListResponse = {
   all: Map<string, Provider>
@@ -39,6 +40,9 @@ type Data = {
   }
   part_text_accum_delta?: {
     [partID: string]: string
+  }
+  generation_telemetry?: {
+    [sessionID: string]: Record<string, GenerationTelemetrySnapshot> | undefined
   }
 }
 

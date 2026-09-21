@@ -1,6 +1,7 @@
 import type { Message, Part, PermissionRequest, QuestionRequest, SessionStatus, Todo } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
+import type { GenerationTelemetrySnapshot } from "@opencode-ai/session-ui/generation-telemetry"
 
 export const SESSION_CACHE_LIMIT = 40
 
@@ -14,6 +15,7 @@ type SessionCache = {
   permission: Record<string, PermissionRequest[] | undefined>
   question: Record<string, QuestionRequest[] | undefined>
   part_text_accum_delta: Record<string, string | undefined>
+  generation_telemetry: Record<string, Record<string, GenerationTelemetrySnapshot> | undefined>
 }
 
 export function dropSessionCaches(store: SessionCache, sessionIDs: Iterable<string>) {
@@ -37,6 +39,7 @@ export function dropSessionCaches(store: SessionCache, sessionIDs: Iterable<stri
     delete store.session_status[sessionID]
     delete store.permission[sessionID]
     delete store.question[sessionID]
+    delete store.generation_telemetry[sessionID]
   }
 }
 

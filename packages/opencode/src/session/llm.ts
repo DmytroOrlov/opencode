@@ -4,7 +4,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Provider } from "@/provider/provider"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
-import { Context, Effect, Layer } from "effect"
+import { Context, Effect, Exit, Layer } from "effect"
 import * as Stream from "effect/Stream"
 import { streamText, wrapLanguageModel, type ModelMessage, type Tool } from "ai"
 import type { LLMEvent } from "@opencode-ai/llm"
@@ -29,6 +29,8 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { MLXTelemetry } from "./llm/mlx-telemetry"
+import { beginAttemptTelemetry } from "./llm/attempt-telemetry"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -45,10 +47,17 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  assistantMessageID?: string
 }
 
 export type StreamRequest = StreamInput & {
   abort: AbortSignal
+  telemetry: MLXTelemetry.TelemetryHolder
+  attachTelemetrySource: (source: MLXTelemetry.TelemetryAttempt) => void
+  // Shared fork bridge for the whole stream attempt: provider and fallback
+  // telemetry publishes run through it so a single scheduling order, not two
+  // unrelated fork queues, arbitrates event publication.
+  bridge: EffectBridge.Shape
 }
 
 export interface Interface {
@@ -87,6 +96,7 @@ const live: Layer.Layer<
         providerID: input.model.providerID,
         modelID: input.model.id,
         "session.id": input.sessionID,
+        messageID: input.assistantMessageID,
         small: (input.small ?? false).toString(),
         agent: input.agent.name,
         mode: input.agent.mode,
@@ -115,7 +125,9 @@ const live: Layer.Layer<
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
       // and results sent back over the WebSocket.
-      const bridge = yield* EffectBridge.make()
+      // Reuse the attempt-wide bridge from the stream scope: every telemetry
+      // publish forks onto one queue instead of two unrelated fork queues.
+      const bridge = input.bridge
       if (language instanceof GitLabWorkflowLanguageModel) {
         const workflowModel = language as GitLabWorkflowLanguageModel & {
           sessionID?: string
@@ -221,6 +233,64 @@ const live: Layer.Layer<
           })
         : undefined
 
+      // `mlxTelemetry` is an OpenCode-only provider option that gates the
+      // mlx-dspark /events bridge below; it must not reach provider SDKs.
+      const sdkOptions: Record<string, any> = { ...prepared.params.options }
+      delete sdkOptions.mlxTelemetry
+
+      // Dedicated-endpoint telemetry: never blocks or fails generation. A
+      // missing/broken watcher or an unready connection simply yields no
+      // telemetry for this attempt.
+      const assistantMessageID = input.assistantMessageID
+      const mlxEnabled = assistantMessageID !== undefined && item.options.mlxTelemetry === true
+      // Telemetry attaches to the SAME effective endpoint provider dispatch
+      // resolves for this model (options.baseURL, provider/model API url, and
+      // vars/env substitution), not a separately guessed URL.
+      const endpoint = mlxEnabled ? yield* provider.getEndpoint(input.model) : undefined
+      const telemetry = mlxEnabled
+        ? yield* Effect.promise(() =>
+            MLXTelemetry.attach({
+              options: item.options,
+              endpoint,
+              apiKey: typeof item.options.apiKey === "string" ? item.options.apiKey : item.key,
+              sessionID: input.sessionID,
+              assistantMessageID,
+              abort: input.abort,
+              emitReset: false,
+              publish: (snapshot) => {
+                // Only a finite positive provider DECODE RATE wins decode
+                // arbitration and permanently suppresses this attempt's
+                // generic fallback. Prefill progress and the rate-less i==0
+                // phase transition stay authoritative for context display
+                // without disabling the fallback the short generation needs.
+                if (MLXTelemetry.hasAuthoritativeDecodeRate(snapshot)) input.telemetry.providerDecodeAccepted = true
+                bridge.fork(
+                  events
+                    .publish(SessionV1.Event.Telemetry, {
+                      sessionID: SessionID.make(snapshot.sessionID),
+                      assistantMessageID: SessionV1.MessageID.make(snapshot.assistantMessageID),
+                      phase: snapshot.phase,
+                      ...(snapshot.processed === undefined ? {} : { processed: snapshot.processed }),
+                      ...(snapshot.total === undefined ? {} : { total: snapshot.total }),
+                      ...(snapshot.tokensPerSecond === undefined ? {} : { tokensPerSecond: snapshot.tokensPerSecond }),
+                      ...(snapshot.done === undefined ? {} : { done: snapshot.done }),
+                      source: "provider" as const,
+                    })
+                    .pipe(Effect.ignore),
+                )
+              },
+              onError: (context, error) =>
+                bridge.fork(
+                  Effect.logWarning("mlx telemetry failed", {
+                    context,
+                    "session.id": input.sessionID,
+                    error: error instanceof Error ? error.message : String(error),
+                  }),
+                ),
+            }).catch(() => undefined),
+          )
+        : undefined
+      if (telemetry) input.attachTelemetrySource(telemetry)
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {
@@ -236,7 +306,7 @@ const live: Layer.Layer<
           topP: prepared.params.topP,
           topK: prepared.params.topK,
           maxOutputTokens: prepared.params.maxOutputTokens,
-          providerOptions: prepared.params.options,
+          providerOptions: sdkOptions,
           headers: prepared.headers,
           abort: input.abort,
         })
@@ -284,6 +354,7 @@ const live: Layer.Layer<
                 providerID: input.model.providerID,
                 modelID: input.model.id,
                 "session.id": input.sessionID,
+                messageID: input.assistantMessageID,
                 small: (input.small ?? false).toString(),
                 agent: input.agent.name,
                 mode: input.agent.mode,
@@ -313,7 +384,7 @@ const live: Layer.Layer<
           temperature: prepared.params.temperature,
           topP: prepared.params.topP,
           topK: prepared.params.topK,
-          providerOptions: ProviderTransform.providerOptions(input.model, prepared.params.options),
+          providerOptions: ProviderTransform.providerOptions(input.model, sdkOptions),
           activeTools: Object.keys(prepared.tools).filter((x) => x !== "invalid"),
           tools: prepared.tools,
           toolChoice: input.toolChoice,
@@ -358,23 +429,97 @@ const live: Layer.Layer<
       Stream.scoped(
         Stream.unwrap(
           Effect.gen(function* () {
+            const bridge = yield* EffectBridge.make()
             const ctrl = yield* Effect.acquireRelease(
               Effect.sync(() => new AbortController()),
               (ctrl) => Effect.sync(() => ctrl.abort()),
             )
 
-            const result = yield* run({ ...input, abort: ctrl.signal })
+            const telemetry: MLXTelemetry.TelemetryHolder = {}
 
-            if (result.type === "native") return result.stream
+            // Generic client-observed throughput: always available for real
+            // assistant generations, but yields permanently once the
+            // authoritative provider path supplies a decode rate. Created
+            // BEFORE run(): the constructor's registration publish clears the
+            // previous attempt's terminal snapshot for this AssistantMessage
+            // immediately, so a retry whose provider setup blocks, fails, or
+            // is cancelled can never leave the stale terminal on screen.
+            const attempt = beginAttemptTelemetry({
+              reset: () => {
+                if (!input.assistantMessageID) return
+                bridge.fork(
+                  events
+                    .publish(SessionV1.Event.Telemetry, {
+                      sessionID: SessionID.make(input.sessionID),
+                      assistantMessageID: SessionV1.MessageID.make(input.assistantMessageID),
+                      phase: "prefill",
+                      done: false,
+                      source: "fallback" as const,
+                    })
+                    .pipe(Effect.ignore),
+                )
+              },
+              fallback: input.assistantMessageID
+                ? {
+                  sessionID: input.sessionID,
+                  assistantMessageID: input.assistantMessageID,
+                  suppressed: () => telemetry.providerDecodeAccepted === true,
+                  publish: (snapshot) =>
+                    bridge.fork(
+                      Effect.gen(function* () {
+                        // Suppression is checked when the fiber runs, not
+                        // when it is scheduled: a fallback publish already
+                        // queued just before provider acceptance must not
+                        // overwrite the authoritative telemetry afterwards.
+                        if (telemetry.providerDecodeAccepted === true) return
+                        yield* events.publish(SessionV1.Event.Telemetry, {
+                          sessionID: SessionID.make(input.sessionID),
+                          assistantMessageID: SessionV1.MessageID.make(input.assistantMessageID!),
+                          phase: snapshot.phase,
+                          ...(snapshot.tokensPerSecond === undefined
+                            ? {}
+                            : { tokensPerSecond: snapshot.tokensPerSecond }),
+                          ...(snapshot.done === undefined ? {} : { done: snapshot.done }),
+                          ...(snapshot.approximate === undefined ? {} : { approximate: snapshot.approximate }),
+                          source: "fallback" as const,
+                        })
+                      }).pipe(Effect.ignore),
+                    ),
+                    emitReset: false,
+                  }
+                : undefined,
+            })
+
+            const result = yield* run({
+              ...input,
+              abort: ctrl.signal,
+              telemetry,
+              attachTelemetrySource: attempt.attachProvider,
+              bridge,
+            }).pipe(
+              Effect.onExit((exit) => (Exit.isFailure(exit) ? Effect.sync(attempt.discard) : Effect.void)),
+            )
+
+            const teardown = (exit: Exit.Exit<unknown, unknown>) =>
+              Effect.sync(Exit.isSuccess(exit) ? attempt.finalize : attempt.discard).pipe(Effect.ignore)
+
+            const tracked = (stream: Stream.Stream<LLMEvent, unknown>) =>
+              (attempt.fallback ? stream.pipe(Stream.map((event) => (attempt.fallback!.push(event), event))) : stream).pipe(
+                Stream.onExit(teardown),
+              )
+
+            if (result.type === "native") return tracked(result.stream)
 
             // Adapter seam: both runtimes expose the same LLMEvent stream. Native
             // already returns one; AI SDK streams are converted here.
             const state = LLMAISDK.adapterState()
-            return Stream.fromAsyncIterable(result.result.fullStream, (e) =>
-              e instanceof Error ? e : new Error(String(e)),
-            ).pipe(
-              Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
-              Stream.flatMap((events) => Stream.fromIterable(events)),
+            return tracked(
+              Stream.fromAsyncIterable(result.result.fullStream, (e) =>
+                e instanceof Error ? e : new Error(String(e)),
+              ).pipe(
+                Stream.mapEffect((event) => LLMAISDK.toLLMEvents(state, event)),
+                Stream.flatMap((events) => Stream.fromIterable(events)),
+              ),
             )
           }),
         ),
