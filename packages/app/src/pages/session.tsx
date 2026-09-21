@@ -1136,7 +1136,7 @@ export default function Page() {
     inputRef?.focus()
   }
 
-  useComposerCommands()
+  useComposerCommands({ model: inputController().model })
   useSessionCommands({
     navigateMessageByOffset,
     setActiveMessage,

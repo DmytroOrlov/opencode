@@ -16,7 +16,10 @@ type ModelState = ReturnType<typeof useLocal>["model"]
 const featuredProviders = ["opencode", "opencode-go", "openai", "anthropic", "google", "github-copilot"]
 const displayModelName = (name: string) => name.replace(/\s+(?:\(free\)|free)$/i, "")
 
-export const DialogSelectModelUnpaidV2: Component<{ model?: ModelState }> = (props) => {
+export const DialogSelectModelUnpaidV2: Component<{
+  model?: ModelState
+  onSelect?: (item: ReturnType<ModelState["list"]>[number]) => void
+}> = (props) => {
   const local = useLocal()
   const model = props.model ?? local.model
   const dialog = useDialog()
@@ -42,7 +45,8 @@ export const DialogSelectModelUnpaidV2: Component<{ model?: ModelState }> = (pro
   }
 
   const selectModel = (item: ReturnType<ModelState["list"]>[number]) => {
-    model.set({ modelID: item.id, providerID: item.provider.id }, { recent: true })
+    if (props.onSelect) props.onSelect(item)
+    else model.set({ modelID: item.id, providerID: item.provider.id }, { recent: true })
     dialog.close()
   }
 

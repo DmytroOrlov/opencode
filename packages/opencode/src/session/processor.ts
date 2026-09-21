@@ -15,7 +15,7 @@ import { MessageV2 } from "./message-v2"
 import { isOverflow } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
-import { SessionRetry } from "./retry"
+import { SessionRetry, type Err } from "./retry"
 import { SessionStatus } from "./status"
 import { SessionSummary } from "./summary"
 import type { Provider } from "@/provider/provider"
@@ -25,9 +25,14 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { SessionRecovery, type AvailableFallback, type FallbackResolution, type RecoveryDecision } from "./recovery"
 
 const DOOM_LOOP_THRESHOLD = 3
-export type Result = "compact" | "stop" | "continue"
+export type Result =
+  | "compact"
+  | "stop"
+  | "continue"
+  | { type: "failover"; error: unknown; mode: "restart" | "continue"; fallback: AvailableFallback }
 
 export interface Handle {
   readonly message: SessionV1.Assistant
@@ -44,6 +49,8 @@ export interface Handle {
       attachments?: SessionV1.FilePart[]
     },
   ) => Effect.Effect<void>
+  readonly markToolExecutionStarted: (toolCallID: string) => Effect.Effect<void>
+  readonly finalizeFailure: (error: unknown) => Effect.Effect<void>
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
 }
 
@@ -51,6 +58,7 @@ type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  fallback?: FallbackResolution
 }
 
 export interface Interface {
@@ -72,6 +80,8 @@ interface ProcessorContext extends Input {
   needsCompaction: boolean
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  executingToolCalls: Set<string>
+  settledExecutedToolCalls: Set<string>
 }
 
 type StreamEvent = LLMEvent
@@ -111,6 +121,8 @@ const layer = Layer.effect(
         needsCompaction: false,
         currentText: undefined,
         reasoningMap: {},
+        executingToolCalls: new Set(),
+        settledExecutedToolCalls: new Set(),
       }
       let aborted = false
 
@@ -124,6 +136,13 @@ const layer = Layer.effect(
         const done = ctx.toolcalls[toolCallID]?.done
         delete ctx.toolcalls[toolCallID]
         if (done) yield* Deferred.succeed(done, undefined).pipe(Effect.ignore)
+      })
+
+      const markToolExecutionStarted = Effect.fn("SessionProcessor.markToolExecutionStarted")(function* (
+        toolCallID: string,
+      ) {
+        ctx.executingToolCalls.add(toolCallID)
+        ctx.settledExecutedToolCalls.delete(toolCallID)
       })
 
       const readToolCall = Effect.fn("SessionProcessor.readToolCall")(function* (toolCallID: string) {
@@ -180,6 +199,7 @@ const layer = Layer.effect(
             attachments: output.attachments,
           },
         })
+        if (ctx.executingToolCalls.delete(toolCallID)) ctx.settledExecutedToolCalls.add(toolCallID)
         yield* settleToolCall(toolCallID)
       })
 
@@ -200,6 +220,7 @@ const layer = Layer.effect(
         if (error instanceof PermissionV1.RejectedError || error instanceof Question.RejectedError) {
           ctx.blocked = ctx.shouldBreak
         }
+        if (ctx.executingToolCalls.delete(toolCallID)) ctx.settledExecutedToolCalls.add(toolCallID)
         yield* settleToolCall(toolCallID)
         return true
       })
@@ -349,6 +370,7 @@ const layer = Layer.effect(
                 ? { ...value.providerMetadata, providerExecuted: true }
                 : value.providerMetadata,
             }))
+            if (value.providerExecuted) yield* markToolExecutionStarted(value.id)
 
             const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
               Effect.provideService(Database.Service, database),
@@ -610,6 +632,103 @@ const layer = Layer.effect(
         yield* session.updateMessage(ctx.assistantMessage)
       })
 
+      const restart = Effect.fn("SessionProcessor.restart")(function* (
+        baseline: Set<string>,
+        messageBaseline: {
+          finish: string | undefined
+          error: SessionV1.Assistant["error"]
+          cost: number
+          tokens: SessionV1.Assistant["tokens"]
+          structured: unknown
+          completed: number | undefined
+        },
+        recaptureSnapshot: boolean,
+      ) {
+        ctx.snapshot = undefined
+        const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        yield* Effect.forEach(
+          parts.filter((part) => !baseline.has(part.id)),
+          (part) =>
+            session.removePart({
+              sessionID: part.sessionID,
+              messageID: part.messageID,
+              partID: part.id,
+            }),
+        )
+        ctx.currentText = undefined
+        ctx.reasoningMap = {}
+        ctx.toolcalls = {}
+        ctx.needsCompaction = false
+        ctx.blocked = false
+        ctx.executingToolCalls.clear()
+        ctx.settledExecutedToolCalls.clear()
+
+        const messageChanged =
+          ctx.assistantMessage.finish !== messageBaseline.finish ||
+          ctx.assistantMessage.error !== messageBaseline.error ||
+          ctx.assistantMessage.cost !== messageBaseline.cost ||
+          JSON.stringify(ctx.assistantMessage.tokens) !== JSON.stringify(messageBaseline.tokens) ||
+          ctx.assistantMessage.structured !== messageBaseline.structured ||
+          ctx.assistantMessage.time.completed !== messageBaseline.completed
+        ctx.assistantMessage.finish = messageBaseline.finish
+        ctx.assistantMessage.error = messageBaseline.error
+        ctx.assistantMessage.cost = messageBaseline.cost
+        ctx.assistantMessage.tokens = {
+          ...messageBaseline.tokens,
+          cache: { ...messageBaseline.tokens.cache },
+        }
+        ctx.assistantMessage.structured = messageBaseline.structured
+        ctx.assistantMessage.time.completed = messageBaseline.completed
+        if (messageChanged) yield* session.updateMessage(ctx.assistantMessage)
+        if (recaptureSnapshot) ctx.snapshot = yield* snapshot.track()
+      })
+
+      const sealForContinuation = Effect.fn("SessionProcessor.sealForContinuation")(function* (baseline: Set<string>) {
+        if (ctx.snapshot) {
+          const patch = yield* snapshot.patch(ctx.snapshot)
+          if (patch.files.length) {
+            yield* session.updatePart({
+              id: PartID.ascending(),
+              messageID: ctx.assistantMessage.id,
+              sessionID: ctx.sessionID,
+              type: "patch",
+              hash: patch.hash,
+              files: patch.files,
+            })
+          }
+          ctx.snapshot = undefined
+        }
+
+        const parts = yield* MessageV2.parts(ctx.assistantMessage.id).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        yield* Effect.forEach(
+          parts.filter((part) => {
+            if (baseline.has(part.id)) return false
+            if (part.type === "patch") return false
+            return !(part.type === "tool" && ctx.settledExecutedToolCalls.has(part.callID))
+          }),
+          (part) =>
+            session.removePart({
+              sessionID: part.sessionID,
+              messageID: part.messageID,
+              partID: part.id,
+            }),
+        )
+        ctx.currentText = undefined
+        ctx.reasoningMap = {}
+        ctx.toolcalls = {}
+        ctx.executingToolCalls.clear()
+        ctx.needsCompaction = false
+        ctx.blocked = false
+        ctx.assistantMessage.error = undefined
+        ctx.assistantMessage.finish = "tool-calls"
+        ctx.assistantMessage.time.completed = Date.now()
+        yield* session.updateMessage(ctx.assistantMessage)
+      })
+
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
         yield* Effect.logError("process", {
           "session.id": input.sessionID,
@@ -638,13 +757,96 @@ const layer = Layer.effect(
         yield* status.set(ctx.sessionID, { type: "idle" })
       })
 
+      const logDecision = (input: {
+        decision: "retry_current" | "failover_restart" | "failover_continue" | "continue_current" | "terminal"
+        reason:
+          | "retryable_failure"
+          | "replay_safe"
+          | "settled_tool_result"
+          | "executing_tool_unknown"
+          | "aborted"
+          | "context_overflow"
+          | "blocked"
+          | "retry_exhausted"
+          | "non_retryable_failure"
+        mode?: "restart" | "continue"
+        statusCode?: number
+        retryAttempt?: number
+        retryNext?: number
+      }) => {
+        return Effect.logInfo("session recovery", {
+          "session.id": ctx.sessionID,
+          messageID: ctx.assistantMessage.id,
+          providerID: ctx.model.providerID,
+          modelID: ctx.model.id,
+          variant: ctx.assistantMessage.variant,
+          phase: "decision",
+          decision: input.decision,
+          reason: input.reason,
+          mode: input.mode,
+          retryAttempt: input.retryAttempt,
+          retryNext: input.retryNext,
+          statusCode: input.statusCode,
+        })
+      }
+
+      const recovery = (error: Err, retryExhausted: boolean) =>
+        SessionRecovery.decide(
+          SessionRecovery.errorFacts(
+            error,
+            {
+              needsCompaction: ctx.needsCompaction,
+              blocked: ctx.blocked,
+              executingToolCalls: ctx.executingToolCalls.size,
+              settledExecutedToolCalls: ctx.settledExecutedToolCalls.size,
+              fallback: input.fallback ?? { reason: "disabled" },
+              retryExhausted,
+            },
+            SessionRetry.retryable(error, input.model.providerID) !== undefined,
+          ),
+        )
+
       const process = Effect.fn("SessionProcessor.process")(function* (streamInput: LLM.StreamInput) {
         yield* Effect.logInfo("process", {
           "session.id": input.sessionID,
           messageID: input.assistantMessage.id,
         })
         ctx.needsCompaction = false
+        ctx.executingToolCalls.clear()
+        ctx.settledExecutedToolCalls.clear()
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
+        const baseline = new Set(
+          (yield* MessageV2.parts(ctx.assistantMessage.id).pipe(Effect.provideService(Database.Service, database))).map(
+            (part) => part.id,
+          ),
+        )
+        const messageBaseline = {
+          finish: ctx.assistantMessage.finish,
+          error: ctx.assistantMessage.error,
+          cost: ctx.assistantMessage.cost,
+          tokens: {
+            ...ctx.assistantMessage.tokens,
+            cache: { ...ctx.assistantMessage.tokens.cache },
+          },
+          structured: ctx.assistantMessage.structured,
+          completed: ctx.assistantMessage.time.completed,
+        }
+        let appliedRecovery: { decision: RecoveryDecision; error?: unknown } | undefined
+        let terminalDecisionLogged = false
+        const logTerminalDecision = (input: {
+          reason:
+            | "executing_tool_unknown"
+            | "aborted"
+            | "context_overflow"
+            | "blocked"
+            | "retry_exhausted"
+            | "non_retryable_failure"
+          statusCode?: number
+        }) => {
+          if (terminalDecisionLogged) return Effect.void
+          terminalDecisionLogged = true
+          return logDecision({ decision: "terminal", ...input })
+        }
 
         return yield* Effect.gen(function* () {
           yield* Effect.gen(function* () {
@@ -659,14 +861,6 @@ const layer = Layer.effect(
               Stream.runDrain,
             )
           }).pipe(
-            Effect.onInterrupt(() =>
-              Effect.gen(function* () {
-                aborted = true
-                if (!ctx.assistantMessage.error) {
-                  yield* halt(new DOMException("Aborted", "AbortError"))
-                }
-              }),
-            ),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
               (cause) => Effect.fail(Cause.squash(cause)),
@@ -675,25 +869,125 @@ const layer = Layer.effect(
               SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
-                  })
-                },
+                recovery: ({ error, attempt }) => recovery(error, attempt > SessionRetry.RETRY_MAX_RETRIES),
+                set: (info) =>
+                  Effect.gen(function* () {
+                    yield* logDecision({
+                      decision: "retry_current",
+                      reason: "retryable_failure",
+                      statusCode: info.statusCode,
+                      retryAttempt: info.attempt,
+                      retryNext: info.next,
+                    })
+                    yield* restart(baseline, messageBaseline, true)
+                    yield* status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt: info.attempt,
+                      message: info.message,
+                      action: info.action,
+                      next: info.next,
+                    })
+                  }),
               }),
             ),
-            Effect.catch(halt),
-            Effect.ensuring(cleanup()),
+            Effect.onInterrupt(() =>
+              Effect.gen(function* () {
+                aborted = true
+                yield* logTerminalDecision({ reason: "aborted" })
+                if (!ctx.assistantMessage.error) {
+                  yield* halt(new DOMException("Aborted", "AbortError"))
+                }
+              }),
+            ),
+            Effect.catch((error) =>
+              Effect.gen(function* () {
+                const parsed = parse(error)
+                const statusCode = SessionV1.APIError.isInstance(parsed) ? parsed.data.statusCode : undefined
+                const decision = recovery(parsed, true)
+                if (decision.type === "failover_continue") {
+                  yield* logDecision({
+                    decision: decision.type,
+                    reason: decision.reason,
+                    mode: "continue",
+                    statusCode,
+                  })
+                  appliedRecovery = { decision, error }
+                  return yield* sealForContinuation(baseline)
+                }
+                if (decision.type === "failover_restart") {
+                  yield* logDecision({
+                    decision: decision.type,
+                    reason: decision.reason,
+                    mode: "restart",
+                    statusCode,
+                  })
+                  appliedRecovery = { decision, error }
+                  return
+                }
+                if (decision.type === "continue_current") {
+                  yield* logDecision({
+                    decision: decision.type,
+                    reason: decision.reason,
+                    mode: "continue",
+                    statusCode,
+                  })
+                  appliedRecovery = { decision }
+                  return yield* sealForContinuation(baseline)
+                }
+                yield* logTerminalDecision({
+                  reason: decision.type === "retry_current" ? "retry_exhausted" : decision.reason,
+                  statusCode,
+                })
+                return yield* halt(error)
+              }),
+            ),
+            Effect.ensuring(
+              Effect.gen(function* () {
+                if (appliedRecovery?.decision.type === "failover_restart") {
+                  yield* restart(baseline, messageBaseline, false)
+                  return
+                }
+                if (
+                  appliedRecovery?.decision.type === "failover_continue" ||
+                  appliedRecovery?.decision.type === "continue_current"
+                ) {
+                  return
+                }
+                yield* cleanup()
+              }),
+            ),
           )
 
           if (ctx.needsCompaction) return "compact"
-          if (ctx.blocked || ctx.assistantMessage.error) return "stop"
+          if (appliedRecovery?.decision.type === "failover_restart") {
+            return {
+              type: "failover",
+              error: appliedRecovery.error,
+              mode: "restart",
+              fallback: appliedRecovery.decision.fallback,
+            } as const
+          }
+          if (appliedRecovery?.decision.type === "failover_continue") {
+            return {
+              type: "failover",
+              error: appliedRecovery.error,
+              mode: "continue",
+              fallback: appliedRecovery.decision.fallback,
+            } as const
+          }
+          if (appliedRecovery?.decision.type === "continue_current") return "continue"
+          if (ctx.blocked) {
+            yield* logTerminalDecision({ reason: "blocked" })
+            return "stop"
+          }
+          if (ctx.assistantMessage.error) return "stop"
           return "continue"
         })
+      })
+
+      const finalizeFailure = Effect.fn("SessionProcessor.finalizeFailure")(function* (error: unknown) {
+        yield* halt(error)
+        yield* cleanup()
       })
 
       return {
@@ -702,6 +996,8 @@ const layer = Layer.effect(
         },
         updateToolCall,
         completeToolCall,
+        markToolExecutionStarted,
+        finalizeFailure,
         process,
       } satisfies Handle
     })

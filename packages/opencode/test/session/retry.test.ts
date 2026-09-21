@@ -7,23 +7,26 @@ import { setTimeout as sleep } from "node:timers/promises"
 import { Effect, Schedule, Schema } from "effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
+import { SessionRecovery } from "../../src/session/recovery"
 import { MessageV2 } from "../../src/session/message-v2"
 import { ProviderError } from "../../src/provider/error"
 import { SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 
 const providerID = ProviderV2.ID.make("test")
 const retryProvider = "test"
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionStatus.node, CrossSpawnSpawner.node])))
 
-function apiError(headers?: Record<string, string>): SessionV1.APIError {
+function apiError(headers?: Record<string, string>, statusCode?: number): SessionV1.APIError {
   return Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
     new SessionV1.APIError({
       message: "boom",
       isRetryable: true,
       responseHeaders: headers,
+      statusCode,
     }).toObject(),
   )
 }
@@ -97,7 +100,8 @@ describe("session.retry.delay", () => {
   it.instance("policy updates retry status and increments attempts", () =>
     Effect.gen(function* () {
       const sessionID = SessionID.make("session-retry-test")
-      const error = apiError({ "retry-after-ms": "0" })
+      const error = apiError({ "retry-after-ms": "0" }, 503)
+      const statuses: Array<number | undefined> = []
       const status = yield* SessionStatus.Service
 
       const step = yield* Schedule.toStepWithMetadata(
@@ -105,11 +109,14 @@ describe("session.retry.delay", () => {
           provider: "test",
           parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
           set: (info) =>
-            status.set(sessionID, {
-              type: "retry",
-              attempt: info.attempt,
-              message: info.message,
-              next: info.next,
+            Effect.gen(function* () {
+              statuses.push(info.statusCode)
+              yield* status.set(sessionID, {
+                type: "retry",
+                attempt: info.attempt,
+                message: info.message,
+                next: info.next,
+              })
             }),
         }),
       )
@@ -121,6 +128,7 @@ describe("session.retry.delay", () => {
         attempt: 2,
         message: "boom",
       })
+      expect(statuses).toStrictEqual([503, 503])
     }),
   )
 
@@ -149,6 +157,138 @@ describe("session.retry.delay", () => {
 })
 
 describe("session.retry.retryable", () => {
+  const facts = (error: ReturnType<NamedError["toObject"]>, fallback: "available" | "disabled", retryExhausted = false) =>
+    SessionRecovery.errorFacts(
+      error,
+      {
+        needsCompaction: false,
+        blocked: false,
+        executingToolCalls: 0,
+        settledExecutedToolCalls: 0,
+        fallback:
+          fallback === "available"
+            ? {
+                reason: "available",
+                ref: { providerID, modelID: ModelV2.ID.make("fallback") },
+                model: undefined as never,
+              }
+            : { reason: "disabled" },
+        retryExhausted,
+      },
+      SessionRetry.retryable(error, retryProvider) !== undefined,
+    )
+
+  test("prefers fallback for model-attempt errors when available", () => {
+    const fallback = {
+      reason: "available" as const,
+      ref: { providerID, modelID: ModelV2.ID.make("fallback") },
+      model: undefined as never,
+    }
+    const errors = [
+      wrap("FailedToOpenSocket"),
+      wrap("fetch failed"),
+      ...[400, 401, 403, 404, 408, 422, 429, 500, 502, 503, 504].map((statusCode) =>
+        Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+          new SessionV1.APIError({ message: `HTTP ${statusCode}`, statusCode, isRetryable: false }).toObject(),
+        ),
+      ),
+      wrap("provider rejected the request"),
+      wrap("unknown model stream failure"),
+    ]
+
+    for (const error of errors) expect(SessionRecovery.decide(facts(error, "available")).type).toMatch(/^failover_/)
+    expect(SessionRecovery.decide({ ...facts(wrap("fetch failed"), "available"), fallback })).toEqual({
+      type: "failover_restart",
+      reason: "replay_safe",
+      fallback,
+    })
+  })
+
+  test("keeps retry and terminal classification when fallback is unavailable", () => {
+    const retryableError = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({ message: "Service unavailable", statusCode: 503, isRetryable: false }).toObject(),
+    )
+    const rateLimitError = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({ message: "Rate limited", statusCode: 429, isRetryable: false }).toObject(),
+    )
+    const terminalError = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({ message: "Bad request", statusCode: 400, isRetryable: false }).toObject(),
+    )
+
+    expect(SessionRecovery.decide(facts(wrap("fetch failed"), "disabled")).type).toBe("retry_current")
+    expect(SessionRecovery.decide(facts(retryableError, "disabled")).type).toBe("retry_current")
+    expect(SessionRecovery.decide(facts(rateLimitError, "disabled")).type).toBe("retry_current")
+    expect(SessionRecovery.decide(facts(terminalError, "disabled")).type).toBe("terminal")
+    expect(SessionRecovery.decide(facts(wrap("unknown model stream failure"), "disabled")).type).toBe("terminal")
+  })
+
+  test("does not fail over abort or context overflow errors", () => {
+    const aborted = new SessionV1.AbortedError({ message: "Aborted" }).toObject()
+    const overflow = new SessionV1.ContextOverflowError({ message: "overflow" }).toObject()
+    expect(SessionRecovery.decide(facts(aborted, "available")).type).toBe("terminal")
+    expect(SessionRecovery.decide(facts(overflow, "available")).type).toBe("terminal")
+  })
+
+  test("continues from a settled tool result without fallback", () => {
+    const error = wrap("fetch failed")
+    expect(
+      SessionRecovery.decide({
+        ...facts(error, "disabled"),
+        settledExecutedToolCalls: 1,
+      }),
+    ).toEqual({ type: "continue_current", reason: "settled_tool_result" })
+  })
+
+  test("classifies transport failures for immediate failover only when available", () => {
+    const transport = wrap("fetch failed")
+    expect(SessionRecovery.decide(facts(transport, "available")).type).toBe("failover_restart")
+    expect(SessionRecovery.decide(facts(transport, "disabled")).type).toBe("retry_current")
+  })
+
+  test("preserves and classifies Bun FailedToOpenSocket APICallErrors", () => {
+    const error = new APICallError({
+      message: "Cannot connect to API: Was there a typo in the url or port?",
+      url: "http://remote.invalid/v1/chat/completions",
+      requestBodyValues: {},
+      isRetryable: true,
+      cause: {
+        code: "FailedToOpenSocket",
+        message: "Was there a typo in the url or port?",
+      },
+    })
+    const parsed = MessageV2.fromError(error, { providerID })
+    expect(SessionV1.APIError.isInstance(parsed)).toBe(true)
+    if (!SessionV1.APIError.isInstance(parsed)) throw new Error("expected APIError")
+    expect(parsed.data.metadata).toMatchObject({
+      url: "http://remote.invalid/v1/chat/completions",
+      code: "FailedToOpenSocket",
+      message: "Was there a typo in the url or port?",
+    })
+    expect(SessionRecovery.decide(facts(parsed, "available")).type).toBe("failover_restart")
+  })
+
+  test("classifies the Bun connection message when no cause code is available", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Cannot connect to API: Was there a typo in the url or port?",
+        isRetryable: true,
+      }).toObject(),
+    )
+    expect(SessionRecovery.decide(facts(error, "available")).type).toBe("failover_restart")
+  })
+
+  test("fails over transient HTTP responses when fallback is available", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Service unavailable",
+        isRetryable: false,
+        statusCode: 503,
+      }).toObject(),
+    )
+    expect(SessionRecovery.decide(facts(error, "available")).type).toBe("failover_restart")
+    expect(SessionRecovery.decide(facts(error, "disabled")).type).toBe("retry_current")
+  })
+
   test("retries serialized too_many_requests messages", () => {
     const error = wrap(JSON.stringify({ type: "error", error: { type: "too_many_requests" } }))
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Too Many Requests" })

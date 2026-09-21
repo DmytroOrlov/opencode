@@ -7,6 +7,7 @@ import { Persist, persisted } from "@/utils/persist"
 import type { ServerScope } from "@/utils/server-scope"
 import type { BlobReference } from "@/utils/draft-store"
 import type { Platform } from "@/context/platform"
+import type { ModelSelectionSnapshot } from "./local"
 
 interface PartBase {
   content: string
@@ -49,6 +50,10 @@ export type PromptModel = {
   providerID: string
   modelID: string
   variant?: string | null
+}
+
+function clonePromptModel(model?: PromptModel) {
+  return model ? { ...model } : undefined
 }
 
 export type FileContextItem = {
@@ -190,6 +195,7 @@ function promptStore(initial?: InitialPrompt): PromptStore {
 
 function createPromptStateValue(store: PromptStore, setStore: SetStoreFunction<PromptStore>) {
   const actions = createPromptActions(setStore)
+  const applyModel = (model: PromptModel | undefined) => setStore("model", clonePromptModel(model))
   const value = {
     store: [() => store, setStore] as [Accessor<PromptStore>, SetStoreFunction<PromptStore>],
     current: () => store.prompt,
@@ -197,7 +203,22 @@ function createPromptStateValue(store: PromptStore, setStore: SetStoreFunction<P
     dirty: () => !isPromptEqual(store.prompt, DEFAULT_PROMPT),
     model: {
       current: () => store.model,
-      set: (model: PromptModel | undefined) => setStore("model", model),
+      apply: applyModel,
+      set: applyModel,
+      snapshot: (): ModelSelectionSnapshot => {
+        const captured = clonePromptModel(store.model)
+        const hasVariant = !!store.model && Object.hasOwn(store.model, "variant")
+        return {
+          restore() {
+            setStore("model", undefined)
+            if (!captured) return
+            const restored = hasVariant
+              ? { providerID: captured.providerID, modelID: captured.modelID, variant: captured.variant }
+              : { providerID: captured.providerID, modelID: captured.modelID }
+            setStore("model", restored)
+          },
+        }
+      },
     },
     context: {
       items: createMemo(() => store.context.items),
@@ -235,6 +256,16 @@ function createPromptStateValue(store: PromptStore, setStore: SetStoreFunction<P
     capture: () => value,
   }
   return value
+}
+
+type PromptStateValue = ReturnType<typeof createPromptStateValue>
+export type PromptCapture = Omit<PromptStateValue, "model" | "capture"> & {
+  model: {
+    current: () => PromptModel | undefined
+    set: (model: PromptModel | undefined) => void
+    snapshot: () => ModelSelectionSnapshot
+  }
+  capture: () => PromptCapture
 }
 
 function createPersistedPrompt(target: ReturnType<typeof promptTarget>, initial?: InitialPrompt, platform?: Platform) {

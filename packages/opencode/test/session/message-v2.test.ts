@@ -645,13 +645,14 @@ describe("session.message-v2.toModelMessage", () => {
               metadata: {},
               time: { start: 0, end: 1 },
             },
-            metadata: { openai: { tool: "meta" } },
+            metadata: { openai: { tool: "meta" }, providerExecuted: true },
           },
         ] as SessionV1.Part[],
       },
     ]
 
-    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+    const serialized = await MessageV2.toModelMessages(input, model)
+    expect(serialized).toStrictEqual([
       {
         role: "user",
         content: [{ type: "text", text: "run tool" }],
@@ -666,13 +667,8 @@ describe("session.message-v2.toModelMessage", () => {
             toolCallId: "call-1",
             toolName: "bash",
             input: { cmd: "ls" },
-            providerExecuted: undefined,
+            providerExecuted: true,
           },
-        ],
-      },
-      {
-        role: "tool",
-        content: [
           {
             type: "tool-result",
             toolCallId: "call-1",
@@ -682,6 +678,11 @@ describe("session.message-v2.toModelMessage", () => {
         ],
       },
     ])
+    const serializedText = JSON.stringify(serialized)
+    expect(serializedText).toContain('"providerExecuted":true')
+    expect(serializedText).toContain('"input":{"cmd":"ls"}')
+    expect(serializedText).toContain('"value":"ok"')
+    expect(serializedText).not.toContain('"providerOptions":{"openai":{"tool":"meta"}}')
   })
 
   test("replaces compacted tool output with placeholder", async () => {

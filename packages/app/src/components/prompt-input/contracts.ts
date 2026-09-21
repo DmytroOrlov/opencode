@@ -2,8 +2,14 @@ import type { useLocal } from "@/context/local"
 import type { Prompt, usePrompt } from "@/context/prompt"
 import type { PromptInputHistory } from "./history-store"
 import type { FollowupDraft } from "./submit"
+import type { ModelPairController } from "@/pages/session/composer/prompt-model-selection"
 
 export type PromptInputState = ReturnType<typeof usePrompt>
+
+export type ComposerModelControls = {
+  selection: ReturnType<typeof useLocal>["model"]
+  pair: ModelPairController
+}
 
 export type PromptInputSubmission = {
   abort: () => Promise<void> | void
@@ -20,7 +26,8 @@ export type PromptInputControls = {
     select: (name: string | undefined) => void
   }
   model: {
-    selection: ReturnType<typeof useLocal>["model"]
+    selection: ComposerModelControls["selection"]
+    pair: ComposerModelControls["pair"]
     paid: boolean
     loading: boolean
   }

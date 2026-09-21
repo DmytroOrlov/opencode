@@ -145,6 +145,11 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       setStore("variant", key, value)
     }
 
+    const commitSelection = (model: ModelKey, options?: { recent?: boolean }) => {
+      setVisibility(model, true)
+      if (options?.recent) push(model)
+    }
+
     const [recentModels] = createResource(
       async () => {
         const recent = store.recent
@@ -164,9 +169,11 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
         list: () => recentModels()!,
         push,
       },
+      commitSelection,
       variant: {
         get: getVariant,
         set: setVariant,
+        commit: setVariant,
       },
     }
   },

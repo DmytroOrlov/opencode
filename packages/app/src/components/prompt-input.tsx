@@ -1697,7 +1697,12 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                               class="min-w-0 max-w-[320px] text-13-regular text-text-base group !px-0"
                               style={control()}
                               onClick={() => {
-                                dialog.show(() => <DialogSelectModelUnpaid model={props.controls.model.selection} />)
+                                dialog.show(() => (
+                                  <DialogSelectModelUnpaid
+                                    model={props.controls.model.selection}
+                                    onSelect={props.controls.model.pair.selectPrimary}
+                                  />
+                                ))
                               }}
                             >
                               <Show when={props.controls.model.selection.current()?.provider?.id}>
@@ -1724,6 +1729,8 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                         >
                           <ModelSelectorPopover
                             model={props.controls.model.selection}
+                            items={props.controls.model.pair.primaryModels}
+                            onSelect={props.controls.model.pair.selectPrimary}
                             trigger={(triggerProps) => (
                               <Button
                                 {...triggerProps}
@@ -1769,7 +1776,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                             current={props.controls.model.selection.variant.current() ?? "default"}
                             label={(x) => (x === "default" ? language.t("common.default") : x)}
                             onSelect={(value) => {
-                              props.controls.model.selection.variant.set(value === "default" ? undefined : value)
+                              props.controls.model.pair.selectVariant(value === "default" ? undefined : value)
                               restoreFocus()
                             }}
                             class="capitalize max-w-[160px] text-text-base !px-0"

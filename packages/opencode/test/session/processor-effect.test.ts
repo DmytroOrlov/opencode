@@ -226,6 +226,97 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
+const technicalFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.concat(
+        Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.reasoningStart({ id: "reasoning-technical" }),
+          LLMEvent.textStart({ id: "text-technical" }),
+        ),
+        Stream.fail(new Error("fetch failed")),
+      ),
+  }),
+)
+const technicalFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, technicalFailureLLM]])
+const itTechnicalFailure = testEffect(technicalFailureEnv)
+
+const settledToolFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-settled", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-settled", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-settled", name: "lookup", input: {}, providerExecuted: true }),
+        LLMEvent.toolResult({
+          id: "call-settled",
+          name: "lookup",
+          result: { type: "json", value: { output: "read once", title: "Lookup", metadata: {} } },
+          providerExecuted: true,
+        }),
+        LLMEvent.textStart({ id: "text-after-tool" }),
+        LLMEvent.textDelta({ id: "text-after-tool", text: "stale continuation" }),
+        LLMEvent.providerError({ message: "fetch failed" }),
+      ),
+  }),
+)
+const settledToolFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, settledToolFailureLLM]])
+const itSettledToolFailure = testEffect(settledToolFailureEnv)
+
+const unknownToolFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-unknown", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-unknown", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-unknown", name: "lookup", input: {}, providerExecuted: true }),
+        LLMEvent.providerError({ message: "provider boom" }),
+      ),
+  }),
+)
+const unknownToolFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, unknownToolFailureLLM]])
+const itUnknownToolFailure = testEffect(unknownToolFailureEnv)
+
+const proposedToolFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-proposed", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-proposed", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-proposed", name: "lookup", input: {} }),
+        LLMEvent.providerError({ message: "provider boom" }),
+      ),
+  }),
+)
+const proposedToolFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, proposedToolFailureLLM]])
+const itProposedToolFailure = testEffect(proposedToolFailureEnv)
+
+const stepFinishFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({
+          index: 0,
+          reason: "stop",
+          usage: { inputTokens: 10, outputTokens: 3, reasoningTokens: 2 },
+        }),
+        LLMEvent.providerError({ message: "provider boom" }),
+      ),
+  }),
+)
+const stepFinishFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, stepFinishFailureLLM]])
+const itStepFinishFailure = testEffect(stepFinishFailureEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -514,7 +605,7 @@ it.live("session.processor effect tests reset reasoning state across retries", (
   ),
 )
 
-it.live("session.processor effect tests do not retry unknown json errors", () =>
+it.live("session.processor effect tests terminalize unknown json errors", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
@@ -551,7 +642,8 @@ it.live("session.processor effect tests do not retry unknown json errors", () =>
 
         expect(value).toBe("stop")
         expect(yield* llm.calls).toBe(1)
-        expect(handle.message.error?.name).toBe("APIError")
+        expect(handle.message.error).toBeDefined()
+        expect(handle.message.time.completed).toBeDefined()
       }),
     { config: (url) => providerCfg(url) },
   ),
@@ -757,6 +849,68 @@ it.live("session.processor effect tests publish retry status updates", () =>
         expect(value).toBe("continue")
         expect(yield* llm.calls).toBe(2)
         expect(states).toStrictEqual([1])
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor aborts during retry backoff", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const statuses = yield* SessionStatus.Service
+
+        yield* llm.error(503, { error: "retry during backoff" })
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "abort retry backoff")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "abort retry backoff" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* waitFor(
+          statuses
+            .get(chat.id)
+            .pipe(Effect.map((value) => (value.type === "retry" && value.attempt === 1 ? value : undefined))),
+          "timed out waiting for retry backoff",
+        )
+        yield* Fiber.interrupt(run)
+
+        const exit = yield* Fiber.await(run)
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const state = yield* statuses.get(chat.id)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") expect(stored.info.error?.name).toBe("MessageAbortedError")
+        expect(state).toMatchObject({ type: "idle" })
+        expect(yield* llm.calls).toBe(1)
       }),
     { config: (url) => providerCfg(url) },
   ),
@@ -1085,7 +1239,11 @@ itProviderError.live("session.processor effect tests fail provider-executed erro
           seen.push(event.type)
           return Effect.void
         })
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
 
         yield* handle.process({
           user: {
@@ -1133,7 +1291,11 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
           seen.push(event.type)
           return Effect.void
         })
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
 
         expect(
           yield* handle.process({
@@ -1165,6 +1327,272 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         expect(seen).toContain(MessageV2.Event.PartUpdated.type)
         expect(seen).toContain(Session.Event.Error.type)
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itTechnicalFailure.live("session.processor rolls back uncommitted technical parts before failover", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "technical failure")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          fallback: { reason: "available", ref, model: mdl },
+        })
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "technical failure" }],
+          tools: {},
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(result).toMatchObject({ type: "failover" })
+        expect(parts).toEqual([])
+        expect(handle.message.error).toBeUndefined()
+        expect(handle.message.time.completed).toBeUndefined()
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettledToolFailure.live("session.processor continues from a settled tool result", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "continue from tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          fallback: { reason: "available", ref, model: mdl },
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "continue from tool" }],
+          tools: {},
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+        const tool = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result).toMatchObject({ type: "failover", mode: "continue" })
+        expect(parts.filter((part) => part.type === "text")).toEqual([])
+        expect(tool?.state.status).toBe("completed")
+        expect(msg.providerID).toBe(ref.providerID)
+        expect(msg.modelID).toBe(ref.modelID)
+        expect(msg.finish).toBe("tool-calls")
+        expect(msg.error).toBeUndefined()
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettledToolFailure.live("session.processor continues from a settled tool result without fallback", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "continue from settled tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "continue from settled tool" }],
+          tools: {},
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result).toBe("continue")
+        expect(tools).toHaveLength(1)
+        expect(tools[0]?.state.status).toBe("completed")
+        expect(msg.finish).toBe("tool-calls")
+        expect(msg.error).toBeUndefined()
+      }),
+    { config: cfg },
+  ),
+)
+
+itUnknownToolFailure.live("session.processor stops when executed tool outcome is unknown", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "unknown tool outcome")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          fallback: { reason: "available", ref, model: mdl },
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "unknown tool outcome" }],
+          tools: {},
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+        const tool = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result).toBe("stop")
+        expect(tool?.state.status).toBe("error")
+        if (tool?.state.status === "error") expect(tool.state.metadata?.interrupted).toBe(true)
+      }),
+    { config: cfg },
+  ),
+)
+
+itProposedToolFailure.live("session.processor restarts after an unexecuted tool proposal", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "unexecuted tool proposal")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          fallback: { reason: "available", ref, model: mdl },
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "unexecuted tool proposal" }],
+          tools: {},
+        })
+
+        expect(result).toMatchObject({ type: "failover", mode: "restart" })
+        expect(yield* MessageV2.parts(msg.id)).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itStepFinishFailure.live("session.processor restores assistant bookkeeping after step-finish failure", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "step finish failure")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const baseline = {
+          finish: msg.finish,
+          cost: msg.cost,
+          tokens: structuredClone(msg.tokens),
+          completed: msg.time.completed,
+        }
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          fallback: { reason: "available", ref, model: mdl },
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "step finish failure" }],
+          tools: {},
+        })
+
+        expect(result).toMatchObject({ type: "failover", mode: "restart" })
+        expect(msg.finish).toBe(baseline.finish)
+        expect(msg.cost).toBe(baseline.cost)
+        expect(msg.tokens).toEqual(baseline.tokens)
+        expect(msg.time.completed).toBe(baseline.completed)
+        expect(yield* MessageV2.parts(msg.id)).toEqual([])
       }),
     { config: cfg },
   ),

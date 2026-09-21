@@ -1,6 +1,7 @@
 import { useCommand, type CommandOption } from "@/context/command"
 import { useLanguage } from "@/context/language"
-import { useLocal, type ModelSelection } from "@/context/local"
+import { useLocal } from "@/context/local"
+import type { ComposerModelControls } from "@/components/prompt-input/contracts"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { getCursorPosition, setCursorPosition } from "@/components/prompt-input/editor-dom"
 import { useSessionLayout } from "./session-layout"
@@ -13,14 +14,14 @@ const withCategory = (category: string) => {
   })
 }
 
-export const useComposerCommands = (input: { model?: ModelSelection } = {}) => {
+export const useComposerCommands = (input: { model: ComposerModelControls }) => {
   const command = useCommand()
   const dialog = useDialog()
   const language = useLanguage()
   const local = useLocal()
   const { sessionKey } = useSessionLayout()
   const sessionOwnership = createSessionOwnership(sessionKey)
-  const model = input.model ?? local.model
+  const model = input.model
   const modelCommand = withCategory(language.t("command.category.model"))
   const agentCommand = withCategory(language.t("command.category.agent"))
 
@@ -42,7 +43,16 @@ export const useComposerCommands = (input: { model?: ModelSelection } = {}) => {
     }
     const { DialogSelectModel } = await import("@/components/dialog-select-model")
     owner.run(() => {
-      void dialog.show(() => <DialogSelectModel model={model} />, restoreComposer)
+      void dialog.show(
+        () => (
+          <DialogSelectModel
+            model={model.selection}
+            items={model.pair.primaryModels}
+            onSelect={model.pair.selectPrimary}
+          />
+        ),
+        restoreComposer,
+      )
     })
   }
 
@@ -60,7 +70,7 @@ export const useComposerCommands = (input: { model?: ModelSelection } = {}) => {
       title: language.t("command.model.variant.cycle"),
       description: language.t("command.model.variant.cycle.description"),
       keybind: "shift+mod+d",
-      onSelect: () => model.variant.cycle(),
+      onSelect: () => model.pair.cycleVariant(),
     }),
     agentCommand({
       id: "agent.cycle",
