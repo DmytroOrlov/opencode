@@ -58,6 +58,11 @@ export namespace ProviderTest {
             if (providerID === row.id) return Effect.succeed(row)
             return Effect.die(new Error(`Unknown test provider: ${providerID}`))
           }),
+          getEndpoint: Effect.fn("TestProvider.getEndpoint")((model) => {
+            const configured = model.providerID === row.id ? row.options?.baseURL : undefined
+            const url = typeof configured === "string" && configured !== "" ? configured : model.api.url
+            return Effect.succeed(url || undefined)
+          }),
           getModel: Effect.fn("TestProvider.getModel")((providerID, modelID) => {
             if (providerID === row.id && modelID === mdl.id) return Effect.succeed(mdl)
             return Effect.die(new Error(`Unknown test model: ${providerID}/${modelID}`))

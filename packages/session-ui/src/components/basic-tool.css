@@ -163,6 +163,18 @@
     color: var(--v2-text-text-muted);
   }
 
+  [data-slot="basic-tool-tool-throughput"] {
+    flex-shrink: 0;
+    font-family: var(--font-family-sans);
+    font-variant-numeric: tabular-nums;
+    font-size: 14px;
+    font-style: normal;
+    font-weight: var(--font-weight-regular);
+    line-height: var(--line-height-large);
+    letter-spacing: var(--letter-spacing-normal);
+    color: var(--v2-text-text-faint);
+  }
+
   [data-slot="basic-tool-tool-action"] {
     display: inline-flex;
     align-items: center;

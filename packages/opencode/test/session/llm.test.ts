@@ -3,7 +3,9 @@ import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import path from "path"
-import { tool, type ModelMessage } from "ai"
+import { streamText, tool, type ModelMessage } from "ai"
+import { createOpenAICompatible } from "@ai-sdk/openai-compatible"
+import type { LanguageModelV3, LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
 import { InstanceRef } from "../../src/effect/instance-ref"
 import { HttpClientRequest, HttpClientResponse } from "effect/unstable/http"
@@ -14,13 +16,16 @@ import { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 
-import { testEffect } from "../lib/effect"
+import { testEffect, pollWithTimeout } from "../lib/effect"
+import { ProviderTest } from "../fake/provider"
+import { EventV2Bridge } from "@/event-v2-bridge"
 import type { Agent } from "../../src/agent/agent"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionID, MessageID } from "../../src/session/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Permission } from "@/permission"
 import { LLMAISDK } from "@/session/llm/ai-sdk"
+import { MLXTelemetry } from "@/session/llm/mlx-telemetry"
 import { Session as SessionNs } from "@/session/session"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -31,7 +36,12 @@ import { ProviderError } from "@/provider/error"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
 
-const openAIConfig = (model: ModelsDev.Provider["models"][string], baseURL: string): Partial<ConfigV1.Info> => {
+const openAIConfig = (
+  model: ModelsDev.Provider["models"][string],
+  baseURL: string,
+  providerOptions: Record<string, unknown> = {},
+  modelOptions: Record<string, unknown> = {},
+): Partial<ConfigV1.Info> => {
   const { experimental: _experimental, ...configModel } = model
   return {
     enabled_providers: ["openai"],
@@ -42,18 +52,55 @@ const openAIConfig = (model: ModelsDev.Provider["models"][string], baseURL: stri
         npm: "@ai-sdk/openai",
         api: "https://api.openai.com/v1",
         models: {
-          [model.id]: JSON.parse(JSON.stringify(configModel)) as ConfigModel,
+          [model.id]: {
+            ...(JSON.parse(JSON.stringify(configModel)) as ConfigModel),
+            options: modelOptions,
+          },
         },
         options: {
           apiKey: "test-openai-key",
           baseURL,
+          ...providerOptions,
         },
       },
     },
   }
 }
 
+const openAICompatibleConfig = (
+  model: ModelsDev.Provider["models"][string],
+  baseURL: string,
+  providers: Array<{
+    id: string
+    options?: Record<string, unknown>
+    modelOptions?: Record<string, unknown>
+  }>,
+): Partial<ConfigV1.Info> => {
+  const { experimental: _experimental, ...configModel } = model
+  return {
+    enabled_providers: providers.map((provider) => provider.id),
+    provider: Object.fromEntries(
+      providers.map(({ id, options, modelOptions }) => [
+        id,
+        {
+          name: id,
+          npm: "@ai-sdk/openai-compatible",
+          api: "https://api.openai.com/v1",
+          models: {
+            [model.id]: {
+              ...(JSON.parse(JSON.stringify(configModel)) as ConfigModel),
+              options: modelOptions,
+            },
+          },
+          options: { apiKey: "test-compatible-key", baseURL, ...options },
+        },
+      ]),
+    ),
+  }
+}
+
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([LLM.node, Provider.node])))
+const itTelemetry = testEffect(AppNodeBuilder.build(LayerNode.group([LLM.node, Provider.node, EventV2Bridge.node])))
 
 // LLM.stream returns a Stream, not an Effect, so we can't use the serviceUse proxy.
 const drain = (input: LLM.StreamInput) => LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runDrain))
@@ -559,6 +606,7 @@ describe("session.llm.ai-sdk adapter", () => {
 type Capture = {
   url: URL
   headers: Headers
+  rawBody: string
   body: Record<string, unknown>
 }
 
@@ -637,6 +685,52 @@ function waitStreamingRequest(pathname: string) {
   }
 }
 
+function waitSplashStreamingRequest(pathname: string) {
+  const request = deferred<Capture>()
+  const controller = deferred<ReadableStreamDefaultController<Uint8Array>>()
+  const requestAborted = deferred<void>()
+  const responseCanceled = deferred<void>()
+  const encoder = new TextEncoder()
+
+  state.queue.push({
+    path: pathname,
+    resolve: request.resolve,
+    response(req: Request) {
+      req.signal.addEventListener("abort", () => requestAborted.resolve(), { once: true })
+      return new Response(
+        new ReadableStream<Uint8Array>({
+          start(value) {
+            controller.resolve(value)
+          },
+          cancel() {
+            responseCanceled.resolve()
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } },
+      )
+    },
+  })
+
+  const emit = async (...chunks: unknown[]) => {
+    const stream = await controller.promise
+    const lines = chunks.map((chunk) => `data: ${typeof chunk === "string" ? chunk : JSON.stringify(chunk)}`)
+    stream.enqueue(encoder.encode(lines.join("\n\n") + "\n\n"))
+  }
+
+  const finish = async () => {
+    const stream = await controller.promise
+    stream.enqueue(encoder.encode("data: [DONE]\n\n"))
+    stream.close()
+  }
+
+  const fail = async () => {
+    const stream = await controller.promise
+    stream.error(new Error("Splash test stream failed after telemetry"))
+  }
+
+  return { request: request.promise, requestAborted: requestAborted.promise, responseCanceled: responseCanceled.promise, emit, finish, fail }
+}
+
 beforeAll(() => {
   state.server = Bun.serve({
     port: 0,
@@ -647,15 +741,17 @@ beforeAll(() => {
       }
 
       const url = new URL(req.url)
-      const body = (await req.json()) as Record<string, unknown>
-      next.resolve({ url, headers: req.headers, body })
+      const rawBody = await req.text()
+      const body = (rawBody ? JSON.parse(rawBody) : {}) as Record<string, unknown>
+      const capture = { url, headers: req.headers, rawBody, body }
+      next.resolve(capture)
 
       if (!url.pathname.endsWith(next.path)) {
         return new Response("not found", { status: 404 })
       }
 
       return typeof next.response === "function"
-        ? next.response(req, { url, headers: req.headers, body })
+        ? next.response(req, capture)
         : next.response
     },
   })
@@ -751,6 +847,769 @@ function createEventResponse(chunks: unknown[], includeDone = false) {
     headers: { "Content-Type": "text/event-stream" },
   })
 }
+
+describe("session.llm Splash SDK protocol gate", () => {
+  const splashModel = loadFixture("openai", "gpt-5.2").model
+  const splashAgent = {
+    name: "test",
+    mode: "primary",
+    options: {},
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  } satisfies Agent.Info
+
+  const splashInput = (providerID: string, assistantMessageID: string, sessionID: string) =>
+    Effect.gen(function* () {
+      const model = yield* Provider.use.getModel(ProviderV2.ID.make(providerID), ModelV2.ID.make(splashModel.id))
+      return {
+        user: {
+          id: MessageID.make(`msg-user-${assistantMessageID}`),
+          sessionID: SessionID.make(sessionID),
+          role: "user",
+          time: { created: Date.now() },
+          agent: splashAgent.name,
+          model: { providerID: ProviderV2.ID.make(providerID), modelID: model.id },
+        } satisfies SessionV1.User,
+        sessionID: SessionID.make(sessionID),
+        model,
+        agent: splashAgent,
+        system: ["You are a helpful assistant."],
+        messages: [{ role: "user", content: "Say hello" }],
+        tools: {},
+        assistantMessageID,
+      } satisfies LLM.StreamInput
+    })
+
+  const splashRecorder = (assistantMessageID: string) =>
+    Effect.gen(function* () {
+      const bridge = yield* EventV2Bridge.Service
+      const received: Array<{
+        sessionID?: unknown
+        assistantMessageID?: unknown
+        phase: string
+        processed?: number
+        total?: number
+        tokensPerSecond?: number
+        done?: boolean
+        source?: string
+      }> = []
+      const unsub = yield* bridge.listen((event) => {
+        if (event.type !== SessionV1.Event.Telemetry.type) return Effect.void
+        const data = event.data as unknown as (typeof received)[number]
+        if (String(data.assistantMessageID) !== assistantMessageID) return Effect.void
+        received.push(data)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+      return received
+    })
+
+  const splashChunk = (id: string, choices: unknown[], extra: Record<string, unknown> = {}) => ({
+    id: `chatcmpl-${id}`,
+    object: "chat.completion.chunk",
+    choices,
+    ...extra,
+  })
+
+  it.instance(
+    "keeps telemetry opt-in out of OpenAI-compatible requests and return_progress independent",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const endpoint = `${state.server!.url.origin}/v1`
+        const run = (providerID: string, suffix: string) =>
+          Effect.gen(function* () {
+            const request = waitRequest(
+              "/chat/completions",
+              createEventResponse(
+                [
+                  { id: "chatcmpl-invariance", object: "chat.completion.chunk", choices: [{ delta: { role: "assistant" } }] },
+                  { id: "chatcmpl-invariance", object: "chat.completion.chunk", choices: [{ delta: { content: "same answer" } }] },
+                  { id: "chatcmpl-invariance", object: "chat.completion.chunk", choices: [{ delta: {}, finish_reason: "stop" }] },
+                ],
+                true,
+              ),
+            )
+            const resolved = yield* Provider.use.getModel(ProviderV2.ID.make(providerID), ModelV2.ID.make(model.id))
+            const sessionID = SessionID.make(`session-splash-${suffix}`)
+            const agent = {
+              name: "test",
+              mode: "primary",
+              options: {},
+              permission: [{ permission: "*", pattern: "*", action: "allow" }],
+            } satisfies Agent.Info
+            const events = yield* LLM.Service.use((svc) =>
+              svc
+                .stream({
+                  user: {
+                    id: MessageID.make(`msg-user-splash-${suffix}`),
+                    sessionID,
+                    role: "user",
+                    time: { created: Date.now() },
+                    agent: agent.name,
+                    model: { providerID: ProviderV2.ID.make(providerID), modelID: resolved.id },
+                  } satisfies SessionV1.User,
+                  sessionID,
+                  model: resolved,
+                  agent,
+                  system: ["You are a helpful assistant."],
+                  messages: [{ role: "user", content: "Say same answer" }],
+                  tools: {},
+                })
+                .pipe(Stream.runCollect),
+            )
+            const capture = yield* Effect.promise(() => request)
+            const text = Array.from(events)
+              .filter((event) => event.type === "text-delta")
+              .map((event) => (event.type === "text-delta" ? event.text : ""))
+              .join("")
+            return { capture, text }
+          })
+
+        const splashOff = yield* run("splash-off", "splash-off")
+        const splashOn = yield* run("splash-on", "splash-on")
+        expect(splashOn.capture.rawBody).toBe(splashOff.capture.rawBody)
+        expect(splashOn.text).toBe(splashOff.text)
+        expect(splashOn.text).toBe("same answer")
+        expect(splashOn.capture.body.splashTelemetry).toBeUndefined()
+        expect(splashOn.capture.body.model).toBe(model.id)
+        expect(splashOn.capture.body.stream).toBe(true)
+        expect(splashOn.capture.body.stream_options).toMatchObject({ include_usage: true })
+        expect(splashOn.capture.body.return_progress).toBeUndefined()
+
+        const progressOff = yield* run("splash-progress-off", "progress-off")
+        const progressOn = yield* run("splash-progress-on", "progress-on")
+        expect(progressOn.capture.rawBody).toBe(progressOff.capture.rawBody)
+        expect(progressOn.capture.body.return_progress).toBe(true)
+        expect(progressOn.capture.body.splashTelemetry).toBeUndefined()
+
+        const otherOff = yield* run("other-off", "other-off")
+        const otherOn = yield* run("other-on", "other-on")
+        expect(otherOn.capture.rawBody).toBe(otherOff.capture.rawBody)
+        expect(otherOn.capture.body.splashTelemetry).toBeUndefined()
+        expect(otherOn.text).toBe(otherOff.text)
+      }),
+    {
+      config: () =>
+        openAICompatibleConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`, [
+          { id: "splash-off" },
+          { id: "splash-on", options: { splashTelemetry: true }, modelOptions: { splashTelemetry: true } },
+          { id: "splash-progress-off", modelOptions: { return_progress: true } },
+          {
+            id: "splash-progress-on",
+            options: { splashTelemetry: true },
+            modelOptions: { splashTelemetry: true, return_progress: true },
+          },
+          { id: "other-off" },
+          { id: "other-on", options: { splashTelemetry: true }, modelOptions: { splashTelemetry: true } },
+        ]),
+    },
+  )
+
+  itTelemetry.instance(
+    "does not attach Splash observation when a compatible provider opts out",
+    () =>
+      Effect.gen(function* () {
+        const runs = [
+          { providerID: "compatible-absent", id: "msg-splash-absent" },
+          { providerID: "compatible-false", id: "msg-splash-false" },
+        ]
+        for (const run of runs) {
+          const received = yield* splashRecorder(run.id)
+          const request = waitRequest(
+            "/chat/completions",
+            createEventResponse(
+              [
+                splashChunk(run.id, [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+                splashChunk(run.id, [{ index: 0, delta: { content: "Short answer" }, finish_reason: null }]),
+                splashChunk(run.id, [{ index: 0, delta: {}, finish_reason: "stop" }], {
+                  timings: { predicted_per_second: 1777 },
+                }),
+              ],
+              true,
+            ),
+          )
+          const input = yield* splashInput(run.providerID, run.id, `session-${run.id}`)
+          const events = yield* LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runCollect))
+          yield* Effect.promise(() => request)
+          const text = Array.from(events)
+            .filter((event) => event.type === "text-delta")
+            .map((event) => (event.type === "text-delta" ? event.text : ""))
+            .join("")
+          expect(text).toBe("Short answer")
+          expect(
+            received.some(
+              (event) =>
+                event.phase === "decode" &&
+                event.tokensPerSecond === 1777 &&
+                event.done === true &&
+                event.source === "provider",
+            ),
+          ).toBe(false)
+        }
+      }),
+    {
+      config: () =>
+        openAICompatibleConfig(splashModel, `${state.server!.url.origin}/v1`, [
+          { id: "compatible-absent" },
+          { id: "compatible-false", options: { splashTelemetry: false }, modelOptions: { splashTelemetry: false } },
+        ]),
+    },
+  )
+
+  itTelemetry.instance(
+    "prefers MLX selection over Splash observation when both controls are enabled",
+    () =>
+      Effect.gen(function* () {
+        const id = "msg-splash-mlx-precedence"
+        const received = yield* splashRecorder(id)
+        const eventsRequest = waitRequest("/events", new Response("unavailable", { status: 404 }))
+        const inferenceRequest = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              splashChunk(id, [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+              splashChunk(id, [{ index: 0, delta: { content: "MLX selected answer" }, finish_reason: null }]),
+              splashChunk(id, [{ index: 0, delta: {}, finish_reason: "stop" }], {
+                timings: { predicted_per_second: 1888 },
+              }),
+            ],
+            true,
+          ),
+        )
+        const input = yield* splashInput("compatible-mlx-splash", id, "session-splash-mlx-precedence")
+        const events = yield* LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runCollect))
+        const [eventsCapture, inferenceCapture] = yield* Effect.promise(() => Promise.all([eventsRequest, inferenceRequest]))
+        const text = Array.from(events)
+          .filter((event) => event.type === "text-delta")
+          .map((event) => (event.type === "text-delta" ? event.text : ""))
+          .join("")
+        expect(eventsCapture.url.pathname.endsWith("/events")).toBe(true)
+        expect(inferenceCapture.url.pathname.endsWith("/chat/completions")).toBe(true)
+        expect(text).toBe("MLX selected answer")
+        expect(received.some((event) => event.tokensPerSecond === 1888 && event.done === true && event.source === "provider")).toBe(false)
+      }),
+    {
+      config: () =>
+        openAICompatibleConfig(splashModel, `${state.server!.url.origin}/v1`, [
+          {
+            id: "compatible-mlx-splash",
+            options: { mlxTelemetry: true, splashTelemetry: true },
+            modelOptions: { mlxTelemetry: true, splashTelemetry: true },
+          },
+        ]),
+    },
+  )
+
+  itTelemetry.instance(
+    "publishes opted-in Splash telemetry through the existing session telemetry events",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const providerID = "splash-custom"
+        const assistantMessageID = "msg-splash-integration"
+        const sessionID = SessionID.make("session-splash-integration")
+        const request = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              {
+                id: "chatcmpl-splash-integration",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+              },
+              {
+                id: "chatcmpl-splash-integration",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { content: "Hello" }, finish_reason: null }],
+              },
+              {
+                id: "chatcmpl-splash-integration",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: {}, finish_reason: null }],
+                prompt_progress: { total: 2, cache: 1, processed: 1, time_ms: 0 },
+              },
+              {
+                id: "chatcmpl-splash-integration",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                timings: { predicted_per_second: 1500 },
+              },
+              {
+                id: "chatcmpl-splash-integration",
+                object: "chat.completion.chunk",
+                choices: [],
+                usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+              },
+            ],
+            true,
+          ),
+        )
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.make(providerID), ModelV2.ID.make(model.id))
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+        const received: Array<{
+          sessionID?: unknown
+          assistantMessageID?: string
+          phase: string
+          processed?: number
+          total?: number
+          tokensPerSecond?: number
+          done?: boolean
+          source?: string
+        }> = []
+        const bridge = yield* EventV2Bridge.Service
+        const unsub = yield* bridge.listen((event) => {
+          if (event.type !== SessionV1.Event.Telemetry.type) return Effect.void
+          const data = event.data as unknown as (typeof received)[number]
+          if (String(data.assistantMessageID) !== assistantMessageID) return Effect.void
+          received.push(data)
+          return Effect.void
+        })
+        yield* Effect.addFinalizer(() => unsub)
+
+        const streamEvents = yield* LLM.Service.use((svc) =>
+          svc
+            .stream({
+              user: {
+                id: MessageID.make("msg-user-splash-integration"),
+                sessionID,
+                role: "user",
+                time: { created: Date.now() },
+                agent: agent.name,
+                model: { providerID: ProviderV2.ID.make(providerID), modelID: resolved.id },
+              } satisfies SessionV1.User,
+              sessionID,
+              model: resolved,
+              agent,
+              system: ["You are a helpful assistant."],
+              messages: [{ role: "user", content: "Say hello" }],
+              tools: {},
+              assistantMessageID,
+            })
+            .pipe(Stream.runCollect),
+        )
+        const capture = yield* Effect.promise(() => request)
+        const text = Array.from(streamEvents)
+          .filter((event) => event.type === "text-delta")
+          .map((event) => (event.type === "text-delta" ? event.text : ""))
+          .join("")
+        expect(text).toBe("Hello")
+        expect(capture.body.return_progress).toBe(true)
+        expect(capture.body.splashTelemetry).toBeUndefined()
+        expect(state.queue).toHaveLength(0)
+
+        yield* pollWithTimeout(
+          Effect.sync(() =>
+            received.some((event) => event.phase === "prefill" && event.source === "provider") ? true : undefined,
+          ),
+          "Splash provider prefill telemetry was not published",
+        )
+        yield* pollWithTimeout(
+          Effect.sync(() =>
+            received.some((event) => event.phase === "decode" && event.done === true && event.source === "provider")
+              ? true
+              : undefined,
+          ),
+          "Splash provider terminal telemetry was not published",
+        )
+        expect(received).toContainEqual({
+          sessionID: expect.anything(),
+          assistantMessageID: expect.anything(),
+          phase: "prefill",
+          processed: 1,
+          total: 2,
+          source: "provider",
+        })
+        expect(received).toContainEqual({
+          sessionID: expect.anything(),
+          assistantMessageID: expect.anything(),
+          phase: "decode",
+          tokensPerSecond: 1500,
+          done: true,
+          source: "provider",
+        })
+      }),
+    {
+      config: () =>
+        openAICompatibleConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`, [
+          {
+            id: "splash-custom",
+            options: { splashTelemetry: true },
+            modelOptions: { return_progress: true },
+          },
+        ]),
+    },
+  )
+
+  itTelemetry.instance(
+    "keeps fallback eligible after prefill and arbitrates provider terminal rates at successful completion",
+    () =>
+      Effect.gen(function* () {
+        const runMeasured = (providerID: string, id: string, timings: unknown[]) =>
+          Effect.gen(function* () {
+            const received = yield* splashRecorder(id)
+            const controlled = waitSplashStreamingRequest("/chat/completions")
+            const input = yield* splashInput(providerID, id, `session-${id}`)
+            const fiber = yield* LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runCollect)).pipe(Effect.forkScoped)
+            yield* Effect.promise(() => controlled.request)
+            yield* Effect.promise(() =>
+              controlled.emit(
+                splashChunk(id, [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+                splashChunk(id, [{ index: 0, delta: { content: "A deliberately long first answer segment for a measurable decode sample." }, finish_reason: null }]),
+                splashChunk(id, [{ index: 0, delta: {}, finish_reason: null }], {
+                  prompt_progress: { total: 10, cache: 2, processed: 2, time_ms: 10 },
+                }),
+              ),
+            )
+            // One deliberate interval matches the existing LLM fallback fixture.
+            yield* Effect.sleep("300 millis")
+            yield* Effect.promise(() =>
+              controlled.emit(
+                splashChunk(id, [{ index: 0, delta: { content: " And the unchanged second segment." }, finish_reason: null }]),
+              ),
+            )
+            yield* pollWithTimeout(
+              Effect.sync(() =>
+                received.some((event) => event.source === "fallback" && event.tokensPerSecond !== undefined && event.done !== true)
+                  ? true
+                  : undefined,
+              ),
+              `fallback live sample missing for ${id}`,
+            )
+            yield* Effect.promise(() =>
+              controlled.emit(
+                ...timings.map((rate) =>
+                  splashChunk(
+                    id,
+                    [{ index: 0, delta: {}, finish_reason: "stop" }],
+                    { timings: rate === "missing" ? {} : { predicted_per_second: rate } },
+                  ),
+                ),
+              ),
+            )
+            yield* Effect.promise(() => controlled.finish())
+            const streamEvents = yield* Fiber.join(fiber)
+            const text = Array.from(streamEvents)
+              .filter((event) => event.type === "text-delta")
+              .map((event) => (event.type === "text-delta" ? event.text : ""))
+              .join("")
+            return { received, text }
+          })
+
+        const prefill = yield* runMeasured("splash-arbitration", "msg-splash-prefill-fallback", [])
+        expect(prefill.text).toBe(
+          "A deliberately long first answer segment for a measurable decode sample. And the unchanged second segment.",
+        )
+        expect(prefill.received.some((event) => event.phase === "prefill" && event.source === "provider")).toBe(true)
+        expect(prefill.received.some((event) => event.source === "fallback" && event.tokensPerSecond !== undefined && event.done !== true)).toBe(true)
+
+        const valid = yield* runMeasured("splash-arbitration", "msg-splash-provider-wins", [1500])
+        expect(valid.received).toContainEqual(
+          expect.objectContaining({ phase: "decode", tokensPerSecond: 1500, done: true, source: "provider" }),
+        )
+        expect(valid.received.filter((event) => event.done === true && event.source === "fallback")).toHaveLength(0)
+
+        for (const [id, timings] of [
+          ["msg-splash-zero-fallback", [0]],
+          ["msg-splash-ambiguous-fallback", [0, 1500]],
+        ] as Array<[string, unknown[]]>) {
+          const unavailable = yield* runMeasured("splash-arbitration", id, timings)
+          expect(unavailable.received.some((event) => event.done === true && event.source === "provider")).toBe(false)
+          expect(unavailable.received.some((event) => event.done === true && event.source === "fallback")).toBe(true)
+        }
+      }),
+    {
+      config: () =>
+        openAICompatibleConfig(splashModel, `${state.server!.url.origin}/v1`, [
+          { id: "splash-arbitration", options: { splashTelemetry: true }, modelOptions: { return_progress: true } },
+        ]),
+    },
+  )
+
+  itTelemetry.instance(
+    "does not fabricate a zero rate when neither source has a measurable sample",
+    () =>
+      Effect.gen(function* () {
+        const id = "msg-splash-no-measurement"
+        const received = yield* splashRecorder(id)
+        const request = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              splashChunk(id, [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+              splashChunk(id, [{ index: 0, delta: { content: "Short" }, finish_reason: null }]),
+              splashChunk(id, [{ index: 0, delta: {}, finish_reason: "stop" }]),
+            ],
+            true,
+          ),
+        )
+        const input = yield* splashInput("splash-short", id, "session-splash-short")
+        const events = yield* LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runCollect))
+        yield* Effect.promise(() => request)
+        expect(Array.from(events).some((event) => event.type === "text-delta")).toBe(true)
+        expect(received.some((event) => event.tokensPerSecond === 0)).toBe(false)
+      }),
+    {
+      config: () =>
+        openAICompatibleConfig(splashModel, `${state.server!.url.origin}/v1`, [
+          { id: "splash-short", options: { splashTelemetry: true } },
+        ]),
+    },
+  )
+
+  itTelemetry.instance(
+    "discards a Splash timing when a stream fails and gives a same-message retry fresh ownership",
+    () =>
+      Effect.gen(function* () {
+        const id = "msg-splash-retry-same-message"
+        const received = yield* splashRecorder(id)
+        const first = waitSplashStreamingRequest("/chat/completions")
+        const input = yield* splashInput("splash-retry", id, "session-splash-retry")
+        const llm = yield* LLM.Service
+        const failed = yield* llm.stream(input).pipe(Stream.runCollect, Effect.exit, Effect.forkScoped)
+        yield* Effect.promise(() => first.request)
+        yield* Effect.promise(() =>
+          first.emit(
+            splashChunk(id, [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+            splashChunk(id, [{ index: 0, delta: { content: "failed attempt" }, finish_reason: null }]),
+            // The network_error finish reason makes the real adapter fail this
+            // attempt after the raw Splash timing has been observed.
+            splashChunk(id, [{ index: 0, delta: {}, finish_reason: "network_error" }], {
+              timings: { predicted_per_second: 111 },
+            }),
+          ),
+        )
+        yield* Effect.promise(() => first.fail())
+        const failedExit = yield* Fiber.join(failed)
+        expect(Exit.isFailure(failedExit)).toBe(true)
+        expect(received.some((event) => event.source === "provider" && event.phase === "decode" && event.done === true)).toBe(false)
+
+        const second = waitRequest(
+          "/chat/completions",
+          createEventResponse(
+            [
+              splashChunk(id, [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+              splashChunk(id, [{ index: 0, delta: { content: "successful retry" }, finish_reason: null }]),
+              splashChunk(id, [{ index: 0, delta: {}, finish_reason: "stop" }], {
+                timings: { predicted_per_second: 222 },
+              }),
+            ],
+            true,
+          ),
+        )
+        const retried = yield* llm.stream(input).pipe(Stream.runCollect)
+        yield* Effect.promise(() => second)
+        expect(Array.from(retried).some((event) => event.type === "text-delta" && event.text === "successful retry")).toBe(true)
+        expect(received.filter((event) => event.source === "provider" && event.done === true)).toEqual([
+          expect.objectContaining({ phase: "decode", tokensPerSecond: 222, done: true, source: "provider" }),
+        ])
+      }),
+    {
+      config: () =>
+        openAICompatibleConfig(splashModel, `${state.server!.url.origin}/v1`, [
+          { id: "splash-retry", options: { splashTelemetry: true } },
+        ]),
+    },
+  )
+
+  itTelemetry.instance(
+    "discards cached Splash terminal telemetry and cancels the response when interrupted",
+    () =>
+      Effect.gen(function* () {
+        const id = "msg-splash-abort-after-telemetry"
+        const received = yield* splashRecorder(id)
+        const controlled = waitSplashStreamingRequest("/chat/completions")
+        const input = yield* splashInput("splash-abort", id, "session-splash-abort")
+        const llm = yield* LLM.Service
+        const fiber = yield* llm.stream(input).pipe(Stream.runDrain).pipe(Effect.forkScoped)
+        yield* Effect.promise(() => controlled.request)
+        yield* Effect.promise(() =>
+          controlled.emit(
+            splashChunk(id, [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+            splashChunk(id, [{ index: 0, delta: {}, finish_reason: null }], {
+              prompt_progress: { total: 10, cache: 1, processed: 4, time_ms: 4 },
+            }),
+            splashChunk(id, [{ index: 0, delta: {}, finish_reason: "stop" }], {
+              timings: { predicted_per_second: 333 },
+            }),
+          ),
+        )
+        yield* pollWithTimeout(
+          Effect.sync(() => received.some((event) => event.phase === "prefill" && event.processed === 4) ? true : undefined),
+          "Splash progress was not observable before abort",
+        )
+        yield* Fiber.interrupt(fiber)
+        yield* Effect.promise(() => Promise.race([controlled.requestAborted, timeout(3000)]))
+        yield* Effect.promise(() => Promise.race([controlled.responseCanceled, timeout(3000)]))
+        expect(received.some((event) => event.source === "provider" && event.phase === "decode" && event.done === true)).toBe(false)
+      }),
+    {
+      config: () =>
+        openAICompatibleConfig(splashModel, `${state.server!.url.origin}/v1`, [
+          { id: "splash-abort", options: { splashTelemetry: true } },
+        ]),
+    },
+  )
+
+  itTelemetry.instance(
+    "keeps concurrent Splash progress and terminal rates attributed to their own messages",
+    () =>
+      Effect.gen(function* () {
+        const aID = "msg-splash-concurrent-a"
+        const bID = "msg-splash-concurrent-b"
+        const aReceived = yield* splashRecorder(aID)
+        const bReceived = yield* splashRecorder(bID)
+        const a = waitSplashStreamingRequest("/chat/completions")
+        const aInput = yield* splashInput("splash-concurrent", aID, "session-splash-concurrent-a")
+        const bInput = yield* splashInput("splash-concurrent", bID, "session-splash-concurrent-b")
+        const llm = yield* LLM.Service
+        const aFiber = yield* llm.stream(aInput).pipe(Stream.runDrain).pipe(Effect.forkScoped)
+        yield* Effect.promise(() => a.request)
+
+        const b = waitSplashStreamingRequest("/chat/completions")
+        const bFiber = yield* llm.stream(bInput).pipe(Stream.runDrain).pipe(Effect.forkScoped)
+        yield* Effect.promise(() => b.request)
+
+        const aProgress = deferred<void>()
+        const bProgress = deferred<void>()
+        yield* Effect.promise(() =>
+          a.emit(
+            splashChunk(aID, [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+            splashChunk(aID, [{ index: 0, delta: {}, finish_reason: null }], {
+              prompt_progress: { total: 10, cache: 0, processed: 2, time_ms: 2 },
+            }),
+          ).then(() => aProgress.resolve()),
+        )
+        yield* Effect.promise(() =>
+          b.emit(
+            splashChunk(bID, [{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+            splashChunk(bID, [{ index: 0, delta: {}, finish_reason: null }], {
+              prompt_progress: { total: 20, cache: 1, processed: 7, time_ms: 7 },
+            }),
+          ).then(() => bProgress.resolve()),
+        )
+        yield* Effect.promise(() => Promise.all([aProgress.promise, bProgress.promise]))
+        yield* pollWithTimeout(
+          Effect.sync(() =>
+            aReceived.some((event) => event.phase === "prefill" && event.processed === 2) &&
+            bReceived.some((event) => event.phase === "prefill" && event.processed === 7)
+              ? true
+              : undefined,
+          ),
+          "both Splash progress events were not published",
+        )
+
+        yield* Effect.promise(() =>
+          a.emit(splashChunk(aID, [{ index: 0, delta: {}, finish_reason: "stop" }], { timings: { predicted_per_second: 111 } })),
+        )
+        yield* Effect.promise(() =>
+          b.emit(splashChunk(bID, [{ index: 0, delta: {}, finish_reason: "stop" }], { timings: { predicted_per_second: 222 } })),
+        )
+        yield* Effect.promise(() => Promise.all([a.finish(), b.finish()]))
+        yield* Fiber.join(aFiber)
+        yield* Fiber.join(bFiber)
+
+        expect(aReceived).toContainEqual(expect.objectContaining({ phase: "prefill", processed: 2, total: 10, source: "provider" }))
+        expect(aReceived).toContainEqual(expect.objectContaining({ phase: "decode", tokensPerSecond: 111, done: true, source: "provider" }))
+        expect(bReceived).toContainEqual(expect.objectContaining({ phase: "prefill", processed: 7, total: 20, source: "provider" }))
+        expect(bReceived).toContainEqual(expect.objectContaining({ phase: "decode", tokensPerSecond: 222, done: true, source: "provider" }))
+        expect(aReceived.some((event) => event.processed === 7 || event.tokensPerSecond === 222)).toBe(false)
+        expect(bReceived.some((event) => event.processed === 2 || event.tokensPerSecond === 111)).toBe(false)
+      }),
+    {
+      config: () =>
+        openAICompatibleConfig(splashModel, `${state.server!.url.origin}/v1`, [
+          { id: "splash-concurrent", options: { splashTelemetry: true }, modelOptions: { return_progress: true } },
+        ]),
+    },
+  )
+
+  test("preserves Splash 1.1.0 telemetry chunks as raw fullStream parts", async () => {
+    const progress = {
+      total: 2,
+      cache: 1,
+      processed: 1,
+      time_ms: 0.0,
+    }
+    const timings = {
+      prompt_n: 2,
+      cache_n: 1,
+      prompt_ms: 1.0,
+      prompt_per_second: 1000.0,
+      predicted_n: 5,
+      predicted_ms: 2.0,
+      predicted_per_second: 1500.0,
+    }
+    const chunk = (choices: unknown[], extra: Record<string, unknown> = {}) => ({
+      id: "chatcmpl-splash",
+      object: "chat.completion.chunk",
+      created: 123,
+      model: "test-model",
+      choices,
+      ...extra,
+    })
+    const progressChunk = chunk([{ index: 0, delta: {}, finish_reason: null }], { prompt_progress: progress })
+    const timingChunk = chunk([{ index: 0, delta: {}, finish_reason: "stop" }], { timings })
+    const request = waitRequest(
+      "/chat/completions",
+      createEventResponse(
+        [
+          chunk([{ index: 0, delta: { role: "assistant" }, finish_reason: null }]),
+          chunk([{ index: 0, delta: { content: "Hello" }, finish_reason: null }]),
+          progressChunk,
+          timingChunk,
+          chunk([], {
+            usage: { prompt_tokens: 2, completion_tokens: 5, total_tokens: 7 },
+            metrics: { decode: { tokens: 3 }, request_latency: { first_token_to_done_ms: 2.0 } },
+          }),
+        ],
+        true,
+      ),
+    )
+
+    const provider = createOpenAICompatible({
+      name: "splash-test",
+      apiKey: "test-key",
+      baseURL: `${state.server!.url.origin}/v1`,
+    })
+    const model = provider("test-model")
+    const result = streamText({ model, prompt: "Say hello", includeRawChunks: true })
+    const parts = await Array.fromAsync(result.fullStream)
+    const capture = await request
+
+    expect(capture.url.pathname.endsWith("/chat/completions")).toBe(true)
+    expect(capture.body.model).toBe("test-model")
+    expect(capture.body.stream).toBe(true)
+    expect(parts.filter((part) => part.type === "text-delta").map((part) => part.text).join("")).toBe("Hello")
+    expect(
+      parts.some(
+        (part) =>
+          part.type === "raw" &&
+          typeof part.rawValue === "object" &&
+          part.rawValue !== null &&
+          "prompt_progress" in part.rawValue &&
+          JSON.stringify(part.rawValue.prompt_progress) === JSON.stringify(progress),
+      ),
+    ).toBe(true)
+    expect(
+      parts.some(
+        (part) =>
+          part.type === "raw" &&
+          typeof part.rawValue === "object" &&
+          part.rawValue !== null &&
+          "timings" in part.rawValue &&
+          typeof part.rawValue.timings === "object" &&
+          part.rawValue.timings !== null &&
+          "predicted_per_second" in part.rawValue.timings &&
+          part.rawValue.timings.predicted_per_second === 1500,
+      ),
+    ).toBe(true)
+  })
+})
 
 describe("session.llm.stream", () => {
   const vivgridFixture = { providerID: "vivgrid", modelID: "gemini-3.1-pro-preview" }
@@ -1553,12 +2412,21 @@ describe("session.llm.stream", () => {
         expect(capture.headers.get("Authorization")).toBe("Bearer test-openai-key")
         expect(capture.body.model).toBe(model.id)
         expect(capture.body.stream).toBe(true)
+        expect(capture.body.splashTelemetry).toBeUndefined()
         expect((capture.body.reasoning as { effort?: string } | undefined)?.effort).toBe("high")
         expect(capture.body.include).toEqual(["reasoning.encrypted_content"])
         expect(JSON.stringify(capture.body.input)).toContain("You are a helpful assistant.")
         expect(capture.body.input).toContainEqual({ role: "user", content: [{ type: "input_text", text: "Hello" }] })
       }),
-    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
+    {
+      config: () =>
+        openAIConfig(
+          loadFixture("openai", "gpt-5.2").model,
+          `${state.server!.url.origin}/v1`,
+          { splashTelemetry: true },
+          { splashTelemetry: true },
+        ),
+    },
   )
 
   it.instance(
@@ -2262,5 +3130,426 @@ describe("session.llm.stream", () => {
         },
       }),
     },
+  )
+})
+
+describe("session.llm.telemetry lifecycle", () => {
+  function startLifecycleMlx() {
+    const encoder = new TextEncoder()
+    const connections: ReadableStreamDefaultController<Uint8Array>[] = []
+    let hits = 0
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        if (new URL(req.url).pathname !== "/events") return new Response("not found", { status: 404 })
+        hits++
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            connections.push(controller)
+            controller.enqueue(encoder.encode("event: stats\ndata: {}\n\n"))
+          },
+          cancel() {},
+        })
+        return new Response(stream, { headers: { "content-type": "text/event-stream" } })
+      },
+    })
+    return {
+      baseURL: `http://localhost:${server.port}/v1`,
+      hits: () => hits,
+      push(frame: string) {
+        for (const connection of connections) {
+          try {
+            connection.enqueue(encoder.encode(frame))
+          } catch {}
+        }
+      },
+      stop: () => server.stop(),
+    }
+  }
+
+  // Provider stub whose setup stage can block or die, simulating a retry that
+  // never reaches stream construction. The stream modes exercise teardown
+  // through LLM.stream rather than calling either telemetry leg directly.
+  const setup = {
+    mode: "block" as "block" | "die" | "stream-fail" | "stream-success" | "stream-block",
+    started: false,
+    returned: false,
+  }
+  const lifecycleLanguage: LanguageModelV3 = {
+    specificationVersion: "v3",
+    provider: "lifecycle",
+    modelId: "lifecycle-model",
+    supportedUrls: {},
+    doGenerate: async () => {
+      throw new Error("lifecycle provider does not generate")
+    },
+    doStream: async ({ abortSignal }) => {
+      let index = 0
+      const wait = (duration: number) => new Promise<void>((resolve) => setTimeout(resolve, duration))
+      const enqueue = (
+        controller: ReadableStreamDefaultController<LanguageModelV3StreamPart>,
+        part: LanguageModelV3StreamPart,
+      ) => {
+        try {
+          controller.enqueue(part)
+        } catch {}
+      }
+      const stream = new ReadableStream<LanguageModelV3StreamPart>({
+        async pull(controller) {
+          if (index++ === 0) {
+            enqueue(controller, { type: "stream-start", warnings: [] })
+            return
+          }
+          if (index === 2) {
+            enqueue(controller, { type: "text-start", id: "lifecycle-text" })
+            return
+          }
+          if (index === 3) {
+            await wait(300)
+            enqueue(controller, {
+              type: "text-delta",
+              id: "lifecycle-text",
+              delta: "a meaningful live generation for telemetry",
+            })
+            return
+          }
+          if (setup.mode === "stream-block") {
+            await new Promise<void>((resolve) => {
+              abortSignal?.addEventListener("abort", () => resolve(), { once: true })
+            })
+            return
+          }
+          if (setup.mode === "stream-fail") {
+            await wait(20)
+            try {
+              controller.error(new Error("lifecycle stream boom"))
+            } catch {}
+            return
+          }
+          enqueue(controller, { type: "text-end", id: "lifecycle-text" })
+          enqueue(controller, {
+            type: "finish",
+            finishReason: { unified: "stop", raw: "stop" },
+            usage: {
+              inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+              outputTokens: { total: 8, text: 8, reasoning: 0 },
+            },
+          })
+          controller.close()
+        },
+      })
+      return { stream }
+    },
+  }
+  const providerStub = ProviderTest.fake({
+    getLanguage: () =>
+      Effect.sync(() => {
+        setup.started = true
+      }).pipe(
+        Effect.andThen(
+          setup.mode === "block"
+            ? Effect.never
+            : setup.mode === "die"
+              ? Effect.die(new Error("provider setup boom"))
+              : Effect.succeed(lifecycleLanguage),
+        ),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            setup.returned = true
+          }),
+        ),
+      ),
+  })
+  const itLifecycle = testEffect(
+    AppNodeBuilder.build(LayerNode.group([LLM.node, EventV2Bridge.node]), [[Provider.node, providerStub.layer]]),
+  )
+  const mlxProviderStub = ProviderTest.fake({ getLanguage: () => Effect.succeed(lifecycleLanguage) })
+  const itMlxLifecycle = testEffect(
+    AppNodeBuilder.build(LayerNode.group([LLM.node, EventV2Bridge.node]), [
+      [Provider.node, mlxProviderStub.layer],
+      [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: true })],
+    ]),
+  )
+
+  type TelemetryEvent = {
+    assistantMessageID: string
+    phase: string
+    done?: boolean
+    tokensPerSecond?: number
+    source?: string
+  }
+
+  function lifecycleInput(
+    assistantMessageID: string,
+    model = providerStub.model,
+    messages: ModelMessage[] = [{ role: "user", content: "Hello" }],
+  ): LLM.StreamInput {
+    const sessionID = SessionID.make("session-telemetry-lifecycle")
+    const agent = {
+      name: "test",
+      mode: "primary",
+      options: {},
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    } satisfies Agent.Info
+    return {
+      user: {
+        id: MessageID.make(`msg_user-${assistantMessageID}`),
+        sessionID,
+        role: "user",
+        time: { created: Date.now() },
+        agent: agent.name,
+        model: { providerID: model.providerID, modelID: model.id },
+      } satisfies SessionV1.User,
+      sessionID,
+      model,
+      agent,
+      system: ["You are a helpful assistant."],
+      messages,
+      tools: {},
+      assistantMessageID,
+    }
+  }
+
+  function recorder(assistantMessageID: string) {
+    return Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const received: TelemetryEvent[] = []
+      const unsub = yield* events.listen((event) => {
+        if (event.type !== SessionV1.Event.Telemetry.type) return Effect.void
+        const data = event.data as unknown as TelemetryEvent & { assistantMessageID?: string }
+        if (String(data.assistantMessageID) !== assistantMessageID) return Effect.void
+        received.push(data)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+      // Previous attempt's frozen terminal for the SAME AssistantMessage.
+      yield* events.publish(SessionV1.Event.Telemetry, {
+        sessionID: SessionID.make("session-telemetry-lifecycle"),
+        assistantMessageID: SessionV1.MessageID.make(assistantMessageID),
+        phase: "decode",
+        tokensPerSecond: 12.5,
+        done: true,
+        source: "fallback",
+      })
+      return received
+    })
+  }
+
+  const terminals = (received: TelemetryEvent[]) => received.filter((item) => item.done === true)
+
+  itLifecycle.instance("retry clears stale terminal telemetry while provider setup still blocks", () =>
+    Effect.gen(function* () {
+      setup.mode = "block"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_block"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const fiber = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain).pipe(Effect.forkScoped)
+
+      yield* pollWithTimeout(
+        Effect.sync(() => (received.some((item) => item.done === false) ? true : undefined)),
+        "stale terminal telemetry was never cleared",
+      )
+      yield* pollWithTimeout(
+        Effect.sync(() => (setup.started ? true : undefined)),
+        "provider setup never started",
+      )
+      // The clear landed while provider setup was still blocked: getLanguage
+      // never returned, so no stream was ever constructed for this attempt.
+      expect(setup.returned).toBe(false)
+      expect(terminals(received).length).toBe(1)
+      expect(received.at(-1)!.done).toBe(false)
+      expect(received.at(-1)!.tokensPerSecond).toBeUndefined()
+      yield* Fiber.interrupt(fiber)
+    }),
+  )
+
+  itLifecycle.instance("provider setup failure keeps the stale terminal cleared without a fake new rate", () =>
+    Effect.gen(function* () {
+      setup.mode = "die"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_fail"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const exit = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain, Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(setup.started).toBe(true)
+
+      yield* pollWithTimeout(
+        Effect.sync(() => (received.some((item) => item.done === false) ? true : undefined)),
+        "stale terminal telemetry was never cleared",
+      )
+      yield* Effect.sleep("100 millis")
+      // Only the seeded stale terminal exists; the failed attempt produced
+      // no bogus terminal rate and did not resurrect anything.
+      expect(terminals(received).length).toBe(1)
+      expect(terminals(received)[0].tokensPerSecond).toBe(12.5)
+      expect(received.at(-1)!.done).toBe(false)
+    }),
+  )
+
+  itLifecycle.instance("cancelling a blocked retry leaves no stale or resurrected telemetry", () =>
+    Effect.gen(function* () {
+      setup.mode = "block"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_cancel"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const fiber = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain).pipe(Effect.forkScoped)
+      yield* pollWithTimeout(
+        Effect.sync(() => (received.some((item) => item.done === false) ? true : undefined)),
+        "stale terminal telemetry was never cleared",
+      )
+
+      yield* Fiber.interrupt(fiber)
+      yield* Effect.sleep("100 millis")
+      // Teardown after interruption must not produce any new terminal: the
+      // reset stays the final state for this AssistantMessage.
+      expect(terminals(received).length).toBe(1)
+      expect(received.at(-1)!.done).toBe(false)
+      expect(received.some((item) => item.source === "provider")).toBe(false)
+    }),
+  )
+
+  itLifecycle.instance("discards fallback telemetry when generic provider setup fails before stream construction", () =>
+    Effect.gen(function* () {
+      setup.mode = "die"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_setup_discard"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const exit = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain, Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(setup.returned).toBe(false)
+      yield* Effect.sleep("100 millis")
+      expect(terminals(received).length).toBe(1)
+      expect(received.at(-1)!.done).toBe(false)
+    }),
+  )
+
+  itMlxLifecycle.instance(
+    "discards an adopted provider source when later native setup fails",
+    () =>
+      Effect.gen(function* () {
+        const mlx = startLifecycleMlx()
+        Object.assign(mlxProviderStub.info.options, {
+          apiKey: "test-key",
+          baseURL: mlx.baseURL,
+          mlxTelemetry: true,
+        })
+        const model = mlxProviderStub.model
+
+        try {
+          yield* Effect.gen(function* () {
+            const events = yield* EventV2Bridge.Service
+            const output: TelemetryEvent[] = []
+            const unsub = yield* events.listen((event) => {
+              if (event.type !== SessionV1.Event.Telemetry.type) return Effect.void
+              const data = event.data as unknown as TelemetryEvent
+              if (String(data.assistantMessageID) !== "msg_telemetry_mlx_setup_discard") return Effect.void
+              output.push(data)
+              return Effect.void
+            })
+            yield* Effect.addFinalizer(() => unsub)
+            yield* events.publish(SessionV1.Event.Telemetry, {
+              sessionID: SessionID.make("session-telemetry-lifecycle"),
+              assistantMessageID: SessionV1.MessageID.make("msg_telemetry_mlx_setup_discard"),
+              phase: "decode",
+              tokensPerSecond: 12.5,
+              done: true,
+              source: "fallback",
+            })
+            const llm = yield* LLM.Service
+            const lateSetupFailureContent = {
+              map: () => {
+                throw new Error("native setup boom")
+              },
+            } as unknown as ModelMessage["content"]
+            const exit = yield* llm
+              .stream(
+                lifecycleInput("msg_telemetry_mlx_setup_discard", model, [
+                  { role: "user", content: lateSetupFailureContent } as ModelMessage,
+                ]),
+              )
+              .pipe(Stream.runDrain, Effect.exit)
+            expect(Exit.isFailure(exit)).toBe(true)
+            expect(mlx.hits()).toBe(1)
+            mlx.push('data: {"req":"late","i":1,"committed":10,"ms":100}\n\n')
+            yield* Effect.sleep("100 millis")
+            expect(output.filter((item) => item.done === true)).toHaveLength(1)
+            expect(output.filter((item) => item.source === "provider")).toHaveLength(0)
+          })
+        } finally {
+          MLXTelemetry.stopAll()
+          mlx.stop()
+        }
+      }),
+  )
+
+  itLifecycle.instance("discards a live fallback rate when the stream fails during consumption", () =>
+    Effect.gen(function* () {
+      setup.mode = "stream-fail"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_stream_fail"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const exit = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain, Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      yield* pollWithTimeout(
+        Effect.sync(() =>
+          received.some(
+            (item) => item.source === "fallback" && item.tokensPerSecond !== undefined && item.done !== true,
+          )
+            ? true
+            : undefined,
+        ),
+        "live fallback telemetry was never published",
+      )
+      expect(terminals(received).length).toBe(1)
+      expect(received.some((item) => item.done === false)).toBe(true)
+    }),
+  )
+
+  itLifecycle.instance("finalizes fallback telemetry exactly once on normal stream completion", () =>
+    Effect.gen(function* () {
+      setup.mode = "stream-success"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_stream_success"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const exit = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain, Effect.exit)
+      expect(Exit.isSuccess(exit)).toBe(true)
+      yield* pollWithTimeout(
+        Effect.sync(() => (received.some((item) => item.done === true) ? true : undefined)),
+        "normal stream never finalized fallback telemetry",
+      )
+      expect(terminals(received).length).toBe(2)
+      expect(terminals(received).at(-1)!.done).toBe(true)
+    }),
+  )
+
+  itLifecycle.instance("discards fallback telemetry on interruption while consuming the stream", () =>
+    Effect.gen(function* () {
+      setup.mode = "stream-block"
+      setup.started = false
+      const assistantMessageID = "msg_telemetry_stream_cancel"
+      const received = yield* recorder(assistantMessageID)
+      const llm = yield* LLM.Service
+      const fiber = yield* llm.stream(lifecycleInput(assistantMessageID)).pipe(Stream.runDrain).pipe(Effect.forkScoped)
+      yield* pollWithTimeout(
+        Effect.sync(() =>
+          received.some(
+            (item) => item.source === "fallback" && item.tokensPerSecond !== undefined && item.done !== true,
+          )
+            ? true
+            : undefined,
+        ),
+        "live fallback telemetry was never published before interruption",
+      )
+      yield* Fiber.interrupt(fiber)
+      yield* Effect.sleep("100 millis")
+      expect(terminals(received).length).toBe(1)
+      expect(received.some((item) => item.done === false)).toBe(true)
+    }),
   )
 })

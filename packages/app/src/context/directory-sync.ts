@@ -19,6 +19,7 @@ const sessionFields = new Set([
   "session_message",
   "part",
   "part_text_accum_delta",
+  "generation_telemetry",
 ])
 
 export const createDirSyncContext = (

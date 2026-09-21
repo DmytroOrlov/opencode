@@ -36,6 +36,12 @@ import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type UiI18n, useI18n } from "@opencode-ai/ui/context/i18n"
 import { BasicTool, GenericTool } from "./basic-tool"
+import { groupParts, isContextGroupTool, sameGroups, type PartGroup } from "./part-group"
+import {
+  completedGenerationRates,
+  selectGenerationRateTargets,
+  type GenerationRateEntry,
+} from "./generation-telemetry"
 import { Accordion } from "@opencode-ai/ui/accordion"
 import { StickyAccordionHeader } from "@opencode-ai/ui/sticky-accordion-header"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
@@ -203,6 +209,7 @@ export interface MessagePartProps {
   showAssistantCopyPartID?: string | null
   turnDurationMs?: number
   useV2Actions?: boolean
+  throughput?: string
 }
 
 function MessageActionButton(
@@ -604,7 +611,6 @@ function taskSession(
     .sort((a, b) => (b.time.created ?? 0) - (a.time.created ?? 0))[0]?.id
 }
 
-const CONTEXT_GROUP_TOOLS = new Set(["read", "glob", "grep", "list"])
 const HIDDEN_TOOLS = new Set(["todowrite"])
 
 function list<T>(value: T[] | undefined | null, fallback: T[]) {
@@ -619,90 +625,7 @@ function same<T>(a: readonly T[] | undefined, b: readonly T[] | undefined) {
   return a.every((x, i) => x === b[i])
 }
 
-export type PartRef = {
-  messageID: string
-  partID: string
-}
-
-export type PartGroup =
-  | {
-      key: string
-      type: "part"
-      ref: PartRef
-    }
-  | {
-      key: string
-      type: "context"
-      refs: PartRef[]
-    }
-
-function sameRef(a: PartRef, b: PartRef) {
-  return a.messageID === b.messageID && a.partID === b.partID
-}
-
-function sameGroup(a: PartGroup, b: PartGroup) {
-  if (a === b) return true
-  if (a.key !== b.key) return false
-  if (a.type !== b.type) return false
-  if (a.type === "part") {
-    if (b.type !== "part") return false
-    return sameRef(a.ref, b.ref)
-  }
-  if (b.type !== "context") return false
-  if (a.refs.length !== b.refs.length) return false
-  return a.refs.every((ref, i) => sameRef(ref, b.refs[i]!))
-}
-
-export function sameGroups(a: readonly PartGroup[] | undefined, b: readonly PartGroup[] | undefined) {
-  if (a === b) return true
-  if (!a || !b) return false
-  if (a.length !== b.length) return false
-  return a.every((item, i) => sameGroup(item, b[i]!))
-}
-
-export function groupParts(parts: { messageID: string; part: PartType }[]) {
-  const result: PartGroup[] = []
-  let start = -1
-
-  const flush = (end: number) => {
-    if (start < 0) return
-    const first = parts[start]
-    const last = parts[end]
-    if (!first || !last) {
-      start = -1
-      return
-    }
-    result.push({
-      key: `context:${first.part.id}`,
-      type: "context",
-      refs: parts.slice(start, end + 1).map((item) => ({
-        messageID: item.messageID,
-        partID: item.part.id,
-      })),
-    })
-    start = -1
-  }
-
-  parts.forEach((item, index) => {
-    if (isContextGroupTool(item.part)) {
-      if (start < 0) start = index
-      return
-    }
-
-    flush(index - 1)
-    result.push({
-      key: `part:${item.messageID}:${item.part.id}`,
-      type: "part",
-      ref: {
-        messageID: item.messageID,
-        partID: item.part.id,
-      },
-    })
-  })
-
-  flush(parts.length - 1)
-  return result
-}
+export { groupParts, sameGroups, type PartGroup, type PartRef } from "./part-group"
 
 function index<T extends { id: string }>(items: readonly T[]) {
   return new Map(items.map((item) => [item.id, item] as const))
@@ -732,6 +655,7 @@ export function AssistantParts(props: {
   editToolDefaultOpen?: boolean
 }) {
   const data = useData()
+  const i18n = useI18n()
   const emptyParts: PartType[] = []
   const emptyTools: ToolPart[] = []
   const msgs = createMemo(() => index(props.messages))
@@ -756,6 +680,22 @@ export function AssistantParts(props: {
       ),
     [] as PartGroup[],
     { equals: sameGroups },
+  )
+
+  const rates = createMemo(() =>
+    selectGenerationRateTargets(
+      grouped().flatMap((group): GenerationRateEntry[] => {
+        if (group.type === "context") {
+          const messageID = group.refs[0]?.messageID
+          if (!messageID) return []
+          return [{ key: group.key, messageID, kind: "tool" }]
+        }
+        const item = part().get(group.ref.messageID)?.get(group.ref.partID)
+        if (item?.type !== "tool" && item?.type !== "text") return []
+        return [{ key: group.key, messageID: group.ref.messageID, kind: item.type }]
+      }),
+      completedGenerationRates(props.messages, data.store.generation_telemetry, i18n.locale()),
+    ),
   )
 
   const last = createMemo(() => grouped().at(-1)?.key)
@@ -784,7 +724,11 @@ export function AssistantParts(props: {
 
                 return (
                   <Show when={parts().length > 0}>
-                    <ContextToolGroup parts={parts()} busy={busy()} />
+                    <ContextToolGroup
+                      parts={parts()}
+                      busy={busy()}
+                      throughput={rates().get(entryAccessor().key)}
+                    />
                   </Show>
                 )
               })()}
@@ -812,6 +756,7 @@ export function AssistantParts(props: {
                         turnDurationMs={props.turnDurationMs}
                         useV2Actions={props.useV2Actions}
                         defaultOpen={partDefaultOpen(item()!, props.shellToolDefaultOpen, props.editToolDefaultOpen)}
+                        throughput={rates().get(entryAccessor().key)}
                       />
                     </Show>
                   </Show>
@@ -823,10 +768,6 @@ export function AssistantParts(props: {
       }}
     </Index>
   )
-}
-
-function isContextGroupTool(part: PartType): part is ToolPart {
-  return part.type === "tool" && CONTEXT_GROUP_TOOLS.has(part.tool)
 }
 
 function contextToolDetail(part: ToolPart): string | undefined {
@@ -1043,6 +984,7 @@ export function AssistantMessageDisplay(props: {
 export function ContextToolGroup(props: {
   parts: ToolPart[]
   busy?: boolean
+  throughput?: string
   open?: boolean
   onOpenChange?: (open: boolean) => void
   onSizeChange?: () => void
@@ -1105,6 +1047,12 @@ export function ContextToolGroup(props: {
                 fallback=""
               />
             </span>
+            <Show when={props.throughput}>
+              <span
+                data-slot="context-tool-group-throughput"
+                class="shrink-0 text-14-regular text-text-weak"
+              >{`\u00B7 ${props.throughput}`}</span>
+            </Show>
           </span>
           <Collapsible.Arrow />
         </div>
@@ -1448,6 +1396,7 @@ export function Part(props: MessagePartProps) {
         showAssistantCopyPartID={props.showAssistantCopyPartID}
         turnDurationMs={props.turnDurationMs}
         useV2Actions={props.useV2Actions}
+        throughput={props.throughput}
       />
     </Show>
   )
@@ -1469,6 +1418,7 @@ export interface ToolProps {
   onContentRendered?: () => void
   forceOpen?: boolean
   locked?: boolean
+  throughput?: string
 }
 
 export type ToolComponent = Component<ToolProps>
@@ -1576,34 +1526,44 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
               const cleaned = error().replace("Error: ", "")
               if (part().tool === "question" && cleaned.includes("dismissed this question")) {
                 return (
-                  <div style="width: 100%; display: flex; justify-content: flex-end;">
+                  <div style="width: 100%; display: flex; justify-content: flex-end; gap: 8px;">
                     <span class="text-13-regular text-text-weak cursor-default">
                       {i18n.t("ui.messagePart.questions.dismissed")}
                     </span>
+                    <Show when={props.throughput}>
+                      <span class="shrink-0 text-13-regular text-text-weak cursor-default">{`\u00B7 ${props.throughput}`}</span>
+                    </Show>
                   </div>
                 )
               }
               return (
-                <ToolErrorCard
-                  tool={part().tool}
-                  error={error()}
-                  title={
-                    part().tool === "websearch" ? webSearchProviderLabel(partMetadata().provider, i18n) : undefined
-                  }
-                  defaultOpen={props.defaultOpen}
-                  open={controlledOpen()}
-                  onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
-                  subtitle={taskSubtitle()}
-                  href={taskHref()}
-                  onSubtitleClick={(event) => {
-                    if (!data.navigateToSession) return
-                    if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
-                    const id = taskId()
-                    if (!id) return
-                    event.preventDefault()
-                    data.navigateToSession(id)
-                  }}
-                />
+                <>
+                  <ToolErrorCard
+                    tool={part().tool}
+                    error={error()}
+                    title={
+                      part().tool === "websearch" ? webSearchProviderLabel(partMetadata().provider, i18n) : undefined
+                    }
+                    defaultOpen={props.defaultOpen}
+                    open={controlledOpen()}
+                    onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
+                    subtitle={taskSubtitle()}
+                    href={taskHref()}
+                    onSubtitleClick={(event) => {
+                      if (!data.navigateToSession) return
+                      if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+                      const id = taskId()
+                      if (!id) return
+                      event.preventDefault()
+                      data.navigateToSession(id)
+                    }}
+                  />
+                  <Show when={props.throughput}>
+                    <div style="width: 100%; display: flex; justify-content: flex-end;">
+                      <span class="shrink-0 text-13-regular text-text-weak cursor-default">{`\u00B7 ${props.throughput}`}</span>
+                    </div>
+                  </Show>
+                </>
               )
             }}
           </Match>
@@ -1624,6 +1584,7 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
               deferContent={props.deferToolContent}
               virtualizeDiff={props.virtualizeDiff}
               onContentRendered={props.onContentRendered}
+              throughput={props.throughput}
             />
           </Match>
         </Switch>
@@ -1696,6 +1657,7 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
       agent ? agent[0]?.toUpperCase() + agent.slice(1) : "",
       model(),
       duration(),
+      props.throughput ?? "",
       interrupted() ? i18n.t("ui.message.interrupted") : "",
     ]
     return items.filter((x) => !!x).join(" \u00B7 ")
@@ -1749,6 +1711,13 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
                 {meta()}
               </span>
             </Show>
+          </div>
+        </Show>
+        <Show when={!showCopy() && !!props.throughput}>
+          <div data-slot="text-part-copy-wrapper">
+            <span data-slot="text-part-meta" class="text-12-regular text-text-weak cursor-default">
+              {props.throughput}
+            </span>
           </div>
         </Show>
       </div>
@@ -2072,6 +2041,7 @@ ToolRegistry.register({
         status={props.status}
         trigger={trigger()}
         hideDetails
+        throughput={props.throughput}
         triggerAsLink
         triggerHref={href()}
         clickable={clickable()}
@@ -2637,6 +2607,6 @@ ToolRegistry.register({
       </div>
     )
 
-    return <BasicTool icon="brain" status={props.status} trigger={trigger()} hideDetails />
+    return <BasicTool icon="brain" status={props.status} trigger={trigger()} hideDetails throughput={props.throughput} />
   },
 })

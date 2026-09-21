@@ -14,6 +14,7 @@ import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import type { State, VcsCache } from "./types"
 import { trimSessions } from "./session-trim"
 import { dropSessionCaches } from "./session-cache"
+import { projectGenerationTelemetry } from "./telemetry"
 import { diffs as list, message as clean } from "@/utils/diffs"
 import { messageKey } from "@/utils/session-message"
 
@@ -27,6 +28,7 @@ const SESSION_CONTENT_EVENTS = new Set([
   "message.part.updated",
   "message.part.removed",
   "message.part.delta",
+  "session.telemetry",
   "permission.asked",
   "permission.replied",
   "question.asked",
@@ -267,6 +269,19 @@ export function applyDirectoryEvent(input: {
     case "session.status": {
       const props = event.properties as { sessionID: string; status: SessionStatus }
       input.setStore("session_status", props.sessionID, reconcile(props.status))
+      break
+    }
+    case "session.telemetry": {
+      const projected = projectGenerationTelemetry(event.properties)
+      if (!projected) break
+      input.setStore(
+        "generation_telemetry",
+        projected.sessionID,
+        (current) => ({
+          ...current,
+          [projected.assistantMessageID]: projected.snapshot,
+        }),
+      )
       break
     }
     case "message.updated": {
