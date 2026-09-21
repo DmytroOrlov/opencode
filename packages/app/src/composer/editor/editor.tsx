@@ -349,6 +349,7 @@ export function ComposerEditor(props: ComposerEditorProps) {
                     title={i18n.t("ui.promptInput.chooseAgent")}
                     keybind={["Mod", "."]}
                     control={control}
+                    class="!px-0"
                   />
                 )}
               </Show>
@@ -362,7 +363,7 @@ export function ComposerEditor(props: ComposerEditorProps) {
                         title={i18n.t("ui.promptInput.chooseVariant")}
                         keybind={["Shift", "Mod", "D"]}
                         control={control}
-                        class={control.current() === "default" ? "composer-variant-default" : undefined}
+                        class={control.current() === "default" ? "!px-0 composer-variant-default" : "!px-0"}
                       />
                     </Show>
                   )}

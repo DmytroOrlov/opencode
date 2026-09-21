@@ -133,6 +133,21 @@ story("does not mask or pad controls when they fit", async ({ mount }) => {
   await expect(controls).toHaveCSS("padding-inline-end", "0px")
 })
 
+story("keeps model, agent, and variant selector triggers compact", async ({ mount }) => {
+  const component = await mount("opencode-composer-flow--model-and-variant")
+  const controls = component.locator('[data-slot="composer-controls"]')
+  const selectorTriggers = [
+    controls.locator('[data-action="composer-model"]'),
+    controls.getByRole("button", { name: "Choose agent" }),
+    controls.getByRole("button", { name: "Choose model variant" }),
+  ]
+
+  for (const trigger of selectorTriggers) {
+    await expect(trigger).toHaveCSS("padding-left", "0px")
+    await expect(trigger).toHaveCSS("padding-right", "0px")
+  }
+})
+
 story("grows suggestions while preserving visible timeline context", async ({ mount }) => {
   const component = await mount("opencode-composer-flow--constrained-command-suggestions")
   const boundary = component.locator('[data-slot="composer-suggestion-boundary-story"]')
