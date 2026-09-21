@@ -1084,6 +1084,8 @@ export type ProviderSettings = {
   timeout?: number | false
   headerTimeout?: number | false
   chunkTimeout?: number | false
+  mlxTelemetry?: boolean
+  splashTelemetry?: boolean
   compaction?: ProviderCompaction
   cache?: ProviderCache
   transport?: ProviderTransport
@@ -1099,6 +1101,8 @@ export type ConfigProviderSettings = {
   timeout?: number | false
   headerTimeout?: number | false
   chunkTimeout?: number | false
+  mlxTelemetry?: boolean
+  splashTelemetry?: boolean
   compaction?: ProviderCompaction
   cache?: ProviderCache
   transport?: ProviderTransport
@@ -1779,6 +1783,36 @@ export type SessionUsageUpdated = {
   type: "session.usage.updated"
   location?: LocationRef
   data: { sessionID: SessionID; cost: MoneyUSD; tokens: TokenUsageInfo }
+}
+
+export type SessionTelemetry = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.telemetry"
+  location?: LocationRef
+  data: {
+    sessionID: SessionID
+    assistantMessageID: SessionMessageID
+    attemptID: EventID
+    attemptSequence: number
+    phase: "start" | "prefill" | "decode" | "complete" | "discard"
+    measurements: Array<
+      | {
+          metric: "prefill-progress"
+          processed: number
+          total: number
+          source: "provider-native" | "estimated"
+          approximate: boolean
+        }
+      | {
+          metric: "decode-rate"
+          tokensPerSecond: number
+          source: "provider-native" | "estimated"
+          approximate: boolean
+        }
+    >
+  }
 }
 
 export type SessionTextDelta = {
@@ -2950,6 +2984,7 @@ export type V2Event =
   | SessionArchived
   | SessionUnarchived
   | SessionUsageUpdated
+  | SessionTelemetry
   | SessionDeleted
   | SessionForked
   | SessionInboxDelivered
@@ -4485,6 +4520,7 @@ export type EventSubscribeInput = {
         | "session.archived"
         | "session.unarchived"
         | "session.usage.updated"
+        | "session.telemetry"
         | "session.deleted"
         | "session.forked"
         | "session.inbox.delivered"

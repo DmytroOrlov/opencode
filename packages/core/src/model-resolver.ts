@@ -137,6 +137,9 @@ export interface Resolved {
   readonly transport?: Provider.Transport
   /** Milliseconds without streamed data before a WebSocket exchange fails; `false` disables the limit. */
   readonly chunkTimeout?: number | false
+  /** Explicit opt-ins for provider telemetry observers; never forwarded to providers. */
+  readonly mlxTelemetry?: boolean
+  readonly splashTelemetry?: boolean
 }
 
 export type MediaError =
@@ -518,6 +521,8 @@ export const layer = Layer.effect(
         // The WebSocket transport can't present a client certificate, so `tls` keeps the model on HTTP.
         transport: Provider.tls(provider?.settings ?? {}) ? "http" : provider?.settings?.transport,
         chunkTimeout: Provider.timeout(provider?.settings?.chunkTimeout),
+        mlxTelemetry: runtimeInfo.settings?.mlxTelemetry,
+        splashTelemetry: runtimeInfo.settings?.splashTelemetry,
       }
     })
     const loadMedia = Effect.fnUntraced(function* <Runtime>(

@@ -2,6 +2,9 @@ import { describe, expect, test } from "bun:test"
 import { Schema } from "effect"
 import { Event } from "../src/event.js"
 import { EventLog } from "../src/event-log.js"
+import { SessionEvent } from "../src/session-event.js"
+import { DurableEventManifest } from "../src/durable-event-manifest.js"
+import { EventManifest } from "../src/event-manifest.js"
 
 describe("public event schemas", () => {
   test("definition is pure", () => {
@@ -48,5 +51,34 @@ describe("public event schemas", () => {
       type: "log.synced",
       aggregateID: "ses_test",
     })
+  })
+
+  test("session telemetry is public and ephemeral", () => {
+    const payload = {
+      id: Event.ID.create(),
+      created: 1,
+      type: "session.telemetry",
+      data: {
+        sessionID: "ses_test",
+        assistantMessageID: "msg_test",
+        attemptID: Event.ID.create(),
+        attemptSequence: 1,
+        phase: "decode",
+        measurements: [
+          {
+            metric: "decode-rate" as const,
+            tokensPerSecond: 12.5,
+            source: "provider-native" as const,
+            approximate: false,
+          },
+        ],
+      },
+    }
+    const decoded = Schema.decodeUnknownSync(SessionEvent.Telemetry)(payload)
+
+    expect(decoded.data.measurements).toEqual(payload.data.measurements)
+    expect(SessionEvent.Telemetry.durability).toBe("ephemeral")
+    expect(EventManifest.Server.get("session.telemetry")).toBe(SessionEvent.Telemetry)
+    expect(DurableEventManifest.Durable.get("session.telemetry.1")).toBeUndefined()
   })
 })

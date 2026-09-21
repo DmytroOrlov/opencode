@@ -664,6 +664,27 @@ const subscribeRetries = (s: Scenario) =>
     return scheduled
   })
 
+// Ephemeral telemetry for this Session's physical attempts, in publication order: one `start` then one
+// `complete` or `discard` per attempt. Intermediate `prefill`/`decode` updates are skipped, so the boundary
+// events stay deterministic no matter how the clocks fall; the terminal payload still carries its measurements.
+const subscribeTelemetry = (s: Scenario) =>
+  Effect.gen(function* () {
+    const attempts = yield* Queue.unbounded<Event.Payload<typeof SessionEvent.Telemetry>>()
+    yield* s.bus
+      .subscribe(SessionEvent.Telemetry)
+      .pipe(
+        Stream.filter(
+          (event) =>
+            event.data.sessionID === sessionID &&
+            event.data.phase !== "prefill" &&
+            event.data.phase !== "decode",
+        ),
+        Stream.runForEach((event) => Queue.offer(attempts, event)),
+        Effect.forkScoped({ startImmediately: true }),
+      )
+    return attempts
+  })
+
 const providerUnavailable = () =>
   new AIError({
     reason: new TransportError({
@@ -4221,6 +4242,7 @@ describe("SessionRunnerLLM", () => {
   })
 
   scenario("continues with reloaded history after durably settling one local tool call", function* (s) {
+    const telemetry = yield* subscribeTelemetry(s)
     yield* s.admit("Echo this")
 
     yield* s.llm.push(TestLLM.toolCall("call-echo", "echo", { text: "hello" }), TestLLM.text("Done", "text-final"))
@@ -4249,6 +4271,12 @@ describe("SessionRunnerLLM", () => {
       "session.tool.success.2",
       "session.step.ended.1",
     ])
+    // Every local tool call settled, so this tool-call attempt finalizes its telemetry as a success.
+    const start = yield* Queue.take(telemetry)
+    const terminal = yield* Queue.take(telemetry)
+    expect(start.data.phase).toBe("start")
+    expect(terminal.data.phase).toBe("complete")
+    expect(terminal.data.attemptID).toBe(start.data.attemptID)
   })
 
   scenario("reloads a model switch before a tool-driven continuation step", function* (s) {
@@ -5408,6 +5436,10 @@ describe("SessionRunnerLLM", () => {
   })
 
   scenario("runs different sessions concurrently", function* (s) {
+    const telemetry = yield* Queue.unbounded<Event.Payload<typeof SessionEvent.Telemetry>>()
+    yield* s.bus
+      .subscribe(SessionEvent.Telemetry)
+      .pipe(Stream.runForEach((event) => Queue.offer(telemetry, event)), Effect.forkScoped({ startImmediately: true }))
     yield* insertSession(otherSessionID)
     yield* s.admit("Run first")
     yield* s.session.prompt({
@@ -5425,9 +5457,53 @@ describe("SessionRunnerLLM", () => {
 
     expect(s.requests).toHaveLength(2)
     expect(s.requests.map((request) => request.promptCacheKey)).toEqual([sessionID, otherSessionID])
+    const starts = [yield* Queue.take(telemetry), yield* Queue.take(telemetry)]
+    expect(starts.map((event) => event.data.phase)).toEqual(["start", "start"])
+    expect(starts.map((event) => event.data.sessionID).sort()).toEqual([sessionID, otherSessionID].sort())
+    expect(new Set(starts.map((event) => event.data.attemptID)).size).toBe(2)
     yield* stream.release
     yield* Fiber.join(first)
     yield* Fiber.join(second)
+  })
+
+  scenario("keeps telemetry publication failure observational", function* (s) {
+    yield* s.bus.listen((event) =>
+      event.type === SessionEvent.Telemetry.type ? Effect.die("telemetry publication unavailable") : Effect.void,
+    )
+    yield* s.llm.push(TestLLM.text("Inference still succeeds", "telemetry-publisher-failure"))
+
+    yield* s.runPrompt("Run despite telemetry failure")
+
+    expect(s.requests).toHaveLength(1)
+    expect(userTexts(s.requests[0])).toEqual(["Run despite telemetry failure"])
+    expect(yield* s.context).toMatchObject([
+      Expected.user("Run despite telemetry failure"),
+      Expected.assistant({}, [Expected.text("Inference still succeeds")]),
+    ])
+  })
+
+  scenario("does not wait for a stalled telemetry completion publisher", function* (s) {
+    const blocked = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    yield* s.bus.listen((event) => {
+      if (!Schema.is(SessionEvent.Telemetry)(event) || event.data.phase !== "complete") return Effect.void
+      return Deferred.succeed(blocked, undefined).pipe(Effect.andThen(Deferred.await(release)))
+    })
+    yield* s.llm.push(TestLLM.text("Inference still succeeds", "telemetry-publisher-stall"))
+
+    const finished = yield* Deferred.make<void>()
+    const run = yield* s.runPrompt("Run despite stalled telemetry").pipe(
+      Effect.tap(() => Deferred.succeed(finished, undefined)),
+      Effect.forkChild,
+    )
+    yield* Deferred.await(blocked)
+    yield* Effect.yieldNow
+    const completed = yield* Deferred.isDone(finished)
+    yield* Deferred.succeed(release, undefined)
+    if (!completed) yield* Fiber.join(run)
+
+    expect(completed).toBe(true)
+    expect(s.requests).toHaveLength(1)
   })
 
   scenario("bounds 64-character session prompt cache keys", function* (s) {
@@ -5502,6 +5578,7 @@ describe("SessionRunnerLLM", () => {
   })
 
   scenario("returns unexpected local tool defects to the model and continues", function* (s) {
+    const telemetry = yield* subscribeTelemetry(s)
     yield* s.admit("Call defect")
 
     yield* s.llm.push(TestLLM.toolCall("call-defect", "defect", {}), TestLLM.text("Recovered", "text-after-defect"))
@@ -5525,6 +5602,22 @@ describe("SessionRunnerLLM", () => {
       "session.tool.failed.2",
       "session.step.ended.1",
     ])
+    // A tool that dies before settling publishes a settlement failure, so that attempt discards its terminal
+    // telemetry even though its provider stream ended cleanly. The clean continuation attempt still completes.
+    const firstStart = yield* Queue.take(telemetry)
+    const firstTerminal = yield* Queue.take(telemetry)
+    const secondStart = yield* Queue.take(telemetry)
+    const secondTerminal = yield* Queue.take(telemetry)
+    expect([firstStart, firstTerminal, secondStart, secondTerminal].map((event) => event.data.phase)).toEqual([
+      "start",
+      "discard",
+      "start",
+      "complete",
+    ])
+    expect(firstTerminal.data.attemptID).toBe(firstStart.data.attemptID)
+    expect(firstTerminal.data.measurements).toEqual([])
+    expect(secondTerminal.data.attemptID).toBe(secondStart.data.attemptID)
+    expect(secondStart.data.attemptSequence).toBeGreaterThan(firstStart.data.attemptSequence)
   })
 
   scenario("preserves each parallel Promise hook failure", function* (s) {
@@ -5599,6 +5692,7 @@ describe("SessionRunnerLLM", () => {
   })
 
   scenario("interrupts runner continuation on a decline after settling an ordinary tool error", function* (s) {
+    const telemetry = yield* subscribeTelemetry(s)
     const registry = yield* Tool.Service
     yield* transformTools(
       registry,
@@ -5657,6 +5751,15 @@ describe("SessionRunnerLLM", () => {
         ),
       ]),
     ])
+    // The provider stream itself succeeded, but the attempt ended in a declined tool, so its scoped finalizer must
+    // discard the attempt instead of publishing successful terminal telemetry with a terminal decode rate.
+    const start = yield* Queue.take(telemetry)
+    const terminal = yield* Queue.take(telemetry)
+    expect(start.data.phase).toBe("start")
+    expect(terminal.data.phase).toBe("discard")
+    expect(terminal.data.attemptID).toBe(start.data.attemptID)
+    expect(terminal.data.attemptSequence).toBe(start.data.attemptSequence)
+    expect(terminal.data.measurements).toEqual([])
   })
 
   scenario("returns permission corrections to the model and continues", function* (s) {
@@ -6392,6 +6495,7 @@ describe("SessionRunnerLLM", () => {
 
   for (const type of ["text", "reasoning"] as const) {
     scenario(`continues ${type} after an output token limit`, function* (s) {
+      const telemetry = yield* subscribeTelemetry(s)
       const nudge =
         "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces."
       const partial =
@@ -6431,6 +6535,12 @@ describe("SessionRunnerLLM", () => {
         Expected.assistant({ finish: "stop" }, [Expected.text("Finished")]),
       ])
       expect(yield* recordedEventTypes(sessionID)).not.toContain("session.retry.scheduled.1")
+      // The output-limit outcome continues the step, but the attempt itself succeeded, so its telemetry completes.
+      const start = yield* Queue.take(telemetry)
+      const terminal = yield* Queue.take(telemetry)
+      expect(start.data.phase).toBe("start")
+      expect(terminal.data.phase).toBe("complete")
+      expect(terminal.data.attemptID).toBe(start.data.attemptID)
     })
   }
 
@@ -7625,6 +7735,41 @@ describe("SessionRunnerLLM", () => {
       Expected.user("Call provider tool"),
       Expected.assistant({}, [Expected.failedTool({ id: "call-parsed" }, { input: { query: "hello" } })]),
     ])
+  })
+
+  scenario("keeps retry telemetry scoped to distinct attempts sharing one assistant message", function* (s) {
+    const telemetry = yield* Queue.unbounded<Event.Payload<typeof SessionEvent.Telemetry>>()
+    yield* s.bus
+      .subscribe(SessionEvent.Telemetry)
+      .pipe(
+        Stream.filter((event) => event.data.sessionID === sessionID),
+        Stream.runForEach((event) => Queue.offer(telemetry, event)),
+        Effect.forkScoped({ startImmediately: true }),
+      )
+    const scheduled = yield* subscribeRetries(s)
+    yield* s.admit("Retry with attempt telemetry")
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered", "telemetry-recovered"))
+
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    const firstStart = yield* Queue.take(telemetry)
+    const firstDiscard = yield* Queue.take(telemetry)
+    const retryMessage = yield* Queue.take(scheduled)
+    yield* TestClock.adjust("2400 millis")
+    yield* Fiber.join(run)
+    const secondStart = yield* Queue.take(telemetry)
+    const secondComplete = yield* Queue.take(telemetry)
+
+    expect(firstStart.data.phase).toBe("start")
+    expect(firstDiscard.data.phase).toBe("discard")
+    expect(secondStart.data.phase).toBe("start")
+    expect(secondComplete.data.phase).toBe("complete")
+    expect(firstStart.data.assistantMessageID).toBe(retryMessage)
+    expect(secondStart.data.assistantMessageID).toBe(retryMessage)
+    expect(firstDiscard.data.attemptID).toBe(firstStart.data.attemptID)
+    expect(secondComplete.data.attemptID).toBe(secondStart.data.attemptID)
+    expect(firstStart.data.attemptID).not.toBe(secondStart.data.attemptID)
+    expect(secondStart.data.attemptSequence).toBeGreaterThan(firstStart.data.attemptSequence)
+    expect(s.requests).toHaveLength(2)
   })
 
   scenario("rejects malformed streamed tool input ordering", function* (s) {

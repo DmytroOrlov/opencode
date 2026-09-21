@@ -20,6 +20,8 @@
     "./effect": "./src/effect.ts",
     "./testing": "./src/testing.ts",
     "./experimental": "./src/experimental.ts",
+    "./telemetry/mlx": "./src/telemetry/mlx.ts",
+    "./telemetry/splash": "./src/telemetry/splash.ts",
     "./route": "./src/route.ts",
     "./providers": "./src/providers.ts",
     "./providers/alibaba": "./src/providers/alibaba.ts",

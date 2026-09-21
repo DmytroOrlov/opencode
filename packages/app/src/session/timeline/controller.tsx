@@ -38,6 +38,11 @@ import { createTimelineProjection } from "./projection"
 import { createNextTimelineProjection } from "@opencode/session-ui/timeline-next"
 import { useServer } from "@/runtime/server/current"
 import type { ReasoningMode } from "@opencode/session-ui/timeline/projection"
+import {
+  reduce as reduceTelemetry,
+  resetForConnectionEpoch,
+  type State as TelemetryState,
+} from "./telemetry"
 
 const emptyMessages: SessionMessageInfo[] = []
 
@@ -86,6 +91,26 @@ export function createTimelineController(input: {
   const dialog = useDialog()
   const language = useLanguage()
   const exporter = useSessionExporter()
+  const [telemetry, setTelemetry] = createSignal<TelemetryState>({})
+
+  createEffect(() => {
+    const id = input.session.identity.sessionID()
+    if (!id) return
+
+    const unsubscribeConnected = serverSDK.event.on("server.connected", () => {
+      setTelemetry(resetForConnectionEpoch())
+    })
+
+    const unsubscribeTelemetry = serverSDK.event.on("session.telemetry", (event) => {
+      if (event.data.sessionID !== id) return
+      setTelemetry((state) => reduceTelemetry(state, event.data))
+    })
+
+    onCleanup(() => {
+      unsubscribeConnected()
+      unsubscribeTelemetry()
+    })
+  })
 
   // Pending inputs and the handoff hold with the history while the view is detached, so a hidden view never shows
   // one against history it has not caught up with.
@@ -431,6 +456,7 @@ export function createTimelineController(input: {
       reasoningMode,
       shellToolPartsExpanded,
       editToolPartsExpanded,
+      telemetry: (assistantMessageID: string) => telemetry()[assistantMessageID],
     },
     title: {
       view: createMemo(() => selectSessionHeaderTitleView(titleState())),

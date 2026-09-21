@@ -2114,6 +2114,7 @@ export type EventSubscribeInput = {
         | "session.archived"
         | "session.unarchived"
         | "session.usage.updated"
+        | "session.telemetry"
         | "session.deleted"
         | "session.forked"
         | "session.inbox.delivered"

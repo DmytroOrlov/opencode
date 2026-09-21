@@ -237,6 +237,7 @@ export async function session(snapshots: "on" | "off", ttft: number) {
   // APIs differ, and the first session call (a warmup run) pays for the import.
   const { ai, LanguageModel } = await import("@opencode/ai/effect")
   const { OpenAIChat } = await import("@opencode/ai/protocols/openai-chat")
+  const { RequestExecutor } = await import("@opencode/ai/route")
   const { TestLLM } = await import("@opencode/ai/testing")
   const { LayerNode } = await import("@opencode/util/effect/layer-node")
   const { Money } = await import("@opencode/schema/money")
@@ -328,10 +329,13 @@ export async function session(snapshots: "on" | "off", ttft: number) {
       Effect.provide(layer),
       Effect.provide(
         Layer.merge(
-          AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionProjector.node, ToolOutput.node]), [
-            Bus.node.replace(Bus.configured({ persist: true })),
-          ]),
-          TestLLM.testLayer(),
+          Layer.merge(
+            AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionProjector.node, ToolOutput.node]), [
+              Bus.node.replace(Bus.configured({ persist: true })),
+            ]),
+            TestLLM.testLayer(),
+          ),
+          RequestExecutor.fetchLayer,
         ),
       ),
       Effect.provide(Logger.layer([])),

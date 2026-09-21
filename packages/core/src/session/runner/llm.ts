@@ -25,7 +25,7 @@ import { toSessionError } from "../to-session-error.js"
 import { DrainResult, Service, type Interface } from "./index.js"
 import { Snapshot } from "../../snapshot.js"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
-import { llmClient } from "../../effect/app-node-platform.js"
+import { llmClient, requestExecutor } from "../../effect/app-node-platform.js"
 import { StepFailedError } from "../error.js"
 import { SessionRunnerRetry } from "./retry.js"
 import { SessionStep } from "./step.js"
@@ -454,6 +454,7 @@ export const node = makeLocationNode({
     Bus.node,
     LocationLifecycle.node,
     llmClient,
+    requestExecutor,
     SessionContext.node,
     SessionModelTransport.node,
     SessionStore.node,

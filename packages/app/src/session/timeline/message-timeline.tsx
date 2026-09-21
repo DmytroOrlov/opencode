@@ -40,6 +40,7 @@ import {
 import { SessionHeaderSpacer } from "@/session/header/session-header"
 import { SessionHeaderGap } from "@/session/header/drag-area"
 import { SessionWorkingIndicator } from "@/session/header/session-working-indicator"
+import { formatThinkingTelemetry } from "@opencode/session-ui/timeline/generation-telemetry"
 
 type BlockingTask = { type: "shell"; partID: string; id?: string; label?: string; started: number }
 
@@ -193,6 +194,17 @@ function MessageTimelineView(
   const turnPadding = () => "px-4 md:px-6"
   const showHeader = createMemo(() => !props.hideHeader && (props.data.showHeader() || workspaceSession()))
   const messageByID = projection.messageByID
+  const workingText = createMemo(() => {
+    const base = language.t("session.timeline.working")
+    const active = projection.activeMessageID()
+    const assistant = active ? projection.assistantMessagesByParent().get(active)?.at(-1) : undefined
+    if (!assistant) return base
+    const attempt = props.data.telemetry(assistant.id)
+    if (!attempt || attempt.phase === "complete") return base
+    const current = attempt.measurements.findLast((measurement) => measurement.metric === "decode-rate") ??
+      attempt.measurements.findLast((measurement) => measurement.metric === "prefill-progress")
+    return formatThinkingTelemetry(base, current, language.locale())
+  })
 
   const virtualized = createTimelineVirtualizer({
     active: () => props.active !== false,
@@ -325,6 +337,7 @@ function MessageTimelineView(
     padding: turnPadding,
     anchor: props.anchor,
     revealPart: virtualized.revealPart,
+    telemetry: props.data.telemetry,
   }
 
   const rowRenderer = props.next
@@ -526,7 +539,7 @@ function MessageTimelineView(
           <div class={`flex h-9 items-center gap-2 pt-3 text-[13px] font-[530] leading-text-compact ${turnPadding()}`}>
             <Show when={live() && showWorking()}>
               <div data-component="session-working" role="status">
-                <TextShimmer text={language.t("session.timeline.working")} active />
+                <TextShimmer text={workingText()} active />
               </div>
             </Show>
             {hint(live)}

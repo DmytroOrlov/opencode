@@ -3,6 +3,7 @@ import type {
   SessionMessageInfo,
   SessionMessageUser,
   SessionStatus,
+  SessionTelemetry,
 } from "@opencode/client/promise"
 import { useI18n } from "@opencode/ui/context/i18n"
 import { SessionTurn } from "@opencode/util/session-turn"
@@ -53,6 +54,7 @@ import { timelineCategory, type TimelineDetail } from "./detail"
 import { currentToolFailed } from "../message/current-tool-state"
 import { userMessageRuns, userRunSpring } from "./user-runs"
 import { attached } from "../components/message-file"
+import { formatGenerationRate, selectGenerationRateTarget } from "./generation-telemetry"
 import {
   createReactiveTimelineProjection,
   Timeline,
@@ -78,6 +80,7 @@ const turnDiffFileLimit = 5
 const decodeMetadataFile = Schema.decodeUnknownOption(Schema.Struct({ file: Schema.String }))
 
 type Projection = ReturnType<typeof createReactiveTimelineProjection>
+type TimelineTelemetry = Pick<SessionTelemetry["data"], "phase" | "measurements">
 
 type FramedTimelineRow = Exclude<TimelineRow.TimelineRow, TimelineRow.TurnGap>
 
@@ -112,6 +115,7 @@ export function createSessionTimelineRowRenderer(input: {
   anchor?: (messageID: string) => string | undefined
   /** Scrolls to and expands the tool call named by its ID or by the shell ID a backgrounded shell call reports. */
   revealPart?: (target: string) => boolean
+  telemetry?: (assistantMessageID: string) => TimelineTelemetry | undefined
 }) {
   const i18n = useI18n()
   const data = useData()
@@ -918,6 +922,31 @@ export function createSessionTimelineRowRenderer(input: {
     )
   }
 
+  const generationRates = (row: TimelineRow.AssistantPart) => {
+    const refs = row.group.type === "part" ? [row.group.ref] : row.group.refs
+    const seen = new Set<string>()
+    return refs.flatMap((ref) => {
+      if (seen.has(ref.messageID)) return []
+      seen.add(ref.messageID)
+      const message = input.projection.messageByID().get(ref.messageID)
+      if (message?.type !== "assistant" || message.error) return []
+      const attempt = input.telemetry?.(message.id)
+      if (attempt?.phase !== "complete") return []
+      const target = selectGenerationRateTarget(
+        Timeline.contentEntries(message).map((entry) => ({
+          id: entry.id,
+          kind: entry.content.type === "tool" ? "tool" : entry.content.type === "text" ? "text" : "other",
+        })),
+      )
+      if (target !== ref.partID) return []
+      const value = formatGenerationRate(
+        attempt.measurements.find((measurement) => measurement.metric === "decode-rate"),
+        i18n.locale(),
+      )
+      return value ? [{ id: message.id, value }] : []
+    })
+  }
+
   function Shell(props: { messageID: string; grouped?: boolean }) {
     const message = createMemo(() => {
       const value = input.projection.messageByID().get(props.messageID)
@@ -1212,12 +1241,20 @@ export function createSessionTimelineRowRenderer(input: {
 
       // Construct once per row key, not inside JSX that reruns when group refs change.
       const content = renderAssistant(current, onSizeChange)
+      const rates = createMemo(() => generationRates(current()))
 
       return (
         <Frame row={current()}>
           <div data-slot="session-turn-message-container" class={`w-full ${padding()}`}>
             <div data-slot="session-turn-assistant-content" aria-hidden={phase(current().userMessageID).live}>
               {content}
+              <For each={rates()}>
+                {(rate) => (
+                  <div data-component="session-generation-rate" aria-label={`Generation rate ${rate.value}`}>
+                    {rate.value}
+                  </div>
+                )}
+              </For>
             </div>
           </div>
         </Frame>

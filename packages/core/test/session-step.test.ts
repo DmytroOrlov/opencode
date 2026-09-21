@@ -1,6 +1,7 @@
 import { expect } from "bun:test"
 import { ai, LanguageModel, LLMEvent } from "@opencode/ai/effect"
 import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
+import { RequestExecutor } from "@opencode/ai/route"
 import { TestLLM } from "@opencode/ai/testing"
 import { Agent } from "@opencode/core/agent"
 import { Bus } from "@opencode/core/bus"
@@ -27,11 +28,12 @@ import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(
-  Layer.merge(
+  Layer.mergeAll(
     AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionProjector.node, ToolOutput.node]), [
       Bus.node.replace(Bus.configured({ persist: true })),
     ]),
     TestLLM.testLayer(),
+    RequestExecutor.fetchLayer,
   ),
 )
 

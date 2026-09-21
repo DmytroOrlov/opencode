@@ -1,6 +1,7 @@
 import { describe, expect } from "bun:test"
 import { ai, LanguageModel, LLMEvent } from "@opencode/ai/effect"
 import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
+import { RequestExecutor } from "@opencode/ai/route"
 import { TestLLM } from "@opencode/ai/testing"
 import { Agent } from "@opencode/core/agent"
 import { Bus } from "@opencode/core/bus"
@@ -23,7 +24,12 @@ import { TestClock } from "effect/testing"
 import { testEffect } from "../lib/effect"
 import { PluginTestLayer } from "./fixture"
 
-const it = testEffect(Layer.merge(PluginTestLayer, TestLLM.testLayer()))
+const it = testEffect(
+  Layer.merge(
+    Layer.merge(PluginTestLayer, TestLLM.testLayer()),
+    RequestExecutor.fetchLayer,
+  ),
+)
 
 const model = SessionRunnerModel.resolved(
   LanguageModel.make({ id: "test-model", provider: "test", route: OpenAIChat.route }),

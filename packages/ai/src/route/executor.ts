@@ -297,8 +297,27 @@ export const withFetch = (
       Effect.provide(FetchHttpClient.layer),
       Effect.provideService(FetchHttpClient.Fetch, fetch),
     )
-  return middleware === undefined ? send : (request) => middleware(request, send)
+  return middleware === undefined
+    ? send
+    : (request) => middleware(request, send)
 }
+
+/** Reject redirects without discarding existing transport options. */
+export const withoutRedirects = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> =>
+  Effect.gen(function* () {
+    const init = Option.getOrElse(
+      yield* Effect.serviceOption(FetchHttpClient.RequestInit),
+      () => ({}),
+    )
+    return yield* effect.pipe(
+      Effect.provideService(FetchHttpClient.RequestInit, {
+        ...init,
+        redirect: "error",
+      }),
+    )
+  })
 
 /**
  * Run `fn` on every request: it sees the raw response before status classification, inside middleware already on

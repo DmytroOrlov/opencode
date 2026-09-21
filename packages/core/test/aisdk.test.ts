@@ -171,6 +171,8 @@ it.effect("projects request settings, headers, and body overlays", () =>
 
     const input = model("@ai-sdk/google", {
       apiKey: "secret",
+      mlxTelemetry: true,
+      splashTelemetry: true,
       thinkingConfig: { thinkingBudget: 1024 },
       compaction: { type: "native" },
       cache: { ttl: "1h" },
@@ -199,8 +201,12 @@ it.effect("projects request settings, headers, and body overlays", () =>
     })
     expect(prepared.body.headers).toEqual({ "x-test": "header" })
     expect(body).toEqual({ safety_setting: "strict" })
-    for (const key of ["compaction", "cache", "encoding", "timeout", "transport"])
+    for (const key of ["compaction", "cache", "encoding", "timeout", "transport", "mlxTelemetry", "splashTelemetry"])
       expect(options).not.toHaveProperty(key)
+    // Per-request options are flattened under the package's provider key, and telemetry never belongs there.
+    const requestOptions = prepared.body.providerOptions?.google ?? {}
+    for (const key of ["mlxTelemetry", "splashTelemetry", "timeout", "cache", "encoding"])
+      expect(requestOptions).not.toHaveProperty(key)
   }),
 )
 
