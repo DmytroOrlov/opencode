@@ -9,6 +9,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ConfigMigrateV1 } from "@opencode-ai/core/v1/config/migrate"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { LEGACY_MODEL_FALLBACK, resolveModelFallback } from "@opencode-ai/core/model-fallback"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
@@ -52,6 +53,23 @@ const provider = {
 }
 
 describe("Config", () => {
+  it.effect("preserves raw fallback states and resolves the legacy default", () =>
+    Effect.sync(() => {
+      const absent = Schema.decodeUnknownSync(ConfigV1.Info)({})
+      expect(absent.fallback).toBeUndefined()
+      expect(resolveModelFallback(absent.fallback)).toEqual(LEGACY_MODEL_FALLBACK)
+
+      const disabled = Schema.decodeUnknownSync(ConfigV1.Info)({ fallback: null })
+      expect(disabled.fallback).toBeNull()
+      expect(resolveModelFallback(disabled.fallback)).toBeNull()
+
+      const configured = Schema.decodeUnknownSync(ConfigV1.Info)({
+        fallback: { model: "test/custom", variant: null },
+      })
+      expect(configured.fallback).toEqual({ model: "test/custom", variant: null })
+    }),
+  )
+
   it.effect("returns the latest defined scalar from priority-ordered documents", () =>
     Effect.sync(() => {
       const entries = [

@@ -29,6 +29,8 @@ const LogLevelRef = Schema.Literals(["DEBUG", "INFO", "WARN", "ERROR"]).annotate
   description: "Log level",
 })
 
+const ModelFallbackNull = Schema.Null.annotate({ identifier: "ModelFallbackNull" })
+
 export const Info = Schema.Struct({
   $schema: Schema.optional(Schema.String).annotate({
     description: "JSON schema reference for configuration validation",
@@ -76,6 +78,18 @@ export const Info = Schema.Struct({
   }),
   small_model: Schema.optional(Schema.String).annotate({
     description: "Small model to use for tasks like title generation in the format of provider/model",
+  }),
+  fallback: Schema.optionalKey(
+    Schema.Union([
+      ModelFallbackNull,
+      Schema.Struct({
+        model: Schema.String,
+        variant: Schema.Union([Schema.String, ModelFallbackNull]),
+      }).annotate({ identifier: "ModelFallback" }),
+    ]),
+  ).annotate({
+    description:
+      "Optional fallback model in provider/model format. Set to null to disable automatic fallback; variant null uses the provider/model default reasoning behavior.",
   }),
   default_agent: Schema.optional(Schema.String).annotate({
     description:

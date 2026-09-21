@@ -1,7 +1,8 @@
 import { Config } from "@/config/config"
 import { GlobalBus, type GlobalEvent as GlobalBusEvent } from "@/bus/global"
-import { EffectBridge } from "@/effect/bridge"
 import { EventV2 } from "@opencode-ai/core/event"
+import { GenerationGate } from "@opencode-ai/core/session/generation-gate"
+import { FallbackRuntimeIntent } from "@/session/fallback-runtime-intent"
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
 import { getTlsCaMode, type TlsCaMode } from "@/tls-ca-mode"
@@ -71,8 +72,9 @@ export function globalHealthResult(
 export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handlers) =>
   Effect.gen(function* () {
     const config = yield* Config.Service
+    const generationGate = yield* GenerationGate.Service
+    const fallbackRuntimeIntent = yield* FallbackRuntimeIntent.Service
     const installation = yield* Installation.Service
-    const bridge = yield* EffectBridge.make()
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
       return globalHealthResult()
@@ -87,9 +89,35 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     })
 
     const configUpdate = Effect.fn("GlobalHttpApi.configUpdate")(function* (ctx) {
-      const result = yield* config.updateGlobal(ctx.payload)
-      if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
-      return result.info
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const stagedRevision = Object.hasOwn(ctx.payload, "fallback")
+            ? yield* fallbackRuntimeIntent.stage(ctx.payload.fallback ?? null)
+            : undefined
+
+          return yield* Effect.gen(function* () {
+            const reservation = yield* generationGate.reserveExclusive
+
+            // Waiting in the FIFO queue remains cancellable. Once granted, transfer
+            // happens under the mask so request cancellation cannot orphan the writer.
+            yield* restore(reservation.await)
+            const lease = yield* reservation.transfer
+            if (lease === undefined) return yield* Effect.interrupt
+
+            return yield* Effect.gen(function* () {
+              const result = yield* config.updateGlobal(ctx.payload)
+              if (result.changed) yield* disposeAllInstancesAndEmitGlobalDisposed()
+              return result.info
+            }).pipe(Effect.ensuring(lease.release))
+          }).pipe(
+            Effect.ensuring(
+              stagedRevision === undefined
+                ? Effect.void
+                : fallbackRuntimeIntent.clearIfCurrent(stagedRevision),
+            ),
+          )
+        }),
+      )
     })
 
     const dispose = Effect.fn("GlobalHttpApi.dispose")(function* () {

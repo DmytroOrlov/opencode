@@ -10,7 +10,7 @@ import fsNode from "fs/promises"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Auth } from "../auth"
 import { Env } from "../env"
-import { applyEdits, modify } from "jsonc-parser"
+import { applyEdits, findNodeAtLocation, modify, parseTree } from "jsonc-parser"
 import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
 import { existsSync } from "fs"
 import { Account } from "@/account/account"
@@ -36,6 +36,7 @@ import { ConfigVariable } from "./variable"
 import { ConfigV2Compat } from "./v2-compat"
 import { Npm } from "@opencode-ai/core/npm"
 import { withTransientReadRetry } from "@/util/effect-http-client"
+import { randomUUID } from "crypto"
 
 // Custom merge function that concatenates array fields instead of replacing them
 // Keep remeda's deep conditional merge type out of hot config-loading paths; TS profiling showed it dominates here.
@@ -148,8 +149,8 @@ function globalConfigFile() {
 }
 
 function patchJsonc(input: string, patch: unknown, path: string[] = []): string {
-  if (!isRecord(patch)) {
-    const edits = modify(input, path, patch, {
+  const replaceJsoncValue = (value: unknown) => {
+    const edits = modify(input, path, value, {
       formattingOptions: {
         insertSpaces: true,
         tabSize: 2,
@@ -157,6 +158,14 @@ function patchJsonc(input: string, patch: unknown, path: string[] = []): string 
     })
     return applyEdits(input, edits)
   }
+
+  if (!isRecord(patch)) {
+    return replaceJsoncValue(patch)
+  }
+
+  const tree = parseTree(input)
+  const current = tree ? findNodeAtLocation(tree, path) : undefined
+  if (!current || current.type !== "object") return replaceJsoncValue(patch)
 
   return Object.entries(patch).reduce((result, [key, value]) => patchJsonc(result, value, [...path, key]), input)
 }
@@ -653,6 +662,18 @@ const layer = Layer.effect(
       yield* invalidateGlobal
     })
 
+    const persistGlobal = Effect.fn("Config.persistGlobal")(function* (file: string, content: string) {
+      const directory = path.dirname(file)
+      const temp = path.join(directory, `.${path.basename(file)}.${randomUUID()}.tmp`)
+      const exists = yield* fs.exists(file).pipe(Effect.orDie)
+      const mode = exists ? (yield* fs.stat(file).pipe(Effect.orDie)).mode : undefined
+      yield* Effect.gen(function* () {
+        yield* fs.writeFileString(temp, content)
+        if (mode !== undefined) yield* fs.chmod(temp, mode)
+        yield* fs.rename(temp, file)
+      }).pipe(Effect.ensuring(fs.remove(temp, { force: true }).pipe(Effect.ignore)), Effect.orDie)
+    })
+
     const updateGlobal = Effect.fn("Config.updateGlobal")(function* (config: Info) {
       const file = globalConfigFile()
       const before = (yield* readConfigFile(file)) ?? "{}"
@@ -667,12 +688,12 @@ const layer = Layer.effect(
         const serialized = JSON.stringify(merged, null, 2)
         next = yield* decodeConfig(merged, file)
         changed = serialized !== before
-        if (changed) yield* fs.writeFileString(file, serialized).pipe(Effect.orDie)
+        if (changed) yield* persistGlobal(file, serialized)
       } else {
         const updated = patchJsonc(before, patch)
         next = yield* decodeConfig(ConfigParse.jsonc(updated, file), file)
         changed = updated !== before
-        if (changed) yield* fs.writeFileString(file, updated).pipe(Effect.orDie)
+        if (changed) yield* persistGlobal(file, updated)
       }
 
       if (changed) yield* invalidate()

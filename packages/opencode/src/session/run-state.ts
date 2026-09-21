@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { GenerationGate } from "@opencode-ai/core/session/generation-gate"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Runner } from "@/effect/runner"
@@ -15,13 +16,13 @@ export interface Interface {
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
-  ) => Effect.Effect<SessionV1.WithParts>
+  ) => Effect.Effect<SessionV1.WithParts, never, Scope.Scope>
   readonly startShell: (
     sessionID: SessionID,
     onInterrupt: Effect.Effect<SessionV1.WithParts>,
     work: Effect.Effect<SessionV1.WithParts>,
     ready?: Latch.Latch,
-  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
+  ) => Effect.Effect<SessionV1.WithParts, Session.BusyError, Scope.Scope>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionRunState") {}
@@ -30,6 +31,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const background = yield* BackgroundJob.Service
+    const generationGate = yield* GenerationGate.Service
     const status = yield* SessionStatus.Service
 
     const state = yield* InstanceState.make(
@@ -90,7 +92,10 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt)).ensureRunning(work)
+      const scope = yield* Scope.Scope
+      const resolve = () => runner(sessionID, onInterrupt)
+      const reserve = () => Effect.provideService(generationGate.reserveShared, Scope.Scope, scope)
+      return yield* (yield* resolve()).ensureRunningAdmitted(work, reserve, resolve)
     })
 
     const startShell = Effect.fn("SessionRunState.startShell")(function* (
@@ -99,8 +104,11 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
     ) {
-      return yield* (yield* runner(sessionID, onInterrupt))
-        .startShell(work, ready)
+      const scope = yield* Scope.Scope
+      const resolve = () => runner(sessionID, onInterrupt)
+      const reserve = () => Effect.provideService(generationGate.reserveShared, Scope.Scope, scope)
+      return yield* (yield* resolve())
+        .startShellAdmitted(work, ready, reserve, resolve)
         .pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
     })
 
@@ -146,6 +154,10 @@ function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })
 }
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [BackgroundJob.node, SessionStatus.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [BackgroundJob.node, SessionStatus.node, GenerationGate.node],
+})
 
 export * as SessionRunState from "./run-state"

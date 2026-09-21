@@ -13,8 +13,12 @@ import { useLanguage } from "@/context/language"
 import { decode64 } from "@/utils/base64"
 
 type ModelState = ReturnType<typeof useLocal>["model"]
+type ModelItem = ReturnType<ModelState["list"]>[number]
 
-export const DialogSelectModelUnpaid: Component<{ model?: ModelState }> = (props) => {
+export const DialogSelectModelUnpaid: Component<{
+  model?: ModelState
+  onSelect?: (item: ModelItem) => void
+}> = (props) => {
   const local = useLocal()
   const model = props.model ?? local.model
   const dialog = useDialog()
@@ -69,9 +73,10 @@ export const DialogSelectModelUnpaid: Component<{ model?: ModelState }> = (props
             </Tooltip>
           )}
           onSelect={(x) => {
-            model.set(x ? { modelID: x.id, providerID: x.provider.id } : undefined, {
-              recent: true,
-            })
+            if (x) {
+              if (props.onSelect) props.onSelect(x)
+              else model.set({ modelID: x.id, providerID: x.provider.id }, { recent: true })
+            }
             dialog.close()
           }}
         >

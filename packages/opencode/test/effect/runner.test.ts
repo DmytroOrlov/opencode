@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Latch, Ref, Scope } from "effect"
+import { GenerationGate } from "@opencode-ai/core/session/generation-gate"
 import { Runner } from "@/effect/runner"
 import { it } from "../lib/effect"
 
@@ -429,6 +430,821 @@ describe("Runner", () => {
       yield* Fiber.await(sh)
       const exit = yield* Fiber.await(run)
       expect(Exit.isFailure(exit)).toBe(true)
+    }),
+  )
+
+  it.live(
+    "holds RunHandle admission through cleanup and lets joiners finish ahead of a queued writer",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const reserve = () => Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+      const refresh = () => Effect.succeed(runner)
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      const cleaned = yield* Deferred.make<void>()
+      let runs = 0
+
+      const first = yield* runner
+        .ensureRunningAdmitted(
+          Effect.sync(() => ++runs).pipe(
+            Effect.andThen(Deferred.succeed(started, undefined)),
+            Effect.andThen(Deferred.await(finish)),
+            Effect.ensuring(Deferred.succeed(cleaned, undefined)),
+            Effect.as("done"),
+          ),
+          reserve,
+          refresh,
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+
+      const writer = yield* gate.reserveExclusive
+      const writerWaiting = yield* Deferred.make<void>()
+      const writerStarted = yield* Deferred.make<void>()
+      const finishWriter = yield* Deferred.make<void>()
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* Deferred.succeed(writerWaiting, undefined)
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer was not granted")
+        expect(runner.state._tag).toBe("Idle")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* Deferred.await(finishWriter)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(writerWaiting)
+
+      const joiner = yield* runner.ensureRunningAdmitted(Effect.succeed("ignored"), reserve, refresh).pipe(Effect.forkChild)
+      // Give the joiner its deterministic scheduler turn while the run is held.
+      yield* Effect.yieldNow
+      yield* Deferred.succeed(finish, undefined)
+      expect(yield* Fiber.join(first)).toBe("done")
+      expect(yield* Fiber.join(joiner)).toBe("done")
+      yield* Deferred.await(cleaned)
+      yield* Deferred.await(writerStarted)
+      expect(runs).toBe(1)
+      yield* Deferred.succeed(finishWriter, undefined)
+      yield* Fiber.join(writerFiber)
+    }),
+  )
+
+  it.live(
+    "holds ShellHandle admission through shell cleanup",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const reserve = () => Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+      const refresh = () => Effect.succeed(runner)
+      const started = yield* Deferred.make<void>()
+      const finish = yield* Deferred.make<void>()
+      const cleaned = yield* Deferred.make<void>()
+
+      const shell = yield* runner
+        .startShellAdmitted(
+          Deferred.succeed(started, undefined)
+            .pipe(Effect.andThen(Deferred.await(finish)), Effect.ensuring(Deferred.succeed(cleaned, undefined)), Effect.as("shell")),
+          undefined,
+          reserve,
+          refresh,
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+
+      const writer = yield* gate.reserveExclusive
+      const writerStarted = yield* Deferred.make<void>()
+      const finishWriter = yield* Deferred.make<void>()
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer was not granted")
+        expect(runner.state._tag).toBe("Idle")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* Deferred.await(finishWriter)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+      expect(yield* Deferred.isDone(writerStarted)).toBeFalse()
+
+      yield* Deferred.succeed(finish, undefined)
+      expect(yield* Fiber.join(shell)).toBe("shell")
+      yield* Deferred.await(cleaned)
+      yield* Deferred.await(writerStarted)
+      yield* Deferred.succeed(finishWriter, undefined)
+      yield* Fiber.join(writerFiber)
+    }),
+  )
+
+  it.live(
+    "runs ShellThenRun admitted before a writer ahead of that writer",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const reserve = () => Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+      const refresh = () => Effect.succeed(runner)
+      const shellStarted = yield* Deferred.make<void>()
+      const finishShellWork = yield* Deferred.make<void>()
+      const runStarted = yield* Deferred.make<void>()
+      const finishRun = yield* Deferred.make<void>()
+      const requestReserved = yield* Deferred.make<void>()
+      let runs = 0
+
+      const shell = yield* runner
+        .startShellAdmitted(
+          Deferred.succeed(shellStarted, undefined).pipe(Effect.andThen(Deferred.await(finishShellWork)), Effect.as("shell")),
+          undefined,
+          reserve,
+          refresh,
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(shellStarted)
+      const reserveFollowUp = () =>
+        Effect.gen(function* () {
+          const reservation = yield* Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+          yield* Deferred.succeed(requestReserved, undefined)
+          return reservation
+        })
+      const run = yield* runner
+        .ensureRunningAdmitted(
+          Effect.sync(() => ++runs).pipe(
+            Effect.andThen(Deferred.succeed(runStarted, undefined)),
+            Effect.andThen(Deferred.await(finishRun)),
+            Effect.as("run"),
+          ),
+          reserveFollowUp,
+          refresh,
+        )
+        .pipe(Effect.forkChild)
+      // The reservation is already granted while the shell reader is active.
+      // This latch establishes that it entered the FIFO before the writer.
+      yield* Deferred.await(requestReserved)
+
+      const writer = yield* gate.reserveExclusive
+      const writerStarted = yield* Deferred.make<void>()
+      const finishWriter = yield* Deferred.make<void>()
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer was not granted")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* Deferred.await(finishWriter)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+
+      yield* Deferred.succeed(finishShellWork, undefined)
+      yield* Fiber.join(shell)
+      yield* Deferred.await(runStarted)
+      expect(yield* Deferred.isDone(writerStarted)).toBeFalse()
+      yield* Deferred.succeed(finishRun, undefined)
+      expect(yield* Fiber.join(run)).toBe("run")
+      yield* Deferred.await(writerStarted)
+      expect(runs).toBe(1)
+      yield* Deferred.succeed(finishWriter, undefined)
+      yield* Fiber.join(writerFiber)
+    }),
+  )
+
+  it.live(
+    "queues ShellThenRun behind an earlier writer and releases it when pending work is cancelled",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const reserve = () => Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+      const refresh = () => Effect.succeed(runner)
+      const shellStarted = yield* Deferred.make<void>()
+      const finishShellWork = yield* Deferred.make<void>()
+      const requestReserved = yield* Deferred.make<void>()
+      let runs = 0
+
+      const shell = yield* runner
+        .startShellAdmitted(
+          Deferred.succeed(shellStarted, undefined).pipe(Effect.andThen(Deferred.await(finishShellWork)), Effect.as("shell")),
+          undefined,
+          reserve,
+          refresh,
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(shellStarted)
+      const writer = yield* gate.reserveExclusive
+      const writerStarted = yield* Deferred.make<void>()
+      const finishWriter = yield* Deferred.make<void>()
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer was not granted")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* Deferred.await(finishWriter)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+
+      const reserveFollowUp = () =>
+        Effect.gen(function* () {
+          const reservation = yield* Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+          yield* Deferred.succeed(requestReserved, undefined)
+          return reservation
+        })
+      const run = yield* runner
+        .ensureRunningAdmitted(Effect.sync(() => ++runs).pipe(Effect.as("run")), reserveFollowUp, refresh)
+        .pipe(Effect.forkChild)
+      // The request reservation is queued behind the writer, so this latch
+      // confirms the stale Runner has observed the request without admitting it.
+      yield* Deferred.await(requestReserved)
+      expect(runner.state._tag).toBe("Shell")
+      expect(yield* Deferred.isDone(writerStarted)).toBeFalse()
+
+      yield* Fiber.interrupt(run)
+      expect(Exit.isFailure(yield* Fiber.await(run))).toBe(true)
+      yield* runner.cancel
+      yield* Deferred.await(writerStarted)
+      expect(runs).toBe(0)
+      yield* Deferred.succeed(finishWriter, undefined)
+      yield* Fiber.join(writerFiber)
+      yield* Deferred.succeed(finishShellWork, undefined)
+    }),
+  )
+
+  it.live(
+    "re-resolves the Runner after a writer before admitting Shell follow-up work",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const oldRunner = Runner.make<string>(scope)
+      const newRunner = Runner.make<string>(scope)
+      const currentRunner = yield* Ref.make(oldRunner)
+      const shellStarted = yield* Deferred.make<void>()
+      const finishShell = yield* Deferred.make<void>()
+      const requestReserved = yield* Deferred.make<void>()
+      const refreshed = yield* Deferred.make<void>()
+      const runStarted = yield* Deferred.make<void>()
+      const finishRun = yield* Deferred.make<void>()
+      const reserveShell = () => Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+      const shell = yield* oldRunner
+        .startShellAdmitted(
+          Deferred.succeed(shellStarted, undefined).pipe(Effect.andThen(Deferred.await(finishShell)), Effect.as("shell")),
+          undefined,
+          reserveShell,
+          () => Effect.succeed(oldRunner),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(shellStarted)
+
+      const writer = yield* gate.reserveExclusive
+      const writerStarted = yield* Deferred.make<void>()
+      const finishWriter = yield* Deferred.make<void>()
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer was not granted")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* Deferred.await(finishWriter)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+
+      let runs = 0
+      const reserveFollowUp = () =>
+        Effect.gen(function* () {
+          const reservation = yield* Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+          yield* Deferred.succeed(requestReserved, undefined)
+          return reservation
+        })
+      const refresh = () =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(refreshed, undefined)
+          return yield* Ref.get(currentRunner)
+        })
+      const request = yield* oldRunner
+        .ensureRunningAdmitted(
+          Effect.sync(() => ++runs).pipe(
+            Effect.andThen(Deferred.succeed(runStarted, undefined)),
+            Effect.andThen(Deferred.await(finishRun)),
+            Effect.as("run"),
+          ),
+          reserveFollowUp,
+          refresh,
+        )
+        .pipe(Effect.forkChild)
+
+      yield* Deferred.await(requestReserved)
+      expect(oldRunner.state._tag).toBe("Shell")
+      expect(yield* Deferred.isDone(refreshed)).toBe(false)
+
+      yield* Deferred.succeed(finishShell, undefined)
+      expect(yield* Fiber.join(shell)).toBe("shell")
+      yield* Deferred.await(writerStarted)
+      expect(oldRunner.state._tag).toBe("Idle")
+      yield* Ref.set(currentRunner, newRunner)
+      expect(yield* Deferred.isDone(refreshed)).toBe(false)
+      yield* Deferred.succeed(finishWriter, undefined)
+      yield* Fiber.join(writerFiber)
+
+      yield* Deferred.await(refreshed)
+      yield* Deferred.await(runStarted)
+      expect(oldRunner.state._tag).toBe("Idle")
+      expect(newRunner.state._tag).toBe("Running")
+      expect(runs).toBe(1)
+      yield* Deferred.succeed(finishRun, undefined)
+      expect(yield* Fiber.join(request)).toBe("run")
+
+      const finalWriter = yield* gate.reserveExclusive
+      yield* finalWriter.await
+      const finalLease = yield* finalWriter.transfer
+      expect(finalLease).toBeDefined()
+      yield* finalLease!.release
+    }),
+  )
+
+  it.live(
+    "releases a redundant admitted run and joins work committed before its Runner recheck",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const aAtRefresh = yield* Deferred.make<void>()
+      const allowARefresh = yield* Deferred.make<void>()
+      const aCancelled = yield* Deferred.make<void>()
+      const bStarted = yield* Deferred.make<void>()
+      const finishB = yield* Deferred.make<void>()
+      const writerAwaitEntered = yield* Deferred.make<void>()
+      const writerStarted = yield* Deferred.make<void>()
+      let aRuns = 0
+      let bRuns = 0
+      let aCancelCalls = 0
+
+      const reserveA = () =>
+        Effect.gen(function* () {
+          const actual = yield* Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+          return {
+            await: actual.await,
+            transfer: actual.transfer,
+            cancel: Effect.gen(function* () {
+              const result = yield* actual.cancel
+              aCancelCalls += 1
+              yield* Deferred.succeed(aCancelled, undefined)
+              return result
+            }),
+          } satisfies GenerationGate.Reservation
+        })
+      const reserveB = () => Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+
+      const requestA = yield* runner
+        .ensureRunningAdmitted(
+          Effect.sync(() => ++aRuns).pipe(Effect.as("A")),
+          reserveA,
+          () =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(aAtRefresh, undefined)
+              yield* Deferred.await(allowARefresh)
+              return runner
+            }),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(aAtRefresh)
+
+      const requestB = yield* runner
+        .ensureRunningAdmitted(
+          Effect.sync(() => ++bRuns).pipe(
+            Effect.andThen(Deferred.succeed(bStarted, undefined)),
+            Effect.andThen(Deferred.await(finishB)),
+            Effect.as("B"),
+          ),
+          reserveB,
+          () => Effect.succeed(runner),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(bStarted)
+      expect(runner.state._tag).toBe("Running")
+
+      const writer = yield* Effect.provideService(gate.reserveExclusive, Scope.Scope, scope)
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* Deferred.succeed(writerAwaitEntered, undefined)
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer reservation was cancelled")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(writerAwaitEntered)
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(writerStarted)).toBe(false)
+
+      yield* Deferred.succeed(allowARefresh, undefined)
+      yield* Deferred.await(aCancelled)
+      expect(aCancelCalls).toBe(1)
+      expect(aRuns).toBe(0)
+      expect(yield* Deferred.isDone(writerStarted)).toBe(false)
+
+      yield* Deferred.succeed(finishB, undefined)
+      expect(yield* Fiber.join(requestB)).toBe("B")
+      expect(yield* Fiber.join(requestA)).toBe("B")
+      yield* Deferred.await(writerStarted)
+      expect(bRuns).toBe(1)
+      yield* Fiber.join(writerFiber)
+    }),
+  )
+
+  it.live(
+    "preserves Busy and releases a shell lease when admitted work commits before ShellHandle",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const transferWon = yield* Deferred.make<void>()
+      const allowTransferReturn = yield* Deferred.make<void>()
+      const runStarted = yield* Deferred.make<void>()
+      const finishRun = yield* Deferred.make<void>()
+      const writerAwaitEntered = yield* Deferred.make<void>()
+      const writerStarted = yield* Deferred.make<void>()
+      let shellRuns = 0
+      let runCount = 0
+      let shellLeaseReleases = 0
+
+      const reserveShell = () =>
+        Effect.gen(function* () {
+          const actual = yield* Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+          return {
+            await: actual.await,
+            transfer: Effect.gen(function* () {
+              const lease = yield* actual.transfer
+              if (lease === undefined) return undefined
+              yield* Deferred.succeed(transferWon, undefined)
+              yield* Deferred.await(allowTransferReturn)
+              return {
+                release: Effect.gen(function* () {
+                  shellLeaseReleases += 1
+                  yield* lease.release
+                }),
+              }
+            }),
+            cancel: actual.cancel,
+          } satisfies GenerationGate.Reservation
+        })
+      const reserveRun = () => Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+      const shell = yield* runner
+        .startShellAdmitted(
+          Effect.sync(() => ++shellRuns).pipe(Effect.as("shell")),
+          undefined,
+          reserveShell,
+          () => Effect.succeed(runner),
+        )
+        .pipe(Effect.catchTag("RunnerBusy", () => Effect.succeed("busy" as const)), Effect.forkChild)
+      yield* Deferred.await(transferWon)
+
+      const run = yield* runner
+        .ensureRunningAdmitted(
+          Effect.sync(() => ++runCount).pipe(
+            Effect.andThen(Deferred.succeed(runStarted, undefined)),
+            Effect.andThen(Deferred.await(finishRun)),
+            Effect.as("run"),
+          ),
+          reserveRun,
+          () => Effect.succeed(runner),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(runStarted)
+      expect(runner.state._tag).toBe("Running")
+
+      const writer = yield* Effect.provideService(gate.reserveExclusive, Scope.Scope, scope)
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* Deferred.succeed(writerAwaitEntered, undefined)
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer reservation was cancelled")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(writerAwaitEntered)
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(writerStarted)).toBe(false)
+
+      yield* Deferred.succeed(allowTransferReturn, undefined)
+      expect(yield* Fiber.join(shell)).toBe("busy")
+      expect(runner.state._tag).toBe("Running")
+      expect(shellRuns).toBe(0)
+      expect(shellLeaseReleases).toBe(1)
+      expect(yield* Deferred.isDone(writerStarted)).toBe(false)
+
+      yield* Deferred.succeed(finishRun, undefined)
+      expect(yield* Fiber.join(run)).toBe("run")
+      yield* Deferred.await(writerStarted)
+      expect(runCount).toBe(1)
+      yield* Fiber.join(writerFiber)
+    }),
+  )
+
+  it.live(
+    "cancels a granted shell reservation before ShellHandle ownership without leaking a reader",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const reservationGranted = yield* Deferred.make<void>()
+      const allowShellToContinue = yield* Deferred.make<void>()
+      const writerAwaitEntered = yield* Deferred.make<void>()
+      const writerStarted = yield* Deferred.make<void>()
+      let shellRuns = 0
+      let cancellationResult: GenerationGate.CancelResult | undefined
+
+      const reserveShell = () =>
+        Effect.gen(function* () {
+          const actual = yield* Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+          return {
+            await: actual.await.pipe(
+              Effect.andThen(Deferred.succeed(reservationGranted, undefined)),
+              Effect.andThen(Deferred.await(allowShellToContinue)),
+              Effect.onInterrupt(() =>
+                actual.cancel.pipe(
+                  Effect.tap((result) => Effect.sync(() => (cancellationResult = result))),
+                  Effect.asVoid,
+                ),
+              ),
+            ),
+            transfer: actual.transfer,
+            cancel: actual.cancel,
+          } satisfies GenerationGate.Reservation
+        })
+      const shell = yield* runner
+        .startShellAdmitted(
+          Effect.sync(() => ++shellRuns).pipe(Effect.as("shell")),
+          undefined,
+          reserveShell,
+          () => Effect.succeed(runner),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(reservationGranted)
+
+      const writer = yield* Effect.provideService(gate.reserveExclusive, Scope.Scope, scope)
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* Deferred.succeed(writerAwaitEntered, undefined)
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer reservation was cancelled")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+      yield* Deferred.await(writerAwaitEntered)
+      yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(writerStarted)).toBe(false)
+
+      yield* Fiber.interrupt(shell)
+      expect(Exit.isFailure(yield* Fiber.await(shell))).toBe(true)
+      expect(cancellationResult).toBe("granted")
+      expect(shellRuns).toBe(0)
+      expect(runner.state._tag).toBe("Idle")
+      expect(runner.busy).toBe(false)
+      yield* Deferred.await(writerStarted)
+      yield* Fiber.join(writerFiber)
+    }),
+  )
+
+  it.live(
+    "StartingRun cancellation wins before Gate transfer after admission",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const shellStarted = yield* Deferred.make<void>()
+      const finishShell = yield* Deferred.make<void>()
+      const transferEntered = yield* Deferred.make<void>()
+      const allowTransfer = yield* Deferred.make<void>()
+      const cancelEntered = yield* Deferred.make<void>()
+      const runStarted = yield* Deferred.make<void>()
+      let cancelCalls = 0
+      const reserve = () => Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+      const shell = yield* runner
+        .startShellAdmitted(
+          Deferred.succeed(shellStarted, undefined).pipe(Effect.andThen(Deferred.await(finishShell)), Effect.as("shell")),
+          undefined,
+          reserve,
+          () => Effect.succeed(runner),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(shellStarted)
+
+      const requestReserved = yield* Deferred.make<void>()
+      const requestReserve = () =>
+        Effect.gen(function* () {
+          const actual = yield* Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+          const reservation: GenerationGate.Reservation = {
+            await: actual.await,
+            transfer: Effect.gen(function* () {
+              yield* Deferred.succeed(transferEntered, undefined)
+              yield* Deferred.await(allowTransfer)
+              return yield* actual.transfer
+            }),
+            cancel: actual.cancel.pipe(
+              Effect.tap(() =>
+                Effect.gen(function* () {
+                  cancelCalls += 1
+                  yield* Deferred.succeed(cancelEntered, undefined)
+                }),
+              ),
+            ),
+          }
+          yield* Deferred.succeed(requestReserved, undefined)
+          return reservation
+        })
+      let runs = 0
+      const request = yield* runner
+        .ensureRunningAdmitted(
+          Effect.sync(() => ++runs).pipe(Effect.andThen(Deferred.succeed(runStarted, undefined)), Effect.as("run")),
+          requestReserve,
+          () => Effect.succeed(runner),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(requestReserved)
+      yield* Effect.yieldNow
+      expect(runner.state._tag).toBe("ShellThenRun")
+
+      const writer = yield* gate.reserveExclusive
+      const writerStarted = yield* Deferred.make<void>()
+      expect(yield* Deferred.isDone(writerStarted)).toBe(false)
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer was not granted")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+
+      yield* Deferred.succeed(finishShell, undefined)
+      yield* Deferred.await(transferEntered)
+      const cancelFiber = yield* runner.cancel.pipe(Effect.forkChild)
+      yield* Deferred.await(cancelEntered)
+      yield* Deferred.succeed(allowTransfer, undefined)
+
+      expect(yield* Fiber.join(shell)).toBe("shell")
+      yield* Fiber.join(cancelFiber)
+      expect(Exit.isFailure(yield* Fiber.await(request))).toBe(true)
+      yield* Deferred.await(writerStarted)
+      expect(runner.state._tag).toBe("Idle")
+      expect(yield* Deferred.isDone(runStarted)).toBe(false)
+      expect(runs).toBe(0)
+      expect(cancelCalls).toBe(1)
+      yield* Fiber.join(writerFiber)
+
+      const finalReader = yield* gate.reserveShared
+      yield* finalReader.await
+      const finalLease = yield* finalReader.transfer
+      expect(finalLease).toBeDefined()
+      yield* finalLease!.release
+    }),
+  )
+
+  it.live(
+    "RunHandle owns admission when start wins before cancellation",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const started = yield* Deferred.make<void>()
+      const keepRunning = yield* Deferred.make<void>()
+      const cleanupEntered = yield* Deferred.make<void>()
+      const allowCleanup = yield* Deferred.make<void>()
+      let leaseReleases = 0
+      const reserve = () =>
+        Effect.gen(function* () {
+          const actual = yield* Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+          return {
+            await: actual.await,
+            cancel: actual.cancel,
+            transfer: actual.transfer.pipe(
+              Effect.map((lease) =>
+                lease === undefined
+                  ? undefined
+                  : {
+                      release: Effect.gen(function* () {
+                        leaseReleases += 1
+                        yield* lease.release
+                      }),
+                    },
+              ),
+            ),
+          } satisfies GenerationGate.Reservation
+        })
+      let runs = 0
+      const run = yield* runner
+        .ensureRunningAdmitted(
+          Effect.sync(() => ++runs)
+            .pipe(
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              Effect.andThen(Deferred.await(keepRunning)),
+              Effect.onInterrupt(() => Deferred.succeed(cleanupEntered, undefined).pipe(Effect.andThen(Deferred.await(allowCleanup)))),
+              Effect.as("run"),
+            ),
+          reserve,
+          () => Effect.succeed(runner),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+
+      const writer = yield* gate.reserveExclusive
+      const writerStarted = yield* Deferred.make<void>()
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer was not granted")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+
+      const cancelFiber = yield* runner.cancel.pipe(Effect.forkChild)
+      yield* Deferred.await(cleanupEntered)
+      expect(yield* Deferred.isDone(writerStarted)).toBe(false)
+      yield* Deferred.succeed(allowCleanup, undefined)
+      yield* Fiber.join(cancelFiber)
+      expect(Exit.isFailure(yield* Fiber.await(run))).toBe(true)
+      yield* Deferred.await(writerStarted)
+      expect(runs).toBe(1)
+      expect(leaseReleases).toBe(1)
+      yield* Fiber.join(writerFiber)
+    }),
+  )
+
+  it.live(
+    "StartingRun releases a transferred lease when cancellation wins before RunHandle commit",
+    Effect.gen(function* () {
+      const scope = yield* Scope.Scope
+      const gate = yield* GenerationGate.make
+      const runner = Runner.make<string>(scope)
+      const shellStarted = yield* Deferred.make<void>()
+      const finishShell = yield* Deferred.make<void>()
+      const transferWon = yield* Deferred.make<void>()
+      const allowTransferReturn = yield* Deferred.make<void>()
+      const cancelReturned = yield* Deferred.make<void>()
+      const requestReserved = yield* Deferred.make<void>()
+      let leaseReleases = 0
+      let runs = 0
+      const reserveShell = () => Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+      const shell = yield* runner
+        .startShellAdmitted(
+          Deferred.succeed(shellStarted, undefined).pipe(Effect.andThen(Deferred.await(finishShell)), Effect.as("shell")),
+          undefined,
+          reserveShell,
+          () => Effect.succeed(runner),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(shellStarted)
+
+      const requestReserve = () =>
+        Effect.gen(function* () {
+          const actual = yield* Effect.provideService(gate.reserveShared, Scope.Scope, scope)
+          yield* Deferred.succeed(requestReserved, undefined)
+          return {
+            await: actual.await,
+            transfer: Effect.gen(function* () {
+              const lease = yield* actual.transfer
+              if (lease === undefined) return undefined
+              yield* Deferred.succeed(transferWon, undefined)
+              yield* Deferred.await(allowTransferReturn)
+              return {
+                release: Effect.gen(function* () {
+                  leaseReleases += 1
+                  yield* lease.release
+                }),
+              }
+            }),
+            cancel: actual.cancel.pipe(Effect.tap(() => Deferred.succeed(cancelReturned, undefined))),
+          } satisfies GenerationGate.Reservation
+        })
+      const request = yield* runner
+        .ensureRunningAdmitted(
+          Effect.sync(() => ++runs).pipe(Effect.as("run")),
+          requestReserve,
+          () => Effect.succeed(runner),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(requestReserved)
+      yield* Effect.yieldNow
+      expect(runner.state._tag).toBe("ShellThenRun")
+
+      const writer = yield* gate.reserveExclusive
+      const writerStarted = yield* Deferred.make<void>()
+      const writerFiber = yield* Effect.gen(function* () {
+        yield* writer.await
+        const lease = yield* writer.transfer
+        if (lease === undefined) return yield* Effect.die("writer was not granted")
+        yield* Deferred.succeed(writerStarted, undefined)
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+
+      yield* Deferred.succeed(finishShell, undefined)
+      yield* Deferred.await(transferWon)
+      const cancelFiber = yield* runner.cancel.pipe(Effect.forkChild)
+      yield* Deferred.await(cancelReturned)
+      expect(yield* Deferred.isDone(writerStarted)).toBe(false)
+      yield* Deferred.succeed(allowTransferReturn, undefined)
+
+      expect(yield* Fiber.join(shell)).toBe("shell")
+      yield* Fiber.join(cancelFiber)
+      expect(Exit.isFailure(yield* Fiber.await(request))).toBe(true)
+      yield* Deferred.await(writerStarted)
+      expect(runs).toBe(0)
+      expect(leaseReleases).toBe(1)
+      expect(runner.state._tag).toBe("Idle")
+      yield* Fiber.join(writerFiber)
     }),
   )
 

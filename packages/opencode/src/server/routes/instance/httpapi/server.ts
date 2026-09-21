@@ -53,6 +53,7 @@ import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
@@ -64,6 +65,8 @@ import { PtyTicket } from "@opencode-ai/core/pty/ticket"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionV2 } from "@opencode-ai/core/session"
+import { GenerationGate } from "@opencode-ai/core/session/generation-gate"
+import { FallbackRuntimeIntent } from "@/session/fallback-runtime-intent"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { lazy } from "@/util/lazy"
@@ -204,6 +207,11 @@ type RouteRequirements =
   | HttpRouter.Request<"Requires", unknown>
   | HttpRouter.Request<"GlobalRequires", never>
 
+type CreateRoutesOptions = CorsOptions & {
+  readonly generationGate?: GenerationGate.Interface
+  readonly fallbackRuntimeIntent?: FallbackRuntimeIntent.Interface
+}
+
 const app = LayerNode.group([
   Npm.node,
   FSUtil.node,
@@ -231,6 +239,8 @@ const app = LayerNode.group([
   SessionProjector.node,
   SessionStatus.node,
   BackgroundJob.node,
+  GenerationGate.node,
+  FallbackRuntimeIntent.node,
   RuntimeFlags.node,
   EventV2Bridge.node,
   SessionRunState.node,
@@ -270,9 +280,34 @@ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
 )
 
 export function createRoutes(
-  corsOptions?: CorsOptions,
+  options?: CreateRoutesOptions,
 ): Layer.Layer<never, EffectConfig.ConfigError, RouteRequirements> {
+  const { generationGate, fallbackRuntimeIntent, ...corsOptions } = options ?? {}
+  const corsConfig = options === undefined ? undefined : corsOptions
   const locationServiceMapV2 = buildLocationServiceMap()
+  const gateReplacement = generationGate === undefined ? undefined : makeGlobalNode({
+    service: GenerationGate.Service,
+    layer: Layer.succeed(GenerationGate.Service, generationGate),
+    deps: [],
+  })
+  const fallbackRuntimeIntentReplacement =
+    fallbackRuntimeIntent === undefined
+      ? undefined
+      : makeGlobalNode({
+          service: FallbackRuntimeIntent.Service,
+          layer: Layer.succeed(FallbackRuntimeIntent.Service, fallbackRuntimeIntent),
+          deps: [],
+        })
+  const replacements: LayerNode.Replacements = [
+    ...(gateReplacement === undefined ? [] : [[GenerationGate.node, gateReplacement] as const]),
+    ...(fallbackRuntimeIntentReplacement === undefined
+      ? []
+      : [[FallbackRuntimeIntent.node, fallbackRuntimeIntentReplacement] as const]),
+  ]
+  const routeReplacements: LayerNode.Replacements = [
+    [LocationServiceMap.node, locationServiceMapV2],
+    ...replacements,
+  ]
 
   return Layer.mergeAll(
     rootApiRoutes,
@@ -288,23 +323,23 @@ export function createRoutes(
       compressionLayer,
       corsVaryFix,
       fenceLayer,
-      cors(corsOptions),
-      AppNodeBuilderV1.build(MoveSession.node, [[LocationServiceMap.node, locationServiceMapV2]]),
+      cors(corsConfig),
+      AppNodeBuilderV1.build(MoveSession.node, routeReplacements),
       HttpServer.layerServices,
     ]),
-    Layer.provide(Layer.succeed(CorsConfig)(corsOptions)),
+    Layer.provide(Layer.succeed(CorsConfig)(corsConfig)),
     Layer.provide(sessionLocationLayer),
     Layer.provide(locationLayer),
     Layer.provide(PtyEnvironment.layer),
     Layer.provide(
       AppNodeBuilderV1.build(SessionV2.node, [
-        [LocationServiceMap.node, locationServiceMapV2],
+        ...routeReplacements,
         [SessionExecution.node, SessionExecutionLocal.node],
       ]),
     ),
     Layer.provide(locationServiceMapV2),
 
-    Layer.provide(AppNodeBuilderV1.build(app)),
+    Layer.provide(AppNodeBuilderV1.build(app, replacements)),
     // Must stay last: layers provided later in this pipe build beneath earlier ones,
     // so Observability must come after every service graph. Otherwise eagerly forked
     // fibers (e.g. the ModelsDev background refresh) capture Effect's default stdout

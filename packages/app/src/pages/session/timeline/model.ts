@@ -1,4 +1,4 @@
-import type { Message, UserMessage } from "@opencode-ai/sdk/v2"
+import type { AssistantMessage, Message, UserMessage } from "@opencode-ai/sdk/v2"
 import { createMemo, createResource, onCleanup, untrack, type Accessor } from "solid-js"
 import { useServerSync } from "@/context/server-sync"
 import { useSync } from "@/context/sync"
@@ -6,6 +6,45 @@ import { same } from "@/utils/same"
 
 const emptyUserMessages: UserMessage[] = []
 const sessionFreshness = 15_000
+
+export type TurnFallbackModel = {
+  providerID: string
+  modelID: string
+  variant?: string
+}
+
+export function selectTurnFallbackModel(
+  user: UserMessage | undefined,
+  assistants: AssistantMessage[],
+): TurnFallbackModel | undefined {
+  if (!user?.model) return
+
+  let assistant: AssistantMessage | undefined
+  for (let i = assistants.length - 1; i >= 0; i--) {
+    const candidate = assistants[i]
+    if (candidate?.agent !== user.agent) continue
+    assistant = candidate
+    break
+  }
+
+  if (!assistant) return
+
+  const requestedVariant = user.model.variant ?? undefined
+  const actualVariant = assistant.variant ?? undefined
+  if (
+    user.model.providerID === assistant.providerID &&
+    user.model.modelID === assistant.modelID &&
+    requestedVariant === actualVariant
+  ) {
+    return
+  }
+
+  return {
+    providerID: assistant.providerID,
+    modelID: assistant.modelID,
+    variant: actualVariant,
+  }
+}
 
 export function createTimelineModel(input: {
   sessionID: Accessor<string | undefined>

@@ -1,8 +1,10 @@
 import { test, expect, describe, afterEach, beforeEach, spyOn } from "bun:test"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
-import { Cause, Effect, Exit, Layer, Logger, Option } from "effect"
+import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import { filesystem, httpClient } from "@opencode-ai/core/effect/app-node-platform"
+import { Cause, Effect, Exit, FileSystem, Layer, Logger, Option } from "effect"
+import { NodeFileSystem } from "@effect/platform-node"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { FetchHttpClient, HttpClient, HttpClientResponse } from "effect/unstable/http"
 import { Config } from "@/config/config"
@@ -98,6 +100,7 @@ const configLayer = (
     auth?: Layer.Layer<Auth.Service>
     account?: Layer.Layer<Account.Service>
     client?: HttpClient.HttpClient
+    fileSystem?: LayerNode.Node<FileSystem.FileSystem, never, any>
   } = {},
 ) =>
   LayerNode.compile(LayerNode.group([Config.node, FSUtil.node, Env.node, CrossSpawnSpawner.node]), [
@@ -105,7 +108,45 @@ const configLayer = (
     [Account.node, options.account ?? AccountTest.empty],
     [Npm.node, NpmTest.noop],
     [httpClient, Layer.succeed(HttpClient.HttpClient, options.client ?? unexpectedHttp)],
+    [filesystem, options.fileSystem ?? filesystem],
   ])
+
+type AtomicFsHooks = {
+  writes: Array<{ path: string; content: string }>
+  renames: Array<[string, string]>
+  removes: string[]
+  failWrite?: (path: string) => boolean
+  failRename?: (from: string, to: string) => boolean
+}
+
+const atomicFsLayer = (hooks: AtomicFsHooks) =>
+  makeGlobalNode({
+    service: FileSystem.FileSystem,
+    deps: [],
+    layer: Layer.effect(
+      FileSystem.FileSystem,
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem
+        return {
+          ...fs,
+          writeFileString: (file: string, content: string) => {
+            hooks.writes.push({ path: file, content })
+            return hooks.failWrite?.(file)
+              ? Effect.die(new Error("injected temp write failure"))
+              : fs.writeFileString(file, content)
+          },
+          rename: (from: string, to: string) => {
+            hooks.renames.push([from, to])
+            return hooks.failRename?.(from, to) ? Effect.die(new Error("injected rename failure")) : fs.rename(from, to)
+          },
+          remove: (file: string, options?: { recursive?: boolean; force?: boolean }) => {
+            hooks.removes.push(file)
+            return fs.remove(file, options)
+          },
+        }
+      }),
+    ).pipe(Layer.provideMerge(NodeFileSystem.layer)),
+  })
 
 const layer = configLayer()
 
@@ -395,6 +436,158 @@ it.effect("updates global config and omits empty shell key in jsonc", () =>
       expect(writtenConfig).not.toContain('"shell"')
       expect(parsed.shell).toBeUndefined()
       expect(parsed.model).toBe("test/model")
+    }),
+  ),
+)
+
+const atomicConfigIt = (hooks: AtomicFsHooks) => testEffect(configLayer({ fileSystem: atomicFsLayer(hooks) }))
+
+const validationHooks: AtomicFsHooks = { writes: [], renames: [], removes: [] }
+atomicConfigIt(validationHooks).effect(
+  "global config validation fails before atomic persistence mutates the target",
+  withGlobalConfig(
+    { config: { permissions: [{ action: "read", resource: "unchanged", effect: "deny" }] } },
+    ({ dir }) =>
+      Effect.gen(function* () {
+        const file = path.join(dir, "opencode.json")
+        const fs = yield* FSUtil.Service
+        const before = yield* fs.readFileString(file)
+        const exit = yield* Effect.exit(Config.use.updateGlobal({ username: "changed" }))
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(yield* fs.readFileString(file)).toBe(before)
+        expect(validationHooks.renames).toEqual([])
+        expect(validationHooks.writes.filter((item) => item.path !== file)).toEqual([])
+      }),
+  ),
+)
+
+const writeFailureHooks: AtomicFsHooks = {
+  writes: [],
+  renames: [],
+  removes: [],
+  failWrite: (file) => file.endsWith(".tmp"),
+}
+atomicConfigIt(writeFailureHooks).effect(
+  "global config temporary write failure preserves the target and attempts temp cleanup",
+  withGlobalConfig({ config: { username: "before" } }, ({ dir }) =>
+    Effect.gen(function* () {
+      const file = path.join(dir, "opencode.json")
+      const fs = yield* FSUtil.Service
+      const before = yield* fs.readFileString(file)
+      const exit = yield* Effect.exit(Config.use.updateGlobal({ username: "after" }))
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(yield* fs.readFileString(file)).toBe(before)
+      expect(writeFailureHooks.renames).toEqual([])
+      expect(writeFailureHooks.writes.some((item) => item.path.endsWith(".tmp"))).toBe(true)
+      expect(writeFailureHooks.removes.some((file) => file.endsWith(".tmp"))).toBe(true)
+    }),
+  ),
+)
+
+const renameFailureHooks: AtomicFsHooks = { writes: [], renames: [], removes: [], failRename: () => true }
+atomicConfigIt(renameFailureHooks).effect(
+  "global config rename failure preserves cache and cleans the temporary file",
+  withGlobalConfig({ config: { username: "before" } }, ({ dir }) =>
+    Effect.gen(function* () {
+      const file = path.join(dir, "opencode.json")
+      const fs = yield* FSUtil.Service
+      const before = yield* fs.readFileString(file)
+      expect((yield* Config.use.getGlobal()).username).toBe("before")
+      const exit = yield* Effect.exit(Config.use.updateGlobal({ username: "after" }))
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(yield* fs.readFileString(file)).toBe(before)
+      expect(renameFailureHooks.renames).toHaveLength(1)
+      expect(renameFailureHooks.renames[0]?.[1]).toBe(file)
+      expect(renameFailureHooks.removes.some((file) => file.endsWith(".tmp"))).toBe(true)
+      expect((yield* Config.use.getGlobal()).username).toBe("before")
+    }),
+  ),
+)
+
+const atomicCommitHooks: AtomicFsHooks = { writes: [], renames: [], removes: [] }
+atomicConfigIt(atomicCommitHooks).effect(
+  "global config atomically commits complete content before invalidating cache",
+  withGlobalConfig({ config: { username: "before" } }, ({ dir }) =>
+    Effect.gen(function* () {
+      const file = path.join(dir, "opencode.json")
+      const fs = yield* FSUtil.Service
+      if (process.platform !== "win32") yield* fs.chmod(file, 0o640)
+      expect((yield* Config.use.getGlobal()).username).toBe("before")
+      const updated = yield* Config.use.updateGlobal({ username: "after" })
+      const target = yield* fs.readFileString(file)
+      const tempWrite = atomicCommitHooks.writes.find((item) => item.path.endsWith(".tmp"))
+      expect(updated.changed).toBe(true)
+      expect(tempWrite?.content).toBe(target)
+      expect(path.dirname(tempWrite!.path)).toBe(dir)
+      expect(tempWrite!.path).not.toBe(file)
+      expect(atomicCommitHooks.renames).toHaveLength(1)
+      expect(atomicCommitHooks.renames[0]?.[0]).toBe(tempWrite!.path)
+      expect(atomicCommitHooks.renames[0]?.[1]).toBe(file)
+      if (process.platform !== "win32") expect((yield* fs.stat(file)).mode & 0o777).toBe(0o640)
+      expect((yield* Config.use.getGlobal()).username).toBe("after")
+    }),
+  ),
+)
+
+const noOpHooks: AtomicFsHooks = { writes: [], renames: [], removes: [] }
+atomicConfigIt(noOpHooks).effect(
+  "unchanged global config update does not write, rename, or invalidate",
+  withGlobalConfig({ config: { username: "same" } }, ({ dir }) =>
+    Effect.gen(function* () {
+      const file = path.join(dir, "opencode.json")
+      const fs = yield* FSUtil.Service
+      const original = JSON.stringify(schemaConfig({ username: "same" }), null, 2)
+      yield* fs.writeFileString(file, original)
+      noOpHooks.writes.length = 0
+      const before = yield* Config.use.getGlobal()
+      const result = yield* Config.use.updateGlobal({ username: "same" })
+      expect(result.changed).toBe(false)
+      expect(noOpHooks.writes).toEqual([])
+      expect(noOpHooks.renames).toEqual([])
+      yield* fs.writeFileString(file, JSON.stringify(schemaConfig({ username: "external" }), null, 2))
+      expect((yield* Config.use.getGlobal()).username).toBe(before.username)
+    }),
+  ),
+)
+
+it.effect("updates a JSONC object after the field was set to null", () =>
+  withGlobalConfig({}, ({ dir }) =>
+    Effect.gen(function* () {
+      const file = path.join(dir, "opencode.jsonc")
+      yield* FSUtil.use.writeWithDirs(
+        file,
+        `{
+  "$schema": "https://opencode.ai/config.json",
+  // preserve this comment
+  "username": "keep",
+  "fallback": {
+    "model": "mlx/qwen3.8-27b",
+    "variant": "xhigh"
+  }
+}
+`,
+      )
+
+      yield* Config.use.updateGlobal({ fallback: null })
+      const afterNull = ConfigParse.schema(
+        ConfigV1.Info,
+        ConfigParse.jsonc(yield* FSUtil.use.readFileString(file), file),
+        file,
+      )
+      expect(afterNull.fallback).toBeNull()
+
+      yield* Config.use.updateGlobal({
+        fallback: {
+          model: "opencode-go/qwen3.8-flash",
+          variant: null,
+        },
+      })
+
+      const written = yield* FSUtil.use.readFileString(file)
+      const final = ConfigParse.schema(ConfigV1.Info, ConfigParse.jsonc(written, file), file)
+      expect(final.fallback).toEqual({ model: "opencode-go/qwen3.8-flash", variant: null })
+      expect(final.username).toBe("keep")
+      expect(written).toContain("// preserve this comment")
     }),
   ),
 )

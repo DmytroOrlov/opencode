@@ -16,12 +16,13 @@ import { useSync } from "@/context/sync"
 import { useTabs } from "@/context/tabs"
 import { useProviders } from "@/hooks/use-providers"
 import { pathKey } from "@/utils/path-key"
+import { createModelPairController, type ModelPairController } from "./prompt-model-selection"
 
 export function createPromptInputController(input: {
   sessionKey: Accessor<string>
   sessionID: Accessor<string | undefined>
   queryOptions: Pick<QueryOptionsApi, "agents" | "providers">
-  model?: ModelSelection
+  model?: ModelSelection & { pair?: ModelPairController }
 }) {
   const layout = useLayout()
   const local = useLocal()
@@ -32,9 +33,11 @@ export function createPromptInputController(input: {
   const agentsQuery = createQuery(() => input.queryOptions.agents(pathKey(sdk().directory)))
   const globalProvidersQuery = createQuery(() => input.queryOptions.providers(null))
   const providersQuery = createQuery(() => input.queryOptions.providers(pathKey(sdk().directory)))
+  const selection = input.model ?? local.model
+  const pair = input.model?.pair ?? createModelPairController({ selection })
 
-  return createMemo<PromptInputControls>(() => {
-    return {
+  return createMemo(() => {
+    return ({
       agents: {
         available: sync().data.agent,
         options: local.agent.list().map((agent) => agent.name),
@@ -44,7 +47,8 @@ export function createPromptInputController(input: {
         select: local.agent.set,
       },
       model: {
-        selection: input.model ?? local.model,
+        selection,
+        pair,
         paid: providers.paid().length > 0,
         loading:
           (local.agent.visible() && agentsQuery.isLoading) ||
@@ -56,7 +60,7 @@ export function createPromptInputController(input: {
         tabs: layout.tabs(input.sessionKey),
         reviewPanel: view.reviewPanel,
       },
-    }
+    } satisfies PromptInputControls)
   })
 }
 

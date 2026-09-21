@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, spyOn } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Deferred, Effect, Fiber, Layer } from "effect"
@@ -6,6 +6,7 @@ import { InstanceRef } from "../../src/effect/instance-ref"
 import { registerDisposer } from "../../src/effect/instance-registry"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
+import { GlobalBus } from "@/bus/global"
 import { tmpdirScoped } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
@@ -243,6 +244,74 @@ describe("InstanceStore", () => {
       yield* store.load({ directory: dir2 })
       yield* store.disposeAll()
       expect(disposed).toEqual([dir1, dir2])
+    }),
+  )
+
+  it.live("disposes every selected entry after synchronous and asynchronous disposer failures", () =>
+    Effect.gen(function* () {
+      const dir1 = yield* tmpdirScoped({ git: true })
+      const dir2 = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const calls: string[] = []
+      const first = yield* store.load({ directory: dir1 })
+      const second = yield* store.load({ directory: dir2 })
+      yield* registerDisposerScoped((directory) => {
+        calls.push(`sync:${directory}`)
+        if (directory === dir1) throw new Error("sync disposer failure")
+        return Promise.resolve()
+      })
+      yield* registerDisposerScoped(async (directory) => {
+        calls.push(`reject:${directory}`)
+        if (directory === dir1) throw new Error("rejected disposer failure")
+      })
+      yield* registerDisposerScoped(async (directory) => {
+        calls.push(`later:${directory}`)
+      })
+
+      yield* store.disposeAll()
+
+      expect(calls).toContain(`later:${dir1}`)
+      expect(calls).toContain(`later:${dir2}`)
+      const fresh1 = yield* store.load({ directory: dir1 })
+      const fresh2 = yield* store.load({ directory: dir2 })
+      expect(fresh1).not.toBe(first)
+      expect(fresh2).not.toBe(second)
+    }),
+  )
+
+  it.live("evicts a selected entry when an unexpected disposed event failure occurs", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const first = yield* store.load({ directory: dir })
+      const emit = GlobalBus.emit.bind(GlobalBus)
+      const spy = spyOn(GlobalBus, "emit").mockImplementation((name, event) => {
+        if (event.payload?.type === "server.instance.disposed") throw new Error("event cleanup failure")
+        return emit(name, event)
+      })
+      yield* Effect.addFinalizer(() => Effect.sync(() => spy.mockRestore()))
+
+      yield* store.disposeAll()
+      expect(yield* store.load({ directory: dir })).not.toBe(first)
+    }),
+  )
+
+  it.live("does not evict a newer replacement while disposing the selected snapshot", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped({ git: true })
+      const store = yield* InstanceStore.Service
+      const first = yield* store.load({ directory: dir })
+      let unregister = () => {}
+      unregister = registerDisposer(async (directory) => {
+        if (directory !== dir) return
+        unregister()
+        await Effect.runPromise(Effect.provideService(store.reload({ directory }), InstanceStore.Service, store))
+      })
+      yield* Effect.addFinalizer(() => Effect.sync(unregister))
+
+      yield* store.disposeAll()
+      const replacement = yield* store.load({ directory: dir })
+      expect(replacement).not.toBe(first)
     }),
   )
 })

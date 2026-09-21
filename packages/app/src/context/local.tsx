@@ -2,7 +2,7 @@ import { createSimpleContext } from "@opencode-ai/ui/context"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { useParams } from "@solidjs/router"
 import { batch, createEffect, createMemo, startTransition } from "solid-js"
-import { createStore } from "solid-js/store"
+import { createStore, reconcile } from "solid-js/store"
 import { useModels } from "@/context/models"
 import { useSettings } from "@/context/settings"
 import { useProviders } from "@/hooks/use-providers"
@@ -16,6 +16,7 @@ import { useServerSDK } from "./server-sdk"
 import { ScopedKey, type ServerScope } from "@/utils/server-scope"
 
 export type ModelKey = { providerID: string; modelID: string; variant?: string }
+export type ModelSelectionSnapshot = { restore(): void }
 
 type State = {
   agent?: string
@@ -50,10 +51,9 @@ const migrate = (value: unknown) => {
 
 const clone = (value: State | undefined) => {
   if (!value) return
-  return {
-    ...value,
-    model: value.model ? { ...value.model } : undefined,
-  } satisfies State
+  const next = { ...value } as State
+  if (Object.hasOwn(value, "model")) next.model = value.model ? { ...value.model } : undefined
+  return next
 }
 
 export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
@@ -277,6 +277,35 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
     const recent = createMemo(() => models.recent.list().map(models.find).filter(Boolean))
 
+    const applyModel = (item: ModelKey | undefined) => {
+      setStore("last", {
+        type: "model",
+        agent: agent.current()?.name,
+        model: item ?? null,
+        variant: selected(),
+      })
+      write({ model: item })
+    }
+
+    const commitModel = (item: ModelKey, options?: { recent?: boolean }) => {
+      models.commitSelection(item, options)
+    }
+
+    const applyVariant = (value: string | undefined) => {
+      const model = current()
+      setStore("last", {
+        type: "variant",
+        agent: agent.current()?.name,
+        model: model ? { providerID: model.provider.id, modelID: model.id } : null,
+        variant: value ?? null,
+      })
+      write({ variant: value ?? null })
+    }
+
+    const commitVariant = (model: ModelKey, value: string | undefined) => {
+      models.variant.commit(model, value)
+    }
+
     const model = {
       ready: models.ready,
       current,
@@ -298,20 +327,19 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         if (!entry) return
         model.set({ providerID: entry.provider.id, modelID: entry.id })
       },
-      set(item: ModelKey | undefined, options?: { recent?: boolean }) {
-        startTransition(() =>
+      apply(item: ModelKey | undefined) {
+        return startTransition(() =>
           batch(() => {
-            setStore("last", {
-              type: "model",
-              agent: agent.current()?.name,
-              model: item ?? null,
-              variant: selected(),
-            })
-            write({ model: item })
-            if (!item) return
-            models.setVisibility(item, true)
-            if (!options?.recent) return
-            models.recent.push(item)
+            applyModel(item)
+          }),
+        )
+      },
+      commit: commitModel,
+      set(item: ModelKey | undefined, options?: { recent?: boolean }) {
+        return startTransition(() =>
+          batch(() => {
+            applyModel(item)
+            if (item) commitModel(item, options)
           }),
         )
       },
@@ -341,20 +369,22 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           if (!item?.variants) return []
           return Object.keys(item.variants)
         },
-        set(value: string | undefined) {
-          startTransition(() =>
+        apply(value: string | undefined) {
+          return startTransition(() =>
             batch(() => {
+              applyVariant(value)
+            }),
+          )
+        },
+        commit(model: ModelKey, value: string | undefined) {
+          commitVariant(model, value)
+        },
+        set(value: string | undefined) {
+          return startTransition(() =>
+            batch(() => {
+              applyVariant(value)
               const model = current()
-              setStore("last", {
-                type: "variant",
-                agent: agent.current()?.name,
-                model: model ? { providerID: model.provider.id, modelID: model.id } : null,
-                variant: value ?? null,
-              })
-              write({ variant: value ?? null })
-              if (model) {
-                models.variant.set({ providerID: model.provider.id, modelID: model.id }, value ?? undefined)
-              }
+              if (model) commitVariant({ providerID: model.provider.id, modelID: model.id }, value)
             }),
           )
         },
@@ -369,6 +399,49 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             }),
           )
         },
+      },
+      snapshot(): ModelSelectionSnapshot {
+        const session = id()
+        const target = session ? { type: "session" as const, id: session } : { type: "draft" as const }
+        const original = session ? clone(saved.session[session]) : clone(store.draft)
+        const modelPresent = !!original && Object.hasOwn(original, "model")
+        const variantPresent = !!original && Object.hasOwn(original, "variant")
+        const model = original?.model ? { ...original.model } : original?.model
+        const variant = original?.variant
+
+        const restoreOwnedFields = (current: State | undefined) => {
+          if (!current && !modelPresent && !variantPresent) return undefined
+          const next = { ...(current ?? {}) } as State
+          if (modelPresent) next.model = model ? { ...model } : undefined
+          else delete next.model
+          if (variantPresent) next.variant = variant
+          else delete next.variant
+          if (Object.keys(next).length === 0) return undefined
+          return next
+        }
+
+        return {
+          restore() {
+            if (target.type === "session") {
+              const key = handoffKey(serverSDK().scope, sdk().directory, target.id)
+              const currentSaved = saved.session[target.id]
+              if (currentSaved !== undefined) {
+                const restored = restoreOwnedFields(currentSaved)
+                setSaved("session", target.id, restored ? reconcile(restored) : undefined)
+              } else {
+                const currentHandoff = handoff.get(key)
+                if (currentHandoff !== undefined) {
+                  const restored = restoreOwnedFields(currentHandoff)
+                  if (restored) handoff.set(key, restored)
+                  else handoff.delete(key)
+                } else setSaved("session", target.id, undefined)
+              }
+            } else {
+              const restored = restoreOwnedFields(store.draft)
+              setStore("draft", restored ? reconcile(restored) : undefined)
+            }
+          },
+        }
       },
     }
 

@@ -56,6 +56,7 @@ const prompt = {
   model: {
     current: () => undefined,
     set: () => undefined,
+    snapshot: () => ({ restore: () => undefined }),
   },
   reset: () => undefined,
   set: () => undefined,

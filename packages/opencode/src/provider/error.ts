@@ -1,6 +1,7 @@
 import { APICallError } from "ai"
 import { STATUS_CODES } from "http"
 import { iife } from "@/util/iife"
+import { isRecord } from "@/util/record"
 import type { ProviderV2 } from "@opencode-ai/core/provider"
 import { isContextOverflow } from "@opencode-ai/llm"
 
@@ -180,7 +181,13 @@ export function parseAPICallError(input: { providerID: ProviderV2.ID; error: API
     }
   }
 
-  const metadata = input.error.url ? { url: input.error.url } : undefined
+  const cause = causeMetadata(input.error.cause)
+  const data = causeMetadata(input.error.data)
+  const metadata = {
+    ...(input.error.url ? { url: input.error.url } : {}),
+    ...((cause.code ?? data.code) ? { code: cause.code ?? data.code } : {}),
+    ...((cause.message ?? data.message) ? { message: cause.message ?? data.message } : {}),
+  }
   return {
     type: "api_error",
     message: m,
@@ -188,8 +195,20 @@ export function parseAPICallError(input: { providerID: ProviderV2.ID; error: API
     isRetryable: input.providerID.startsWith("openai") ? isOpenAiErrorRetryable(input.error) : input.error.isRetryable,
     responseHeaders: input.error.responseHeaders,
     responseBody: input.error.responseBody,
-    metadata,
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
   }
+}
+
+function causeMetadata(value: unknown) {
+  let current = value
+  let code: string | undefined
+  let message: string | undefined
+  for (let depth = 0; depth < 4 && isRecord(current); depth++) {
+    if (!code && typeof current.code === "string") code = current.code
+    if (!message && typeof current.message === "string") message = current.message
+    current = current.cause
+  }
+  return { code, message }
 }
 
 export * as ProviderError from "./error"
