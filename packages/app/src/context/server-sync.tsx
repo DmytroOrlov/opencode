@@ -658,9 +658,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   }
 
   const updateConfigMutation = useMutation(() => ({
-    mutationFn: (config: Config) => serverSDK.client.global.config.update({ config }),
-    onSuccess: () => {
-      bootstrap.refetch()
+    mutationFn: (input: { config: Config; options?: { signal?: AbortSignal } }) =>
+      serverSDK.client.global.config.update({ config: input.config }, input.options),
+    onSuccess: async () => {
+      await bootstrap.refetch()
       // Invalidate all provider queries so newly configured custom providers
       // appear immediately in the available provider list across all directories.
       queryClient.invalidateQueries({ queryKey: [serverSDK.scope, null, "providers"] })
@@ -669,6 +670,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       })
     },
   }))
+
+  const updateConfig = (config: Config, options?: { signal?: AbortSignal }) =>
+    updateConfigMutation.mutateAsync({ config, options })
 
   return {
     data: globalStore,
@@ -685,7 +689,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     queryOptions: queryOptionsApi,
     refreshProviders,
     // bootstrap,
-    updateConfig: updateConfigMutation.mutateAsync,
+    updateConfig,
     project: projectApi,
     session,
     homeSessions,

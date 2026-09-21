@@ -8,6 +8,8 @@ import { OpenApi } from "effect/unstable/httpapi"
 import { createServer } from "node:http"
 import { MDNS } from "./mdns"
 import { HttpApiApp } from "./routes/instance/httpapi/server"
+import { GenerationGate } from "@opencode-ai/core/session/generation-gate"
+import { FallbackRuntimeIntent } from "@/session/fallback-runtime-intent"
 import { disposeMiddleware } from "./routes/instance/httpapi/lifecycle"
 import { WebSocketTracker } from "./routes/instance/httpapi/websocket-tracker"
 import { PublicApi } from "./routes/instance/httpapi/public"
@@ -97,8 +99,13 @@ const listenEffect: (opts: ListenOptions) => Effect.Effect<EffectListener, unkno
   },
 )
 
-function listenerLayer(opts: ListenOptions, port: number) {
-  return HttpRouter.serve(HttpApiApp.createRoutes(opts), {
+function listenerLayer(
+  opts: ListenOptions,
+  port: number,
+  generationGate: GenerationGate.Interface,
+  fallbackRuntimeIntent: FallbackRuntimeIntent.Interface,
+) {
+  return HttpRouter.serve(HttpApiApp.createRoutes({ ...opts, generationGate, fallbackRuntimeIntent }), {
     middleware: disposeMiddleware,
     disableLogger: true,
     disableListenLog: true,
@@ -123,7 +130,14 @@ function startWithPortFallback(opts: ListenOptions) {
 
 function startListener(opts: ListenOptions, port: number) {
   const scope = Scope.makeUnsafe()
-  return Layer.buildWithMemoMap(listenerLayer(opts, port), Layer.makeMemoMapUnsafe(), scope).pipe(
+  return Effect.all([GenerationGate.acquireProcess(scope), FallbackRuntimeIntent.acquireProcess(scope)]).pipe(
+    Effect.flatMap(([generationGate, fallbackRuntimeIntent]) =>
+      Layer.buildWithMemoMap(
+        listenerLayer(opts, port, generationGate, fallbackRuntimeIntent),
+        Layer.makeMemoMapUnsafe(),
+        scope,
+      ),
+    ),
     Effect.provide(HttpApiApp.context),
     Effect.onError(() => Scope.close(scope, Exit.void).pipe(Effect.ignore)),
     Effect.map(

@@ -531,62 +531,312 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
   }
 })
 
+export type CompactionPairFormat = "legacy" | "new" | "malformed"
+
+export type CompactionPairInterpretation = {
+  readonly format: CompactionPairFormat
+  readonly ordinary: boolean
+  readonly published: boolean
+}
+
+function hasReadableSummaryText(parts: readonly Part[]) {
+  return parts.some((part) => part.type === "text" && part.text.trim() !== "")
+}
+
+export function interpretCompactionPair(input: {
+  readonly user: WithParts
+  readonly part: CompactionPart
+  readonly summary?: WithParts
+}): CompactionPairInterpretation {
+  const owner = input.user.info
+  if (owner.role !== "user") return { format: "malformed", ordinary: false, published: false }
+  const summary = input.summary?.info
+  const owned =
+    input.part.messageID === owner.id &&
+    input.part.sessionID === owner.sessionID &&
+    (input.summary === undefined || summary?.sessionID === owner.sessionID)
+  const summarySucceeded =
+    summary !== undefined &&
+    summary.role === "assistant" &&
+    summary.parentID === owner.id &&
+    summary.summary === true &&
+    Boolean(summary.finish) &&
+    summary.finish !== "error" &&
+    summary.error === undefined
+  const publication = input.part.publication
+
+  if (owner.origin === undefined && publication === undefined)
+    return { format: "legacy", ordinary: false, published: owned && summarySucceeded }
+  if (publication === undefined) return { format: "malformed", ordinary: false, published: false }
+  return {
+    format: "new",
+    ordinary: owner.origin === "compaction",
+    published:
+      owned &&
+      summarySucceeded &&
+      publication.state === "published" &&
+      publication.summaryID === summary.id &&
+      hasReadableSummaryText(input.summary!.parts),
+  }
+}
+
+type CompactionPairCandidate = {
+  readonly owner: WithParts
+  readonly ownerIndex: number
+  readonly part: CompactionPart
+  readonly interpretation: CompactionPairInterpretation
+  readonly boundarySummary: WithParts | undefined
+}
+
+function compactionPartOf(msg: WithParts) {
+  return msg.parts.find((item): item is CompactionPart => item.type === "compaction")
+}
+
+function isTailAnchorEligible(msg: WithParts | undefined): boolean {
+  if (msg === undefined) return false
+  const info = msg.info
+  if (info.role === "user") return info.origin === undefined && compactionPartOf(msg) === undefined
+  if (info.role === "assistant") return info.summary !== true
+  return false
+}
+
+// Shared applicability check for a recognized published pair: the optional
+// retained-tail boundary must be a genuine anchor positioned after the summary
+// and owner in newest-first raw order, otherwise the publication cannot form
+// an applicable model projection. Model-history filtering and the
+// finished-relative pending-work cutoff must agree here, so a pair that is
+// durably recognizable but has an invalid tail can neither become model
+// context nor suppress legitimate earlier pending work.
+function publishedPairApplicable(input: {
+  readonly collected: readonly WithParts[]
+  readonly indexOf: ReadonlyMap<string, number>
+  readonly ownerIndex: number
+  readonly part: CompactionPart
+  readonly summary: WithParts
+}): boolean {
+  const tailID = input.part.tail_start_id
+  if (tailID === undefined) return true
+  const tailIndex = input.indexOf.get(tailID)
+  if (tailIndex === undefined) return false
+  if (!isTailAnchorEligible(input.collected[tailIndex])) return false
+  const summaryIndex = input.indexOf.get(input.summary.info.id)
+  if (summaryIndex === undefined) return false
+  return summaryIndex < input.ownerIndex && input.ownerIndex < tailIndex
+}
+
 export function filterCompacted(msgs: Iterable<WithParts>) {
-  const result = [] as WithParts[]
-  const completed = new Set<string>()
-  let retain: MessageID | undefined
-  for (const msg of msgs) {
-    result.push(msg)
-    if (retain) {
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "user" && completed.has(msg.info.id)) {
-      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
-      if (!part) continue
-      if (!part.tail_start_id) break
-      retain = part.tail_start_id
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
-      completed.add(msg.info.parentID)
+  const collected: WithParts[] = Array.isArray(msgs) ? msgs : Array.from(msgs)
+  const indexByID = new Map<string, number>()
+  const summariesByParent = new Map<string, WithParts[]>()
+  for (let i = 0; i < collected.length; i++) {
+    const msg = collected[i]!
+    indexByID.set(msg.info.id, i)
+    if (msg.info.role !== "assistant" || !msg.info.summary) continue
+    const siblings = summariesByParent.get(msg.info.parentID)
+    if (siblings) siblings.push(msg)
+    else summariesByParent.set(msg.info.parentID, [msg])
   }
-  result.reverse()
-  const compactionIndex = result.findLastIndex(
-    (msg) =>
-      msg.info.role === "user" &&
-      msg.parts.some((item): item is CompactionPart => item.type === "compaction" && item.tail_start_id !== undefined),
-  )
-  const compaction = result[compactionIndex]
-  const part = compaction?.parts.find(
-    (item): item is CompactionPart => item.type === "compaction" && item.tail_start_id !== undefined,
-  )
-  const summaryIndex = compaction
-    ? result.findIndex(
-        (msg, index) =>
-          index > compactionIndex &&
-          msg.info.role === "assistant" &&
-          msg.info.summary &&
-          msg.info.parentID === compaction.info.id,
+
+  const pairs = new Map<string, CompactionPairCandidate>()
+  for (let i = 0; i < collected.length; i++) {
+    const msg = collected[i]!
+    if (msg.info.role !== "user") continue
+    const part = compactionPartOf(msg)
+    if (!part) continue
+    const children = summariesByParent.get(msg.info.id) ?? []
+    const publishedSummaryID = part.publication?.state === "published" ? part.publication.summaryID : undefined
+    const candidates: (WithParts | undefined)[] =
+      publishedSummaryID !== undefined
+        ? [collected[indexByID.get(publishedSummaryID) ?? -1]]
+        : children.length > 0
+          ? children
+          : [undefined]
+    let interpretation = interpretCompactionPair({ user: msg, part, summary: candidates[0] })
+    let resolved = candidates[0]
+    if (!interpretation.published) {
+      for (const candidate of candidates.slice(1)) {
+        const next = interpretCompactionPair({ user: msg, part, summary: candidate })
+        if (!next.published) continue
+        interpretation = next
+        resolved = candidate
+        break
+      }
+    }
+    pairs.set(msg.info.id, {
+      owner: msg,
+      ownerIndex: i,
+      part,
+      interpretation,
+      boundarySummary: resolved,
+    })
+  }
+
+  const isVisible = (msg: WithParts, active: CompactionPairCandidate | undefined): boolean => {
+    const info = msg.info
+    if (info.role === "user") {
+      if (compactionPartOf(msg) === undefined) return info.origin === undefined
+      const pair = pairs.get(info.id)
+      if (pair === undefined) return info.origin === undefined
+      if (pair.interpretation.format === "legacy") return !pair.interpretation.published || isApplicable(pair)
+      return active !== undefined && active.owner.info.id === info.id
+    }
+    if (info.role === "assistant" && info.summary) {
+      const parentIndex = indexByID.get(info.parentID)
+      const parent = parentIndex === undefined ? undefined : collected[parentIndex]
+      if (parent === undefined || parent.info.role !== "user") return false
+      const parentPair = pairs.get(parent.info.id)
+      if (parentPair === undefined) return false
+      if (parentPair.interpretation.format === "legacy") {
+        if (!parentPair.interpretation.published) return true
+        return isApplicable(parentPair) && parentPair.boundarySummary?.info.id === info.id
+      }
+      return (
+        active !== undefined &&
+        active.owner.info.id === parent.info.id &&
+        parentPair.interpretation.published &&
+        parentPair.boundarySummary?.info.id === info.id
       )
-    : -1
-  const tailIndex = part?.tail_start_id ? result.findIndex((msg) => msg.info.id === part.tail_start_id) : -1
-  if (tailIndex >= 0 && tailIndex < compactionIndex && summaryIndex > compactionIndex) {
-    return [
-      ...result.slice(compactionIndex, summaryIndex + 1),
-      ...result.slice(tailIndex, compactionIndex),
-      ...result.slice(summaryIndex + 1),
-    ]
+    }
+    return true
   }
-  return result
+
+  const isApplicable = (pair: CompactionPairCandidate): boolean => {
+    if (!pair.interpretation.published) return false
+    const summary = pair.boundarySummary
+    if (summary === undefined) return false
+    return publishedPairApplicable({
+      collected,
+      indexOf: indexByID,
+      ownerIndex: pair.ownerIndex,
+      part: pair.part,
+      summary,
+    })
+  }
+
+  let boundary: CompactionPairCandidate | undefined
+  for (const msg of collected) {
+    const pair = pairs.get(msg.info.id)
+    if (!pair || !isApplicable(pair)) continue
+    boundary = pair
+    break
+  }
+
+  let keepEnd = collected.length
+  if (boundary) {
+    const tailID = boundary.part.tail_start_id
+    keepEnd = tailID !== undefined ? indexByID.get(tailID)! + 1 : boundary.ownerIndex + 1
+  }
+
+  const visible = collected.slice(0, keepEnd).reverse().filter((msg) => isVisible(msg, boundary))
+
+  const active = boundary
+  const tailID = active?.part.tail_start_id
+  if (active && tailID !== undefined) {
+    const ownerIndex = visible.findIndex((msg) => msg.info.id === active.owner.info.id)
+    const summaryIndex = visible.findIndex((msg) => msg.info.id === active.boundarySummary?.info.id)
+    const tailIndex = visible.findIndex((msg) => msg.info.id === tailID)
+    if (tailIndex >= 0 && tailIndex < ownerIndex && summaryIndex > ownerIndex) {
+      return [
+        ...visible.slice(ownerIndex, summaryIndex + 1),
+        ...visible.slice(tailIndex, ownerIndex),
+        ...visible.slice(summaryIndex + 1),
+      ]
+    }
+  }
+  return visible
 }
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
   return filterCompacted(yield* stream(sessionID))
 })
+
+export function pendingWork(raw: Iterable<WithParts>) {
+  const collected: WithParts[] = Array.isArray(raw) ? raw : Array.from(raw)
+  const indexByID = new Map<string, WithParts>()
+  const positions = new Map<string, number>()
+  for (let i = 0; i < collected.length; i++) {
+    indexByID.set(collected[i]!.info.id, collected[i]!)
+    positions.set(collected[i]!.info.id, i)
+  }
+
+  // The finished-relative scheduling cutoff only advances for assistants that
+  // historical scheduling could observe: ordinary finished replies, strict
+  // legacy summaries (including terminal failures), and summaries whose pair
+  // is actually published as an applicable model projection. A
+  // completed-but-unpublished new-format summary is hidden from model history,
+  // and a published pair whose invalid tail cannot form an applicable
+  // projection is rejected by filterCompacted; neither raw finish may advance
+  // the cutoff and suppress legitimate pending work that predates it.
+  const advancesCutoff = (msg: WithParts, info: Assistant): boolean => {
+    if (!info.finish) return false
+    if (info.summary !== true) return true
+    const owner = indexByID.get(info.parentID)
+    if (owner === undefined || owner.info.role !== "user") return false
+    const part = compactionPartOf(owner)
+    if (part === undefined) return false
+    const interpretation = interpretCompactionPair({ user: owner, part, summary: msg })
+    if (interpretation.format === "legacy") return true
+    if (!interpretation.published) return false
+    const ownerIndex = positions.get(owner.info.id)
+    if (ownerIndex === undefined) return false
+    return publishedPairApplicable({ collected, indexOf: positions, ownerIndex, part, summary: msg })
+  }
+  let finished: Assistant | undefined
+  for (const msg of collected) {
+    const info = msg.info
+    if (info.role === "assistant" && advancesCutoff(msg, info) && isAfter(info, finished)) finished = info
+  }
+  const tasks: (CompactionPart | SubtaskPart)[] = []
+  for (const msg of collected) {
+    const info = msg.info
+    const origin = info.role === "user" ? info.origin : undefined
+    for (const part of msg.parts) {
+      if (part.type === "subtask") {
+        if (finished && !isAfter(info, finished)) continue
+        tasks.push(part)
+        continue
+      }
+      if (part.type !== "compaction") continue
+      if (origin === undefined && part.publication === undefined) {
+        if (finished && !isAfter(info, finished)) continue
+        tasks.push(part)
+        continue
+      }
+      if (part.publication === undefined) continue
+      if (origin !== "compaction") continue
+      if (part.publication.state !== "queued") continue
+      tasks.push(part)
+    }
+  }
+  tasks.reverse()
+  return { tasks }
+}
+
+export function compactionWorkInput(msgs: WithParts[], owner: WithParts): WithParts[] {
+  const result: WithParts[] = []
+  let placed = false
+  const placeOwner = () => {
+    if (placed) return
+    placed = true
+    result.push(owner)
+  }
+  for (const msg of msgs) {
+    if (msg.info.id === owner.info.id) {
+      placed = true
+      result.push(msg)
+      continue
+    }
+    if (!isAfter(msg.info, owner.info)) {
+      result.push(msg)
+      continue
+    }
+    const ownerChild = msg.info.role === "assistant" && msg.info.parentID === owner.info.id
+    placeOwner()
+    if (ownerChild) result.push(msg)
+  }
+  placeOwner()
+  return result
+}
 
 // filterCompacted reorders messages for model consumption
 // ([compaction-user, summary, ...retained tail..., continue-user]), so array

@@ -86,6 +86,7 @@ export const dict: Record<string, string> = {
   "ui.sessionTurn.status.makingEdits": "Modifica dei file",
   "ui.sessionTurn.status.runningCommands": "Esecuzione di comandi",
   "ui.sessionTurn.status.thinking": "Ragionamento",
+  "ui.sessionTurn.status.fallback": "Modello di riserva",
   "ui.sessionTurn.status.thinkingWithTopic": "Ragionamento - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Raccolta delle idee",
   "ui.sessionTurn.status.consideringNextSteps": "Valutazione dei prossimi passaggi",

@@ -4,6 +4,7 @@ import { Cause, Clock, Duration, Effect, Schedule } from "effect"
 import { MessageV2 } from "./message-v2"
 import { iife } from "@/util/iife"
 import { isRecord } from "@/util/record"
+import type { RecoveryDecision } from "./recovery"
 
 export type Err = ReturnType<NamedError["toObject"]>
 
@@ -34,10 +35,11 @@ const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
   /rate increased too quickly|rate limit|rate-limit|rate_limit|too many requests/i,
   /overloaded|service unavailable|service_unavailable|service-unavailable|internal error|internal_error|internal server error|server error|server_error|server-error|provider returned error|provider_returned_error|provider-returned-error/i,
-  /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout/i,
+  /terminated|fetch failed|failed to fetch|network[-_\s]error|upstream connect|connection error|connection refused|connection lost|socket connection was closed|socket hang up|reset before headers|getaddrinfo|enotfound|eai_again|econnrefused|econnreset|etimedout|cannot connect to api|was there a typo in the url or port/i,
   /^timeout$|\b(?:request|response|connection|network|stream|read) (?:timeout|timed out|time out)\b/i,
   /try your request again|retry your request|resource exhausted|resource_exhausted/i,
   /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
+  /unable to connect|cannot connect to api|was there a typo in the url or port|host unreachable|network is unreachable|network unavailable|name resolution|could not resolve|no such host|headers timed out|header timeout/i,
 ]
 
 function cap(ms: number) {
@@ -183,15 +185,24 @@ function parseJSON(value: unknown) {
 export function policy(opts: {
   provider: string
   parse: (error: unknown) => Err
-  set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
+  recovery?: (input: { error: Err; attempt: number }) => Effect.Effect<RecoveryDecision>
+  set: (input: {
+    attempt: number
+    message: string
+    action?: Retryable["action"]
+    next: number
+    statusCode?: number
+  }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
-    Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
-      const error = opts.parse(meta.input)
-      const retry = retryable(error, opts.provider)
-      if (!retry) return Cause.done(meta.attempt)
-      if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
-      return Effect.gen(function* () {
+    Effect.succeed((meta: Schedule.InputMetadata<unknown>) =>
+      Effect.gen(function* () {
+        const error = opts.parse(meta.input)
+        const retry = retryable(error, opts.provider)
+        const decision = yield* (opts.recovery?.({ error, attempt: meta.attempt }) ??
+          Effect.succeed({ type: "retry_current" as const }))
+        if (decision.type !== "retry_current" || !retry) return yield* Cause.done(meta.attempt)
+        if (meta.attempt > RETRY_MAX_RETRIES) return yield* Cause.done(meta.attempt)
         const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
         const now = yield* Clock.currentTimeMillis
         yield* opts.set({
@@ -199,10 +210,17 @@ export function policy(opts: {
           message: retry.message,
           action: retry.action,
           next: now + wait,
+          statusCode: SessionV1.APIError.isInstance(error) ? error.data.statusCode : undefined,
         })
-        return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
-      })
-    }),
+        // The backoff elapses inside the step so the refreshed recovery decision
+        // is observed immediately before the schedule permits another attempt.
+        yield* Effect.sleep(Duration.millis(wait))
+        const refreshed = yield* (opts.recovery?.({ error, attempt: meta.attempt }) ??
+          Effect.succeed({ type: "retry_current" as const }))
+        if (refreshed.type !== "retry_current") return yield* Cause.done(meta.attempt)
+        return [meta.attempt, Duration.zero] as [number, Duration.Duration]
+      }),
+    ),
   )
 }
 

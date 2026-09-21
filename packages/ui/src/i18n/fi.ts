@@ -83,6 +83,7 @@ export const dict: Record<string, string> = {
   "ui.sessionTurn.status.makingEdits": "Tehdään muokkauksia",
   "ui.sessionTurn.status.runningCommands": "Suoritetaan komentoja",
   "ui.sessionTurn.status.thinking": "Ajatellaan",
+  "ui.sessionTurn.status.fallback": "Varamalli",
   "ui.sessionTurn.status.thinkingWithTopic": "Ajatellaan - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Kootaan ajatuksia",
   "ui.sessionTurn.status.consideringNextSteps": "Harkitaan seuraavia vaiheita",

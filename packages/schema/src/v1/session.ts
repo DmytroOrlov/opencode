@@ -192,12 +192,51 @@ export const AgentPart = Schema.Struct({
 }).annotate({ identifier: "AgentPart" })
 export type AgentPart = Types.DeepMutable<Schema.Schema.Type<typeof AgentPart>>
 
+export const CompactionPublicationQueued = Schema.Struct({
+  state: Schema.Literal("queued"),
+  summaryID: Schema.optional(Schema.Never),
+}).annotate({ identifier: "CompactionPublicationQueued" })
+export type CompactionPublicationQueued = Types.DeepMutable<Schema.Schema.Type<typeof CompactionPublicationQueued>>
+
+export const CompactionPublicationPreparing = Schema.Struct({
+  state: Schema.Literal("preparing"),
+  summaryID: Schema.optional(Schema.Never),
+}).annotate({ identifier: "CompactionPublicationPreparing" })
+export type CompactionPublicationPreparing = Types.DeepMutable<Schema.Schema.Type<typeof CompactionPublicationPreparing>>
+
+export const CompactionPublicationAbandoned = Schema.Struct({
+  state: Schema.Literal("abandoned"),
+  summaryID: Schema.optional(Schema.Never),
+}).annotate({ identifier: "CompactionPublicationAbandoned" })
+export type CompactionPublicationAbandoned = Types.DeepMutable<Schema.Schema.Type<typeof CompactionPublicationAbandoned>>
+
+export const CompactionPublicationPublished = Schema.Struct({
+  state: Schema.Literal("published"),
+  summaryID: MessageID,
+}).annotate({ identifier: "CompactionPublicationPublished" })
+export type CompactionPublicationPublished = Types.DeepMutable<
+  Schema.Schema.Type<typeof CompactionPublicationPublished>
+>
+
+export const CompactionPublication = Schema.Union([
+  CompactionPublicationQueued,
+  CompactionPublicationPreparing,
+  CompactionPublicationAbandoned,
+  CompactionPublicationPublished,
+]).annotate({ discriminator: "state", identifier: "CompactionPublication" })
+export type CompactionPublication =
+  | CompactionPublicationQueued
+  | CompactionPublicationPreparing
+  | CompactionPublicationAbandoned
+  | CompactionPublicationPublished
+
 export const CompactionPart = Schema.Struct({
   ...partBase,
   type: Schema.Literal("compaction"),
   auto: Schema.Boolean,
   overflow: Schema.optional(Schema.Boolean),
   tail_start_id: Schema.optional(MessageID),
+  publication: optional(CompactionPublication),
 }).annotate({ identifier: "CompactionPart" })
 export type CompactionPart = Types.DeepMutable<Schema.Schema.Type<typeof CompactionPart>>
 
@@ -351,6 +390,7 @@ export const User = Schema.Struct({
   }),
   system: Schema.optional(Schema.String),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
+  origin: optional(Schema.String),
 }).annotate({ identifier: "UserMessage" })
 export type User = Types.DeepMutable<Schema.Schema.Type<typeof User>>
 

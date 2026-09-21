@@ -1,13 +1,10 @@
 import { ImagePreview } from "@opencode-ai/ui/image-preview"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
-import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
-import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
-import { Icon } from "@opencode-ai/ui/v2/icon"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 import { createEffect, createMemo, on, Show } from "solid-js"
-import { ModelSelectorPopoverV2 } from "@/components/dialog-select-model"
+import { ModelSelectorPopoverV2, ModelSelectorTriggerV2 } from "@/components/dialog-select-model"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
 import type { PromptInputProps } from "@/components/prompt-input/contracts"
 import { normalizePromptHistoryEntry, promptLength, type PromptHistoryComment } from "@/components/prompt-input/history"
@@ -25,8 +22,13 @@ import { usePlatform } from "@/context/platform"
 import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { createSessionTabs } from "@/pages/session/helpers"
+import type { ModelPairController } from "@/pages/session/composer/prompt-model-selection"
 import { showToast } from "@/utils/toast"
-import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
+import {
+  PromptInputV2,
+  PromptInputV2Select,
+  type PromptInputV2Suggestion,
+} from "@opencode-ai/session-ui/v2/prompt-input"
 import {
   createPromptInputV2Controller,
   createPromptInputV2State,
@@ -43,11 +45,24 @@ export type PromptInputV2ControllerProps = Omit<PromptInputProps, "class" | "sub
 export type PromptInputV2ComposerController = PromptInputV2Interaction & {
   readonly model: PromptInputProps["controls"]["model"]
 }
-
+type PromptModelItem = ReturnType<ModelPairController["primaryModels"]>[number]
 export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
   const dialog = useDialog()
   const command = useCommand()
   const language = useLanguage()
+  const pair = props.controller.model.pair!
+  const displayedFallback = pair.fallback.displayed
+  const selectedFallbackModel = pair.fallback.selected
+  const primaryModels = pair.primaryModels
+  const fallbackModels = pair.fallbackModels
+  const fallbackVariantOptions = createMemo(() => [
+    { id: "", label: language.t("common.default") },
+    ...pair.fallback.variants().map((id) => ({ id, label: id })),
+  ])
+  const selectFallbackModel = (id: string) => {
+    pair.selectFallback(id ? fallbackModels().find((model) => `${model.provider.id}/${model.id}` === id) : undefined)
+  }
+  const selectFallbackVariant = (id: string) => pair.selectFallbackVariant(id)
 
   return (
     <div class="flex flex-col gap-3">
@@ -65,13 +80,59 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
             title={language.t("command.model.choose")}
             keybind={command.keybindParts("model.choose")}
             model={props.controller.model.selection}
+            items={primaryModels}
+            onSelect={pair.selectPrimary}
             providerID={props.controller.model.selection.current()?.provider?.id}
             modelName={props.controller.model.selection.current()?.name ?? language.t("dialog.model.select.title")}
             onClose={props.controller.restoreFocus}
             onUnpaidClick={() =>
-              dialog.show(() => <DialogSelectModelUnpaidV2 model={props.controller.model.selection} />)
+              dialog.show(() => (
+                <DialogSelectModelUnpaidV2
+                  model={props.controller.model.selection}
+                  onSelect={pair.selectPrimary}
+                />
+              ))
             }
           />
+        }
+        afterVariantControl={
+          <Show when={!props.controller.model.loading}>
+            <div class="flex min-w-0 items-center gap-1">
+              <TooltipV2
+                placement="top"
+                gutter={4}
+                value={`${language.t("ui.sessionTurn.status.fallback")} · ${language.t("model.tooltip.model")}`}
+              >
+                <ModelSelectorPopoverV2
+                  items={fallbackModels}
+                  current={selectedFallbackModel}
+                  includeNone
+                  noneCurrent={() => !displayedFallback()}
+                  onSelect={(item) => selectFallbackModel(`${item.provider.id}/${item.id}`)}
+                  onSelectNone={() => pair.selectFallback(undefined)}
+                  trigger={(triggerProps) => (
+                    <ModelSelectorTriggerV2
+                      triggerProps={triggerProps}
+                      providerID={selectedFallbackModel()?.provider.id}
+                      modelName={
+                        selectedFallbackModel()?.name ?? displayedFallback()?.model ?? language.t("sound.option.none")
+                      }
+                      dataAction="prompt-fallback-model"
+                      dataControlType="popover"
+                    />
+                  )}
+                />
+              </TooltipV2>
+              <PromptInputV2Select
+                title={`${language.t("ui.sessionTurn.status.fallback")} · ${language.t("model.tooltip.reasoning")}`}
+                options={fallbackVariantOptions()}
+                current={displayedFallback()?.variant ?? ""}
+                class="!px-0"
+                disabled={!displayedFallback() || !selectedFallbackModel()}
+                onSelect={selectFallbackVariant}
+              />
+            </div>
+          </Show>
         }
       />
     </div>
@@ -397,7 +458,11 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       variant: {
         options: () => variants().map((value) => ({ id: value, label: value })),
         current: () => props.controls.model.selection.variant.current() ?? "default",
-        onSelect: (value) => props.controls.model.selection.variant.set(value === "default" ? undefined : value),
+        onSelect: (value) => {
+          const variant = value === "default" ? undefined : value
+          if (props.controls.model.pair) props.controls.model.pair.selectVariant(variant)
+          else props.controls.model.selection.variant.set(variant)
+        },
         keybind: () => command.keybindParts("model.variant.cycle"),
       },
       submit: {
@@ -474,29 +539,14 @@ function PromptInputV2ModelControl(props: {
   title: string
   keybind: string[]
   model: PromptInputV2ComposerController["model"]["selection"]
+  items?: () => PromptModelItem[]
+  onSelect?: (item: PromptModelItem) => void
   providerID?: string
   modelName: string
   onClose: () => void
   onUnpaidClick: () => void
 }) {
   const shouldAnimate = createMemo<boolean>((previous) => previous ?? props.loading)
-  const content = () => (
-    <>
-      <Show when={props.providerID}>
-        {(providerID) => (
-          <ProviderIcon
-            id={providerID()}
-            class="size-4 shrink-0 opacity-40 group-hover:opacity-100 transition-opacity duration-150"
-            style={{ "will-change": "opacity", transform: "translateZ(0)" }}
-          />
-        )}
-      </Show>
-      <span class="truncate leading-4">{props.modelName}</span>
-      <span class="-ml-0.5 -mr-1 flex shrink-0">
-        <Icon name="chevron-down" />
-      </span>
-    </>
-  )
   return (
     <Show when={!props.loading}>
       <TooltipV2
@@ -512,35 +562,29 @@ function PromptInputV2ModelControl(props: {
         <Show
           when={props.paid}
           fallback={
-            <ButtonV2
-              data-action="prompt-model"
-              data-control-type="dialog"
-              variant="ghost-muted"
-              size="normal"
-              class="min-w-0 max-w-[220px] justify-start ![font-weight:440] group !px-0"
-              classList={{ "animate-in fade-in": shouldAnimate() }}
-              style={{ height: "28px" }}
-              onClick={props.onUnpaidClick}
-            >
-              {content()}
-            </ButtonV2>
+            <ModelSelectorTriggerV2
+              triggerProps={{ onClick: props.onUnpaidClick }}
+              providerID={props.providerID}
+              modelName={props.modelName}
+              animate={shouldAnimate()}
+              dataAction="prompt-model"
+              dataControlType="dialog"
+            />
           }
         >
           <ModelSelectorPopoverV2
             model={props.model}
+            items={props.items}
+            onSelect={props.onSelect}
             trigger={(triggerProps) => (
-              <ButtonV2
-                {...triggerProps}
-                variant="ghost-muted"
-                size="normal"
-                style={{ height: "28px" }}
-                class="min-w-0 max-w-[220px] justify-start ![font-weight:440] group !px-0"
-                classList={{ "animate-in fade-in": shouldAnimate() }}
+              <ModelSelectorTriggerV2
+                triggerProps={triggerProps}
+                providerID={props.providerID}
+                modelName={props.modelName}
+                animate={shouldAnimate()}
                 data-action="prompt-model"
                 data-control-type="popover"
-              >
-                {content()}
-              </ButtonV2>
+              />
             )}
             onClose={props.onClose}
           />

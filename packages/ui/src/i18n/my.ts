@@ -85,6 +85,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "တည်းဖြတ်မှုများ ပြုလုပ်ခြင်း။",
   "ui.sessionTurn.status.runningCommands": "လုပ်ဆောင်နေသည့် အမိန့်များ",
   "ui.sessionTurn.status.thinking": "စဉ်းစားခြင်း။",
+  "ui.sessionTurn.status.fallback": "အရန်မော်ဒယ်",
   "ui.sessionTurn.status.thinkingWithTopic": "စဉ်းစားခြင်း - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "အတွေးများစုစည်းခြင်း။",
   "ui.sessionTurn.status.consideringNextSteps": "နောက်အဆင့်များကို ထည့်သွင်းစဉ်းစားခြင်း။",

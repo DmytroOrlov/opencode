@@ -42,7 +42,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  processor: Pick<
+    SessionProcessor.Handle,
+    "message" | "updateToolCall" | "completeToolCall" | "markToolExecutionStarted"
+  >
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
@@ -108,6 +111,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
               { args },
             )
+            yield* input.processor.markToolExecutionStarted(options.toolCallId)
             const result = yield* item.execute(args, ctx)
             const output = {
               ...result,
@@ -184,6 +188,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               always: permissionPatterns,
             })
 
+            yield* input.processor.markToolExecutionStarted(opts.toolCallId)
             const resources = Object.values(yield* mcp.resources(parsed.server))
             const filtered = resources
               .filter((resource) => !parsed.server || resource.client === parsed.server)
@@ -267,6 +272,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               always: permissionPatterns,
             })
 
+            yield* input.processor.markToolExecutionStarted(opts.toolCallId)
             const templates = Object.values(yield* mcp.resourceTemplates(parsed.server))
             const filtered = templates
               .filter((template) => !parsed.server || template.client === parsed.server)
@@ -347,6 +353,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               always: [`mcp:${parsed.server}:*`],
             })
 
+            yield* input.processor.markToolExecutionStarted(opts.toolCallId)
             const content = yield* mcp.readResource(parsed.server, parsed.uri)
             if (!content) throw new Error(`Failed to read MCP resource: ${parsed.server}/${parsed.uri}`)
 
@@ -406,6 +413,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           )
           const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {
             yield* ctx.ask({ permission: key, metadata: {}, patterns: ["*"], always: ["*"] })
+            yield* input.processor.markToolExecutionStarted(opts.toolCallId)
             return yield* Effect.promise(() => execute(args, opts))
           }).pipe(
             Effect.withSpan("Tool.execute", {

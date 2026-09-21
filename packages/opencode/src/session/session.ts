@@ -701,32 +701,141 @@ const layer: Layer.Layer<
         metadata: structuredClone(original.metadata),
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
-      const idMap = new Map<string, MessageID>()
       const target = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : msgs.length
+      const selected = msgs.slice(0, target < 0 ? msgs.length : target)
 
-      for (const msg of msgs.slice(0, target < 0 ? msgs.length : target)) {
-        const newID = MessageID.ascending()
-        idMap.set(msg.info.id, newID)
+      // T032: allocate every destination message ID for the entire selected
+      // subset before cloning any message or dependent part. A published
+      // compaction part's publication.summaryID references its summary
+      // forward (S comes after U), so a one-pass incremental idMap can never
+      // remap it.
+      const idMap = new Map<string, MessageID>()
+      for (const msg of selected) idMap.set(msg.info.id, MessageID.ascending())
 
+      // T032: a source owner whose successful completed summary lies outside
+      // the selected subset is a partial pair. A new-format published binding
+      // must not survive without its exact summary, and a completed legacy
+      // pair must not be reinterpreted as runnable historical pending work
+      // merely because the completed S was excluded by the cutoff.
+      const selectedIDs = new Set(idMap.keys())
+      const partialCompletedOwners = new Set<string>()
+      {
+        const summariesByParent = new Map<string, SessionV1.WithParts[]>()
+        for (const msg of msgs) {
+          if (msg.info.role !== "assistant" || !msg.info.summary) continue
+          const siblings = summariesByParent.get(msg.info.parentID)
+          if (siblings) siblings.push(msg)
+          else summariesByParent.set(msg.info.parentID, [msg])
+        }
+        for (const msg of selected) {
+          if (msg.info.role !== "user") continue
+          if (!msg.parts.some((part) => part.type === "compaction")) continue
+          const completedOutside = (summariesByParent.get(msg.info.id) ?? []).some((summary) => {
+            const info = summary.info
+            if (info.role !== "assistant") return false
+            return !selectedIDs.has(info.id) && Boolean(info.finish) && info.finish !== "error" && info.error === undefined
+          })
+          if (completedOutside) partialCompletedOwners.add(msg.info.id)
+        }
+      }
+
+      // Deletion gate D2: an assistant whose parent is not part of the fork
+      // subset has no destination parent to remap. An orphan summary is
+      // dropped instead of being cloned with a foreign source parentID or
+      // given a fabricated owner: it is already hidden from model history,
+      // current-response selection and pending-work scheduling, so cloning it
+      // would add nothing but a dangling source reference. Ordinary orphan
+      // assistants keep their conversation content (no destructive
+      // truncation) and are cloned below exactly as before.
+      const droppedOrphanSummaries = new Set<string>()
+      for (const msg of selected) {
+        if (msg.info.role !== "assistant" || msg.info.summary !== true) continue
+        if (msg.info.parentID === undefined || idMap.has(msg.info.parentID)) continue
+        droppedOrphanSummaries.add(msg.info.id)
+        idMap.delete(msg.info.id)
+      }
+
+      // Phase 1: clone destination message records under the preallocated
+      // IDs, remapping assistant parentID through the complete map.
+      for (const msg of selected) {
+        if (droppedOrphanSummaries.has(msg.info.id)) continue
+        const newID = idMap.get(msg.info.id)!
         const parentID = msg.info.role === "assistant" && msg.info.parentID ? idMap.get(msg.info.parentID) : undefined
-        const cloned = yield* updateMessage({
+        yield* updateMessage({
           ...msg.info,
           sessionID: session.id,
           id: newID,
           ...(parentID && { parentID }),
         })
+      }
 
+      // Phase 2: clone ordinary parts and summary content. Published
+      // compaction parts are deferred until their referenced summary and
+      // readable content are durable in the destination, because the
+      // projector rejects a published part whose exact pair is incomplete.
+      const deferredPublished: SessionV1.WithParts[] = []
+      for (const msg of selected) {
+        if (droppedOrphanSummaries.has(msg.info.id)) continue
+        const newID = idMap.get(msg.info.id)!
         for (const part of msg.parts) {
-          const p: SessionV1.Part = {
+          if (part.type === "compaction" && part.publication?.state === "published") {
+            deferredPublished.push(msg)
+            continue
+          }
+          const cloned: SessionV1.Part = {
             ...part,
             id: PartID.ascending(),
-            messageID: cloned.id,
+            messageID: newID,
             sessionID: session.id,
           }
-          if (p.type === "compaction" && p.tail_start_id) {
-            p.tail_start_id = idMap.get(p.tail_start_id)
+          if (cloned.type === "compaction") {
+            if (cloned.tail_start_id !== undefined) {
+              const tail = idMap.get(cloned.tail_start_id)
+              if (tail) cloned.tail_start_id = tail
+              else delete cloned.tail_start_id
+            }
+            if (cloned.publication === undefined && partialCompletedOwners.has(msg.info.id)) {
+              cloned.publication = { state: "abandoned" }
+            }
           }
-          yield* updatePart(p)
+          yield* updatePart(cloned)
+        }
+      }
+
+      // Phase 3: persist published compaction parts last, remapping every
+      // forward publication.summaryID and retained-tail reference. A pair
+      // whose summary or required tail cannot be mapped — or whose SOURCE
+      // pair no longer has complete usable durable summary evidence (for
+      // example after an authorized deletion removed the summary's last
+      // readable content) — stays explicitly abandoned instead of dangling a
+      // source-session reference, being reinterpreted as a full publication,
+      // or failing the destination's publication transition guard.
+      for (const msg of deferredPublished) {
+        const newID = idMap.get(msg.info.id)!
+        for (const part of msg.parts) {
+          if (part.type !== "compaction" || part.publication?.state !== "published") continue
+          const publishedSummaryID = part.publication.summaryID
+          const summaryID = idMap.get(publishedSummaryID)
+          const cloned: SessionV1.CompactionPart = {
+            ...part,
+            id: PartID.ascending(),
+            messageID: newID,
+            sessionID: session.id,
+          }
+          if (cloned.tail_start_id !== undefined) {
+            const tail = idMap.get(cloned.tail_start_id)
+            if (tail) cloned.tail_start_id = tail
+            else delete cloned.tail_start_id
+          }
+          const tailComplete = part.tail_start_id === undefined || cloned.tail_start_id !== undefined
+          const sourceSummary = selected.find((candidate) => candidate.info.id === publishedSummaryID)
+          const publishable =
+            summaryID !== undefined &&
+            tailComplete &&
+            sourceSummary !== undefined &&
+            MessageV2.interpretCompactionPair({ user: msg, part, summary: sourceSummary }).published
+          cloned.publication = publishable ? { state: "published", summaryID } : { state: "abandoned" }
+          yield* updatePart(cloned)
         }
       }
       return session

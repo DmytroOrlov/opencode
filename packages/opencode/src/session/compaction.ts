@@ -7,12 +7,14 @@ import { Provider } from "@/provider/provider"
 import { MessageV2 } from "./message-v2"
 import { Token } from "@/util/token"
 import { SessionProcessor } from "./processor"
+import type { ModelAttemptRef } from "./model-attempt"
+import type { FallbackResolution } from "./recovery"
 import { Agent } from "@/agent/agent"
 import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 
-import { Effect, Layer, Context } from "effect"
+import { Effect, Exit, Layer, Context, Option } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { isOverflow as overflow, usable } from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
@@ -95,20 +97,24 @@ function summaryText(message: SessionV1.WithParts) {
 }
 
 function completedCompactions(messages: SessionV1.WithParts[]) {
-  const users = new Map<MessageID, number>()
+  const users = new Map<MessageID, { msg: SessionV1.WithParts; index: number }>()
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]
     if (msg.info.role !== "user") continue
     if (!msg.parts.some((part) => part.type === "compaction")) continue
-    users.set(msg.info.id, i)
+    users.set(msg.info.id, { msg, index: i })
   }
 
   return messages.flatMap((msg, assistantIndex): CompletedCompaction[] => {
     if (msg.info.role !== "assistant") return []
-    if (!msg.info.summary || !msg.info.finish || msg.info.error) return []
-    const userIndex = users.get(msg.info.parentID)
-    if (userIndex === undefined) return []
-    return [{ userIndex, assistantIndex, summary: summaryText(msg) }]
+    const owner = users.get(msg.info.parentID)
+    if (owner === undefined) return []
+    const part = owner.msg.parts.find(
+      (item): item is SessionV1.CompactionPart => item.type === "compaction",
+    )
+    if (part === undefined) return []
+    if (!MessageV2.interpretCompactionPair({ user: owner.msg, part, summary: msg }).published) return []
+    return [{ userIndex: owner.index, assistantIndex, summary: summaryText(msg) }]
   })
 }
 
@@ -174,6 +180,7 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    resolveFallback?: (model: Provider.Model) => Effect.Effect<FallbackResolution>
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -316,19 +323,119 @@ const layer = Layer.effect(
       }
     })
 
+    // T027: verify the exact summary from durable storage before publication.
+    // The in-memory processor message and streaming buffer are never sufficient
+    // evidence; the persisted summary must still exist, belong to this session
+    // and owner, carry successful finalization with no error, and host readable
+    // durable text content.
+    const verifyPersistedSummary = Effect.fn("SessionCompaction.verifyPersistedSummary")(function* (input: {
+      sessionID: SessionID
+      ownerID: MessageID
+      summaryID: MessageID
+    }) {
+      const summary = yield* session
+        .findMessage(input.sessionID, (msg) => msg.info.id === input.summaryID)
+        .pipe(
+          Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(Option.none())),
+          Effect.map(Option.getOrUndefined),
+        )
+      if (summary === undefined) return undefined
+      const info = summary.info
+      if (info.role !== "assistant") return undefined
+      if (info.sessionID !== input.sessionID) return undefined
+      if (info.parentID !== input.ownerID) return undefined
+      if (info.summary !== true) return undefined
+      if (!info.finish || info.finish === "error" || info.error !== undefined) return undefined
+      if (!summary.parts.some((part) => part.type === "text" && part.text.trim() !== "")) return undefined
+      return info
+    })
+
+    // T026: best-effort terminal cleanup for an ordinary preparing operation.
+    // Correctness never depends on this write succeeding: an interrupted
+    // cleanup simply leaves the part in its never-published state, which is
+    // already non-authoritative and non-runnable.
+    // T026: best-effort terminal cleanup for an ordinary preparing operation.
+    // Correctness never depends on this write succeeding: an interrupted
+    // cleanup simply leaves the part in its never-published state, which is
+    // already non-authoritative and non-runnable.
+    const abandonPart = Effect.fnUntraced(function* (part: SessionV1.CompactionPart | undefined) {
+      if (part === undefined) return
+      const abandoned: SessionV1.CompactionPart = { ...part, publication: { state: "abandoned" } }
+      yield* session.updatePart(abandoned).pipe(Effect.catchDefect(() => Effect.void))
+    })
+
     const processCompaction = Effect.fn("SessionCompaction.process")(function* (input: {
       parentID: MessageID
       messages: SessionV1.WithParts[]
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      resolveFallback?: (model: Provider.Model) => Effect.Effect<FallbackResolution>
     }) {
-      const parent = input.messages.findLast((m) => m.info.id === input.parentID)
-      if (!parent || parent.info.role !== "user") {
+      // T025: the durable owner and its compaction part are re-read from
+      // persisted storage instead of trusting a stale in-memory copy.
+      const durableOwner = yield* session
+        .findMessage(input.sessionID, (msg) => msg.info.id === input.parentID)
+        .pipe(
+          Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(Option.none())),
+          Effect.map(Option.getOrUndefined),
+        )
+      if (!durableOwner || durableOwner.info.role !== "user") {
         throw new Error(`Compaction parent must be a user message: ${input.parentID}`)
       }
-      const userMessage = parent.info
-      const compactionPart = parent.parts.find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+      const userMessage = durableOwner.info
+      const foundPart = durableOwner.parts.find(
+        (part): part is SessionV1.CompactionPart => part.type === "compaction",
+      )
+
+      // T025 entry state machine: never execute recovery-preparation, unknown
+      // origins, malformed synthetic pairs, preparing, published, or abandoned
+      // work. Upgrade eligible queued and strict-legacy pending work to
+      // preparing before any summary is created or updated. A parent without
+      // a compaction part cannot be synthetic runnable work; direct calls on
+      // a genuine user without a part keep the historical partless behavior
+      // (summarization only, no publication lifecycle).
+      const origin = userMessage.origin
+      let compactionPart: SessionV1.CompactionPart | undefined
+      if (foundPart === undefined) {
+        if (origin !== undefined) return "stop" as const
+      } else {
+        compactionPart = foundPart
+        if (origin !== undefined && origin !== "compaction") return "stop" as const
+        if (origin !== undefined && compactionPart.publication === undefined) return "stop" as const
+        if (compactionPart.publication !== undefined && compactionPart.publication.state !== "queued")
+          return "stop" as const
+        if (origin === undefined && compactionPart.publication === undefined) {
+          // Strict legacy pending pair. A completed successful legacy pair is
+          // never executed or upgraded; unfinished-S and finish:"error" records
+          // keep their historical eligibility until this explicit upgrade.
+          const completed = yield* session
+            .findMessage(
+              input.sessionID,
+              (msg) =>
+                msg.info.role === "assistant" &&
+                msg.info.parentID === input.parentID &&
+                msg.info.summary === true &&
+                Boolean(msg.info.finish) &&
+                msg.info.finish !== "error" &&
+                msg.info.error === undefined,
+            )
+            .pipe(
+              Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(Option.none())),
+              Effect.map(Option.getOrUndefined),
+            )
+          if (completed !== undefined) return "stop" as const
+          compactionPart = yield* session.updatePart({
+            ...compactionPart,
+            publication: { state: "preparing" },
+          })
+        } else {
+          compactionPart = yield* session.updatePart({
+            ...compactionPart,
+            publication: { state: "preparing" },
+          })
+        }
+      }
 
       let messages = input.messages
       let replay:
@@ -359,36 +466,135 @@ const layer = Layer.effect(
       const model = agent.model
         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
         : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+      const sourceRef: ModelAttemptRef = {
+        providerID: model.providerID,
+        modelID: model.id,
+        ...((agent.model ? agent.variant : userMessage.model.variant)
+          ? { variant: agent.model ? agent.variant : userMessage.model.variant }
+          : {}),
+      }
       const cfg = yield* config.get()
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
-      const selected = yield* select({
-        messages: history.filter((_, index) => !hidden.has(index)),
-        cfg,
-        model,
-      })
+      const compactionHistory = history.filter((_, index) => !hidden.has(index))
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
         "experimental.session.compacting",
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const msgs = structuredClone(selected.head)
-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
-      const nextPrompt =
-        compacting.prompt ??
-        [
-          buildPrompt({
-            previousSummary,
-            context: [conversation],
-          }),
-          ...compacting.context,
+      const prepare = Effect.fn("SessionCompaction.prepare")(function* (candidate: Provider.Model) {
+        const selected = yield* select({ messages: compactionHistory, cfg, model: candidate })
+        const msgs = structuredClone(selected.head)
+        yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+        const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
+        const nextPrompt =
+          compacting.prompt ??
+          [
+            buildPrompt({
+              previousSummary,
+              context: [conversation],
+            }),
+            ...compacting.context,
+          ]
+            .filter(Boolean)
+            .join("\n\n")
+        const content = [
+          nextPrompt,
+          ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
         ]
           .filter(Boolean)
           .join("\n\n")
+        const request = [
+          {
+            role: "user" as const,
+            content: [{ type: "text" as const, text: content }],
+          },
+        ]
+        const tokens = Token.estimate(JSON.stringify({ system: [], messages: request, tools: {} }))
+        const budget = usable({ cfg, model: candidate, outputTokenMax: flags.outputTokenMax })
+        return { selected, request, tokens, budget }
+      })
+
+      // A zero context limit has no known ceiling; preserve dispatch without treating it as a proven fit.
+      const exceedsKnownBudget = (candidate: Provider.Model, prepared: { tokens: number; budget: number }) =>
+        candidate.limit.context !== 0 && prepared.tokens > prepared.budget
+      const capacityError = (
+        candidate: Provider.Model,
+        prepared: { tokens: number; budget: number },
+        detail?: string,
+      ) =>
+        new SessionV1.ContextOverflowError({
+          message: [
+            `Cannot safely compact with ${candidate.providerID}/${candidate.id}: estimated input is ${prepared.tokens} tokens, above its effective input budget of ${prepared.budget} tokens after output reservation.`,
+            "Conversation history was preserved. Use a compaction model with more usable context or shorten the session before retrying.",
+            detail,
+          ]
+            .filter(Boolean)
+            .join(" "),
+        })
+
+      let activeModel = model
+      let activeRef = sourceRef
+      let allowFallback = true
+      let prepared = yield* prepare(activeModel)
+      if (exceedsKnownBudget(activeModel, prepared)) {
+        const fallback = yield* input.resolveFallback?.(model) ?? Effect.succeed({ reason: "disabled" as const })
+        if (fallback.reason !== "available") {
+          const ctx = yield* InstanceState.context
+          const msg: SessionV1.Assistant = {
+            id: MessageID.ascending(),
+            role: "assistant",
+            parentID: input.parentID,
+            sessionID: input.sessionID,
+            mode: "compaction",
+            agent: "compaction",
+            variant: sourceRef.variant,
+            summary: true,
+            path: { cwd: ctx.directory, root: ctx.worktree },
+            cost: 0,
+            tokens: { output: 0, input: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            modelID: model.id,
+            providerID: model.providerID,
+            time: { created: Date.now(), completed: Date.now() },
+            finish: "error",
+            error: capacityError(model, prepared, `Fallback resolution: ${fallback.reason}.`).toObject(),
+          }
+          yield* session.updateMessage(msg)
+          yield* abandonPart(compactionPart)
+          return "stop"
+        }
+        activeModel = fallback.model
+        activeRef = fallback.ref
+        allowFallback = false
+        prepared = yield* prepare(activeModel)
+        if (exceedsKnownBudget(activeModel, prepared)) {
+          const ctx = yield* InstanceState.context
+          const msg: SessionV1.Assistant = {
+            id: MessageID.ascending(),
+            role: "assistant",
+            parentID: input.parentID,
+            sessionID: input.sessionID,
+            mode: "compaction",
+            agent: "compaction",
+            variant: activeRef.variant,
+            summary: true,
+            path: { cwd: ctx.directory, root: ctx.worktree },
+            cost: 0,
+            tokens: { output: 0, input: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+            modelID: activeModel.id,
+            providerID: activeModel.providerID,
+            time: { created: Date.now(), completed: Date.now() },
+            finish: "error",
+            error: capacityError(activeModel, prepared).toObject(),
+          }
+          yield* session.updateMessage(msg)
+          yield* abandonPart(compactionPart)
+          return "stop"
+        }
+      }
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
@@ -397,7 +603,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         mode: "compaction",
         agent: "compaction",
-        variant: userMessage.model.variant,
+        variant: activeRef.variant,
         summary: true,
         path: {
           cwd: ctx.directory,
@@ -410,42 +616,66 @@ const layer = Layer.effect(
           reasoning: 0,
           cache: { read: 0, write: 0 },
         },
-        modelID: model.id,
-        providerID: model.providerID,
+        modelID: activeModel.id,
+        providerID: activeModel.providerID,
         time: {
           created: Date.now(),
         },
       }
       yield* session.updateMessage(msg)
-      const processor = yield* processors.create({
-        assistantMessage: msg,
-        sessionID: input.sessionID,
-        model,
+      const processAttempt = Effect.fn("SessionCompaction.processAttempt")(function* (
+        candidate: Provider.Model,
+        ref: ModelAttemptRef,
+        request: typeof prepared.request,
+        allowFallback: boolean,
+      ) {
+        const processor = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: input.sessionID,
+          model: candidate,
+          ...(allowFallback && input.resolveFallback
+            ? { resolveFallback: () => input.resolveFallback!(candidate) }
+            : {}),
+        })
+        const result = yield* processor.process({
+          user: { ...userMessage, model: { providerID: ref.providerID, modelID: ref.modelID, variant: ref.variant } },
+          agent,
+          sessionID: input.sessionID,
+          tools: {},
+          system: [],
+          messages: request,
+          model: candidate,
+        })
+        return { processor, result }
       })
-      const result = yield* processor.process({
-        user: userMessage,
-        agent,
-        sessionID: input.sessionID,
-        tools: {},
-        system: [],
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: [
-                  nextPrompt,
-                  ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                ]
-                  .filter(Boolean)
-                  .join("\n\n"),
-              },
-            ],
-          },
-        ],
-        model,
-      })
+
+      let attempt = yield* processAttempt(activeModel, activeRef, prepared.request, allowFallback)
+      if (typeof attempt.result === "object" && attempt.result.type === "failover") {
+        const fallback = attempt.result.fallback
+        const fallbackPrepared = yield* prepare(fallback.model)
+        if (exceedsKnownBudget(fallback.model, fallbackPrepared)) {
+          attempt.processor.message.error = capacityError(
+            fallback.model,
+            fallbackPrepared,
+            "The primary compaction request failed and the configured fallback cannot safely accept this history.",
+          ).toObject()
+          attempt.processor.message.finish = "error"
+          attempt.processor.message.time.completed = Date.now()
+          yield* session.updateMessage(attempt.processor.message)
+          yield* abandonPart(compactionPart)
+          return "stop"
+        }
+        activeModel = fallback.model
+        activeRef = fallback.ref
+        prepared = fallbackPrepared
+        msg.providerID = activeModel.providerID
+        msg.modelID = activeModel.id
+        msg.variant = activeRef.variant
+        yield* session.updateMessage(msg)
+        attempt = yield* processAttempt(activeModel, activeRef, prepared.request, false)
+      }
+      const processor = attempt.processor
+      const result = attempt.result
 
       if (result === "compact") {
         processor.message.error = new SessionV1.ContextOverflowError({
@@ -455,16 +685,58 @@ const layer = Layer.effect(
         }).toObject()
         processor.message.finish = "error"
         yield* session.updateMessage(processor.message)
+        yield* abandonPart(compactionPart)
         return "stop"
       }
 
-      if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
-        yield* session.updatePart({
-          ...compactionPart,
-          tail_start_id: selected.tail_start_id,
-        })
+      if (typeof result === "object") {
+        yield* processor.finalizeFailure(result.error)
+        yield* abandonPart(compactionPart)
+        return "stop"
       }
 
+      if (result !== "continue") {
+        yield* abandonPart(compactionPart)
+        return result
+      }
+
+      // T027/T028: only a durably complete, successful, readable summary may
+      // be published, and only through ONE final PartUpdated that carries the
+      // exact summary binding and the finalized tail (if any) atomically.
+      // This is the sole publication linearization point; a failed verification
+      // or a rejected publication event leaves the pair unpublished.
+      if (result === "continue" && !processor.message.error && compactionPart !== undefined) {
+        const verified = yield* verifyPersistedSummary({
+          sessionID: input.sessionID,
+          ownerID: input.parentID,
+          summaryID: msg.id,
+        })
+        if (verified === undefined) {
+          yield* abandonPart(compactionPart)
+          return "stop"
+        }
+        const published = yield* session
+          .updatePart({
+            ...compactionPart,
+            tail_start_id: prepared.selected.tail_start_id,
+            publication: { state: "published", summaryID: msg.id },
+          })
+          .pipe(Effect.exit)
+        if (Exit.isFailure(published)) {
+          yield* Effect.logWarning("compaction publication rejected; leaving candidate unpublished", {
+            "session.id": input.sessionID,
+            messageID: input.parentID,
+            summaryID: msg.id,
+          })
+          yield* abandonPart(compactionPart)
+          return "stop"
+        }
+        compactionPart = published.value
+      }
+
+      // N7: ordinary autocontinue/replay and Event.Compacted run only after a
+      // successful publication; a published task is never re-executed by this
+      // loop because its part is no longer queued.
       if (result === "continue" && input.auto) {
         if (replay) {
           const original = replay.info
@@ -563,6 +835,11 @@ const layer = Layer.effect(
       auto: boolean
       overflow?: boolean
     }) {
+      // T024: the first durable U carries synthetic origin and the initial
+      // part carries queued publication metadata. U and P are separate
+      // durable events: a crash between them leaves an orphan synthetic U
+      // (never a user prompt or runnable task), and a crash after P leaves
+      // legitimate queued ordinary pending work.
       const msg = yield* session.updateMessage({
         id: MessageID.ascending(),
         role: "user",
@@ -570,6 +847,7 @@ const layer = Layer.effect(
         sessionID: input.sessionID,
         agent: input.agent,
         time: { created: Date.now() },
+        origin: "compaction",
       })
       yield* session.updatePart({
         id: PartID.ascending(),
@@ -578,6 +856,7 @@ const layer = Layer.effect(
         type: "compaction",
         auto: input.auto,
         overflow: input.overflow,
+        publication: { state: "queued" },
       })
     })
 

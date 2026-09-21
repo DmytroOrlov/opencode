@@ -6,7 +6,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option } from "effect"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -35,6 +35,7 @@ import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
+import { FallbackRuntimeIntent } from "../../src/session/fallback-runtime-intent"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -52,7 +53,7 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
 import { TestInstance } from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
-import { reply, TestLLMServer } from "../lib/llm-server"
+import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -206,6 +207,7 @@ const promptRoot = LayerNode.group([
   SystemPrompt.node,
   CrossSpawnSpawner.node,
   RuntimeFlags.node,
+  FallbackRuntimeIntent.node,
 ])
 
 function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
@@ -298,6 +300,73 @@ function providerCfg(url: string) {
           ...cfg.provider.test.options,
           baseURL: url,
         },
+      },
+    },
+  }
+}
+
+function fallbackProviderCfg(url: string) {
+  const base = providerCfg(url)
+  const fallback = {
+    ...base.provider.test,
+    id: "mlx",
+    name: "MLX",
+    models: {
+      "qwen3.8-27b": {
+        ...cfg.provider.test.models["test-model"],
+        id: "qwen3.8-27b",
+        name: "Qwen 3.8 27B",
+        reasoning: true,
+        variants: { xhigh: { reasoningEffort: "xhigh" } },
+      },
+      "qwen-fallback-test": {
+        ...cfg.provider.test.models["test-model"],
+        id: "qwen-fallback-test",
+        name: "Qwen Fallback Test",
+        reasoning: true,
+        variants: {
+          low: { reasoningEffort: "low" },
+          high: { reasoningEffort: "high" },
+        },
+      },
+    },
+  }
+  return {
+    ...providerCfg(url),
+    provider: {
+      ...base.provider,
+      mlx: fallback,
+    },
+  }
+}
+
+function fallbackWithChunkTimeoutCfg(url: string, chunkTimeout: number) {
+  const base = fallbackProviderCfg(url)
+  return {
+    ...base,
+    provider: {
+      ...base.provider,
+      test: {
+        ...base.provider.test,
+        options: { ...base.provider.test.options, chunkTimeout },
+      },
+    },
+  }
+}
+
+function fallbackRemoteDownCfg(url: string) {
+  const base = fallbackProviderCfg(url)
+  return {
+    ...base,
+    provider: {
+      ...base.provider,
+      test: {
+        ...base.provider.test,
+        options: { ...base.provider.test.options, baseURL: "http://127.0.0.1:1/v1" },
+      },
+      mlx: {
+        ...base.provider.mlx,
+        options: { ...base.provider.mlx.options, baseURL: url },
       },
     },
   }
@@ -781,6 +850,629 @@ it.instance("static loop returns assistant text through local provider", () =>
   }),
 )
 
+it.instance(
+  "fails over on the same assistant message and routes the active variant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Fallback provider",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback me" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-primary-transport",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      if (result.info.role !== "assistant") throw new Error("expected assistant message")
+      expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+      expect(result.info.modelID).toBe(ModelV2.ID.make("qwen3.8-27b"))
+      expect(result.info.variant).toBe("xhigh")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "fallback answer")).toBe(true)
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+      expect(JSON.stringify(inputs[1])).toContain("xhigh")
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "fails over immediately on a primary connectivity failure",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      const statuses: SessionStatus.Info[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+        const data = event.data as typeof SessionStatus.Event.Status.data.Type
+        if (data.sessionID === session.id) statuses.push(data.status)
+        return Effect.void
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback on network loss" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-connectivity",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("local answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      yield* off
+      expect(result.info.role).toBe("assistant")
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+      expect(JSON.stringify(inputs[1])).toContain("xhigh")
+      expect(statuses.some((status) => status.type === "retry")).toBe(false)
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "recovers from a silent primary SSE stream through the configured fallback",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => fallbackWithChunkTimeoutCfg(url, 50))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "recover from the silent SSE stream" }],
+      })
+      yield* llm.hang
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "qwen3.8-27b",
+        reply().text("fallback completed after idle timeout").stop().item(),
+      )
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      if (result.info.role !== "assistant") throw new Error("expected assistant response")
+      expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+      expect(result.info.modelID).toBe(ModelV2.ID.make("qwen3.8-27b"))
+      expect(
+        result.parts.some((part) => part.type === "text" && part.text === "fallback completed after idle timeout"),
+      ).toBe(true)
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+    }),
+  { config: fallbackWithChunkTimeoutCfg("http://localhost:1/v1", 50) },
+  10_000,
+)
+
+it.instance(
+  "does not use a fallback when explicitly disabled",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({ ...fallbackProviderCfg(url), fallback: null }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "retry primary" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "disabled-fallback",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "test-model", reply().text("primary recovered").stop().item())
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(
+        (yield* llm.inputs)
+          .filter((input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"))
+          .map((input) => input.model),
+      ).toEqual(["test-model", "test-model"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "uses the configured fallback model and variant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...fallbackProviderCfg(url),
+        fallback: { model: "mlx/qwen-fallback-test", variant: "high" },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "configured fallback" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(503, { error: { message: "primary unavailable" } }),
+      )
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "qwen-fallback-test",
+        reply().text("configured answer").stop().item(),
+      )
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+        expect(result.info.modelID).toBe(ModelV2.ID.make("qwen-fallback-test"))
+        expect(result.info.variant).toBe("high")
+      }
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          ["test-model", "qwen-fallback-test"].some((model) => model === input.model) &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen-fallback-test"])
+      expect(JSON.stringify(inputs[1])).toContain("high")
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "prefers the staged runtime fallback over the persisted one",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...fallbackProviderCfg(url),
+        fallback: { model: "mlx/qwen-fallback-test", variant: "high" },
+      }))
+      const intent = yield* FallbackRuntimeIntent.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "runtime over persisted" }],
+      })
+      yield* intent.stage({ model: "mlx/qwen3.8-27b", variant: "xhigh" })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(503, { error: { message: "primary unavailable" } }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("runtime answer").stop().item())
+      const result = yield* prompt.loop({ sessionID: session.id })
+      if (result.info.role !== "assistant") throw new Error("expected assistant message")
+      expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+      expect(result.info.modelID).toBe(ModelV2.ID.make("qwen3.8-27b"))
+      expect(result.info.variant).toBe("xhigh")
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          ["test-model", "qwen3.8-27b", "qwen-fallback-test"].includes(String(input.model)) &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  15_000,
+)
+
+it.instance(
+  "disables fallback when runtime intent explicitly clears it",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const intent = yield* FallbackRuntimeIntent.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "runtime clear" }],
+      })
+      yield* intent.stage(null)
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-runtime-clear",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "test-model", reply().text("primary recovered").stop().item())
+      const result = yield* prompt.loop({ sessionID: session.id })
+      if (result.info.role !== "assistant") throw new Error("expected assistant message")
+      const inputs = (yield* llm.inputs).filter(
+        (input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "test-model"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  15_000,
+)
+
+it.instance(
+  "dispatches the latest staged runtime fallback when an older one is superseded",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const intent = yield* FallbackRuntimeIntent.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "latest runtime fallback" }],
+      })
+      yield* intent.stage({ model: "mlx/qwen3.8-27b", variant: "xhigh" })
+      yield* intent.stage({ model: "mlx/qwen-fallback-test", variant: "low" })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(503, { error: { message: "primary unavailable" } }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen-fallback-test", reply().text("latest answer").stop().item())
+      const result = yield* prompt.loop({ sessionID: session.id })
+      if (result.info.role !== "assistant") throw new Error("expected assistant message")
+      expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+      expect(result.info.modelID).toBe(ModelV2.ID.make("qwen-fallback-test"))
+      expect(result.info.variant).toBe("low")
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          ["test-model", "qwen3.8-27b", "qwen-fallback-test"].includes(String(input.model)) &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen-fallback-test"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  15_000,
+)
+
+it.instance(
+  "keeps the accepted fallback attempt frozen when a newer intent arrives",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const intent = yield* FallbackRuntimeIntent.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      const gate = defer<void>()
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "frozen fallback" }],
+      })
+      yield* intent.stage({ model: "mlx/qwen-fallback-test", variant: "high" })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(503, { error: { message: "primary unavailable" } }),
+      )
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "qwen-fallback-test",
+        raw({
+          head: [{ id: "chatcmpl-held", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant" } }] }],
+          wait: gate.promise,
+          tail: [
+            {
+              id: "chatcmpl-held",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { content: "held fallback answer" } }],
+            },
+            {
+              id: "chatcmpl-held",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            },
+          ],
+        }),
+      )
+
+      const run = yield* prompt.loop({ sessionID: session.id }).pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        llm.inputs.pipe(
+          Effect.map((inputs) => (inputs.some((input) => input.model === "qwen-fallback-test") ? true : undefined)),
+        ),
+        "staged fallback request never reached the provider",
+      )
+      yield* intent.stage({ model: "mlx/qwen3.8-27b", variant: "xhigh" })
+      gate.resolve()
+
+      const result = yield* Fiber.join(run)
+      if (result.info.role !== "assistant") throw new Error("expected assistant message")
+      expect(result.info.modelID).toBe(ModelV2.ID.make("qwen-fallback-test"))
+      expect(result.info.variant).toBe("high")
+      expect(result.parts.some((part) => part.type === "text" && part.text === "held fallback answer")).toBe(true)
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          ["test-model", "qwen3.8-27b", "qwen-fallback-test"].includes(String(input.model)) &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen-fallback-test"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  15_000,
+)
+
+it.instance(
+  "uses configured fallback default reasoning without forcing a variant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => ({
+        ...fallbackProviderCfg(url),
+        fallback: { model: "mlx/qwen-fallback-test", variant: null },
+      }))
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "default fallback" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(503, { error: { message: "primary unavailable" } }),
+      )
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "qwen-fallback-test",
+        reply().text("default answer").stop().item(),
+      )
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") expect(result.info.variant).toBeUndefined()
+      const fallbackInput = (yield* llm.inputs).find(
+        (input) => input.model === "qwen-fallback-test" && !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(fallbackInput).toBeDefined()
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "does not substitute the legacy fallback for invalid configured fallback values",
+  () =>
+    Effect.gen(function* () {
+      const cases = [
+        { name: "invalid variant", fallback: { model: "mlx/qwen-fallback-test", variant: "missing" } },
+        { name: "inherited invalid variant", fallback: { model: "mlx/qwen-fallback-test", variant: "toString" } },
+        { name: "invalid model", fallback: { model: "mlx/does-not-exist", variant: null } },
+      ] as const
+      for (const item of cases) {
+        const { llm } = yield* useServerConfig((url) => ({ ...fallbackProviderCfg(url), fallback: item.fallback }))
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+        yield* prompt.prompt({
+          sessionID: session.id,
+          agent: "build",
+          noReply: true,
+          parts: [{ type: "text", text: item.name }],
+        })
+        yield* llm.pushMatch(
+          (hit) => hit.body.model === "test-model",
+          raw({
+            chunks: [
+              {
+                id: item.name,
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+              },
+            ],
+          }),
+        )
+        yield* llm.pushMatch((hit) => hit.body.model === "test-model", reply().text("primary recovered").stop().item())
+        yield* prompt.loop({ sessionID: session.id })
+        expect((yield* llm.inputs).filter((input) => input.model !== "test-model")).toHaveLength(0)
+      }
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "retries the fallback model without recursively failing over",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "retry fallback" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-fallback-retry-primary",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "qwen3.8-27b",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-fallback-retry-error",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback retry answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b", "qwen3.8-27b"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "does not fail over to the same provider and model with another variant",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig((url) => {
+        const base = fallbackProviderCfg(url)
+        return {
+          ...base,
+          provider: {
+            ...base.provider,
+            test: {
+              ...base.provider.test,
+              models: {
+                ...base.provider.test.models,
+                "test-model": {
+                  ...base.provider.test.models["test-model"],
+                  reasoning: true,
+                  variants: {
+                    high: { reasoningEffort: "high" },
+                    xhigh: { reasoningEffort: "xhigh" },
+                  },
+                },
+              },
+            },
+          },
+          fallback: { model: "test/test-model", variant: "xhigh" },
+        }
+      })
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        variant: "high",
+        parts: [{ type: "text", text: "same model" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(400, { error: { message: "do not recurse" } }),
+      )
+      yield* prompt.loop({ sessionID: session.id })
+      expect(
+        (yield* llm.inputs).filter(
+          (input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"),
+        ),
+      ).toHaveLength(1)
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "discards failed connectivity telemetry before local fallback telemetry starts",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackRemoteDownCfg)
+      const events = yield* EventV2Bridge.Service
+      const telemetry: { assistantMessageID?: string; done?: boolean; source?: string }[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type === SessionV1.Event.Telemetry.type) {
+          telemetry.push(event.data as { assistantMessageID?: string; done?: boolean; source?: string })
+        }
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => off)
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback telemetry" }],
+      })
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("local answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      yield* Effect.sleep("100 millis")
+      const current = telemetry.filter((item) => item.assistantMessageID === result.info.id)
+      expect(current.filter((item) => item.done === false).length).toBeGreaterThanOrEqual(2)
+      expect(current.filter((item) => item.done === true)).toHaveLength(0)
+    }),
+  { config: fallbackRemoteDownCfg("http://localhost:1/v1") },
+)
+
 it.instance("static loop consumes queued replies across turns", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
@@ -820,6 +1512,452 @@ it.instance("static loop consumes queued replies across turns", () =>
     expect(yield* llm.hits).toHaveLength(2)
     expect(yield* llm.pending).toBe(0)
   }),
+)
+
+it.instance(
+  "keeps the fallback model sticky across a tool step",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "Sticky fallback",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "use a tool" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-sticky-transport",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().tool("first", { value: "first" }).item())
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("sticky answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b", "qwen3.8-27b"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "starts a new user turn from the primary after sticky fallback",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "first turn" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-first-turn-failure",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback turn").stop().item())
+      yield* prompt.loop({ sessionID: session.id })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "second turn" }],
+      })
+      yield* llm.pushMatch((hit) => hit.body.model === "test-model", reply().text("primary turn").stop().item())
+      yield* prompt.loop({ sessionID: session.id })
+
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b", "test-model"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "fails over an HTTP 400 when fallback is available",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "do not use fallback for HTTP 400" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(400, { error: { message: "primary unavailable" } }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+        expect(result.info.error).toBeUndefined()
+      }
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "keeps retrying the primary when connectivity fails without a fallback",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "retry network failure" }],
+      })
+      yield* llm.push(
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-retry-partial",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "partial" }, finish_reason: null }],
+            },
+            {
+              id: "chatcmpl-retry-partial",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.text("primary recovered")
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("test"))
+      expect(
+        (yield* llm.inputs).filter(
+          (input) => input.model === "test-model" && !JSON.stringify(input).includes("Generate a title"),
+        ),
+      ).toHaveLength(2)
+      expect(result.parts.some((part) => part.type === "text" && part.text === "partial")).toBe(false)
+      expect(result.parts.some((part) => part.type === "text" && part.text === "primary recovered")).toBe(true)
+    }),
+  { config: providerCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "fails over HTTP 503 when fallback is available",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "retry transient HTTP failures" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(503, { error: { message: "service unavailable" } }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback recovered").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("mlx"))
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "fails over HTTP 429 before same-provider retry",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const events = yield* EventV2Bridge.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      const statuses: SessionStatus.Info[] = []
+      const off = yield* events.listen((event) => {
+        if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+        const data = event.data as typeof SessionStatus.Event.Status.data.Type
+        if (data.sessionID === session.id) statuses.push(data.status)
+        return Effect.void
+      })
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback rate limit" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        httpError(429, { error: { message: "rate limited" } }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      yield* off
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("mlx"))
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+      expect(JSON.stringify(inputs[1])).toContain("xhigh")
+      expect(statuses.some((status) => status.type === "retry")).toBe(false)
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "continues from a completed tool without replaying it after provider failure",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const registry = yield* ToolRegistry.Service
+      const { read } = yield* registry.named()
+      let executionCount = 0
+      const originalRead = read.execute
+      read.execute = (...args) => {
+        executionCount++
+        return originalRead(...args)
+      }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          read.execute = originalRead
+        }),
+      )
+      const session = yield* sessions.create({
+        title: "Tool continuation fallback",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const file = path.join(dir, "once.txt")
+      yield* writeText(file, "executed once")
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "read the file and summarize it" }],
+      })
+      yield* llm.pushMatch((hit) => hit.body.model === "test-model", reply().tool("read", { filePath: file }).item())
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-tool-failure",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback summary").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      const msgs = yield* MessageV2.filterCompactedEffect(session.id)
+      const tools = msgs.flatMap((msg) => msg.parts).filter((part) => part.type === "tool" && part.tool === "read")
+      const toolAssistant = msgs.find(
+        (msg) =>
+          msg.info.role === "assistant" &&
+          msg.parts.some((part) => part.type === "tool" && part.tool === "read" && part.state.status === "completed"),
+      )
+      const fallbackAssistant = msgs.find(
+        (msg) => msg.info.role === "assistant" && msg.info.providerID === ProviderV2.ID.make("mlx"),
+      )
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("mlx"))
+      expect(result.parts.some((part) => part.type === "text" && part.text === "fallback summary")).toBe(true)
+      expect(executionCount).toBe(1)
+      expect(tools).toHaveLength(1)
+      expect(tools[0]?.type === "tool" ? tools[0].state.status : undefined).toBe("completed")
+      expect(toolAssistant?.info.role === "assistant" ? toolAssistant.info.providerID : undefined).toBe(
+        ProviderV2.ID.make("test"),
+      )
+      expect(toolAssistant?.info.role === "assistant" ? toolAssistant.info.modelID : undefined).toBe(
+        ModelV2.ID.make("test-model"),
+      )
+      expect(fallbackAssistant?.info.role === "assistant" ? fallbackAssistant.info.providerID : undefined).toBe(
+        ProviderV2.ID.make("mlx"),
+      )
+      expect(fallbackAssistant?.info.role === "assistant" ? fallbackAssistant.info.modelID : undefined).toBe(
+        ModelV2.ID.make("qwen3.8-27b"),
+      )
+      expect(fallbackAssistant?.info.role === "assistant" ? fallbackAssistant.info.variant : undefined).toBe("xhigh")
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "test-model", "qwen3.8-27b"])
+      expect(JSON.stringify(inputs[2])).toContain("executed once")
+      expect(JSON.stringify(inputs[0])).toContain("exact model ID is test/test-model")
+      expect(JSON.stringify(inputs[2])).toContain("exact model ID is mlx/qwen3.8-27b")
+      expect(JSON.stringify(inputs[2])).not.toContain("exact model ID is test/test-model")
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+  10_000,
+)
+
+it.instance(
+  "replaces partial text before connectivity fallback",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "do not fail over after output" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-partial-connectivity",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "partial" }, finish_reason: null }],
+            },
+            {
+              id: "chatcmpl-partial-connectivity",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("fallback answer").stop().item())
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      expect(result.info.role === "assistant" ? result.info.providerID : undefined).toBe(ProviderV2.ID.make("mlx"))
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+      expect(result.parts.some((part) => part.type === "text" && part.text === "partial")).toBe(false)
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
+)
+
+it.instance(
+  "does not retry a failed fallback or fall back recursively",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(fallbackProviderCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({ permission: [{ permission: "*", pattern: "*", action: "allow" }] })
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "fallback failure" }],
+      })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-no-recursive-primary",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "qwen3.8-27b",
+        httpError(400, { error: { message: "fallback unavailable" } }),
+      )
+
+      const result = yield* prompt.loop({ sessionID: session.id })
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+        expect(result.info.modelID).toBe(ModelV2.ID.make("qwen3.8-27b"))
+        expect(result.info.error).toBeDefined()
+      }
+      const inputs = (yield* llm.inputs).filter(
+        (input) =>
+          (input.model === "test-model" || input.model === "qwen3.8-27b") &&
+          !JSON.stringify(input).includes("Generate a title"),
+      )
+      expect(inputs.map((input) => input.model)).toEqual(["test-model", "qwen3.8-27b"])
+    }),
+  { config: fallbackProviderCfg("http://localhost:1/v1") },
 )
 
 it.instance("loop continues when finish is tool-calls", () =>
@@ -2310,6 +3448,57 @@ it.instance("records aborted errors when prompt is cancelled mid-stream", () =>
   }),
 )
 
+it.instance("records an aborted fallback when prompt is cancelled", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(fallbackProviderCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({ title: "Fallback cancel regression" })
+
+    yield* llm.pushMatch(
+      (hit) => hit.body.model === "test-model" && !JSON.stringify(hit.body).includes("Generate a title"),
+      raw({
+        chunks: [
+          {
+            id: "fallback-cancel-primary",
+            object: "chat.completion.chunk",
+            choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+          },
+        ],
+      }),
+    )
+    yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().hang().item())
+
+    const fiber = yield* prompt
+      .prompt({
+        sessionID: session.id,
+        agent: "build",
+        parts: [{ type: "text", text: "Cancel fallback" }],
+      })
+      .pipe(Effect.forkChild)
+
+    yield* pollWithTimeout(
+      llm.inputs.pipe(
+        Effect.map((inputs) => (inputs.some((input) => input.model === "qwen3.8-27b") ? true : undefined)),
+      ),
+      "fallback request did not start",
+    )
+    yield* waitForBusy(session.id)
+    yield* prompt.cancel(session.id)
+
+    const exit = yield* Fiber.await(fiber)
+    expect(Exit.isSuccess(exit)).toBe(true)
+    const msgs = yield* sessions.messages({ sessionID: session.id })
+    const last = msgs.findLast((msg) => msg.info.role === "assistant")
+    expect(last?.info.role).toBe("assistant")
+    if (last?.info.role === "assistant") {
+      expect(last.info.providerID).toBe(ProviderV2.ID.make("mlx"))
+      expect(last.info.modelID).toBe(ModelV2.ID.make("qwen3.8-27b"))
+      expect(last.info.error?.name).toBe("MessageAbortedError")
+    }
+  }),
+)
+
 // Agent variant
 
 noLLMServer.instance(
@@ -2466,5 +3655,1407 @@ noLLMServer.instance(
         }
       }
     }),
+  30_000,
+)
+
+const messageIDs = (msgs: SessionV1.WithParts[]) => msgs.map((msg) => msg.info.id)
+
+type LegacySchedulingSeed = {
+  head: SessionV1.Info
+  tailUser: SessionV1.Info
+  tailAssistant: SessionV1.Info
+  c1: SessionV1.Info
+  s1: SessionV1.Info
+  c2: SessionV1.Info
+  s2: SessionV1.Info
+}
+
+const seedLegacyScheduling = Effect.fn("test.seedLegacyScheduling")(function* (
+  sessionID: SessionID,
+  finalize: "unfinished" | "failed",
+) {
+  const session = yield* Session.Service
+
+  const head = yield* session.updateMessage({
+    id: MessageID.make("msg_sched_head"),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: 100 },
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sched_head"),
+    messageID: head.id,
+    sessionID,
+    type: "text",
+    text: "head question",
+  })
+  const headReply = yield* session.updateMessage({
+    id: MessageID.make("msg_sched_head_reply"),
+    role: "assistant",
+    parentID: head.id,
+    sessionID,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: 110 },
+    finish: "stop",
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sched_head_reply"),
+    messageID: headReply.id,
+    sessionID,
+    type: "text",
+    text: "head reply",
+  })
+
+  const tailUser = yield* session.updateMessage({
+    id: MessageID.make("msg_sched_tail"),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: 160 },
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sched_tail"),
+    messageID: tailUser.id,
+    sessionID,
+    type: "text",
+    text: "tail question",
+  })
+  const tailAssistant = yield* session.updateMessage({
+    id: MessageID.make("msg_sched_tail_reply"),
+    role: "assistant",
+    parentID: tailUser.id,
+    sessionID,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: 170 },
+    finish: "stop",
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sched_tail_reply"),
+    messageID: tailAssistant.id,
+    sessionID,
+    type: "text",
+    text: "tail reply",
+  })
+
+  const c1 = yield* session.updateMessage({
+    id: MessageID.make("msg_sched_c1"),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: 200 },
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sched_c1"),
+    messageID: c1.id,
+    sessionID,
+    type: "compaction",
+    auto: true,
+    tail_start_id: tailUser.id,
+  })
+  const s1 = yield* session.updateMessage({
+    id: MessageID.make("msg_sched_s1"),
+    role: "assistant",
+    parentID: c1.id,
+    sessionID,
+    mode: "compaction",
+    agent: "compaction",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    summary: true,
+    finish: "stop",
+    time: { created: 250 },
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sched_s1"),
+    messageID: s1.id,
+    sessionID,
+    type: "text",
+    text: "summary one",
+  })
+
+  const c2 = yield* session.updateMessage({
+    id: MessageID.make("msg_sched_c2"),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: 300 },
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sched_c2"),
+    messageID: c2.id,
+    sessionID,
+    type: "compaction",
+    auto: true,
+  })
+  const s2 = yield* session.updateMessage({
+    id: MessageID.make("msg_sched_s2"),
+    role: "assistant",
+    parentID: c2.id,
+    sessionID,
+    mode: "compaction",
+    agent: "compaction",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    summary: true,
+    time: finalize === "failed" ? { created: 350, completed: 350 } : { created: 350 },
+    ...(finalize === "failed"
+      ? { finish: "error" as const, error: new SessionV1.AbortedError({ message: "compaction failed" }).toObject() }
+      : {}),
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sched_s2"),
+    messageID: s2.id,
+    sessionID,
+    type: "text",
+    text: finalize === "failed" ? "failed summary" : "partial summary",
+  })
+
+  return { head, tailUser, tailAssistant, c1, s1, c2, s2 }
+})
+
+const compactionProcessCalls: { parentID: MessageID; messages: SessionV1.WithParts[]; auto: boolean }[] = []
+
+function recordingCompactionLayer(result: "stop" | "continue" = "stop") {
+  return Layer.succeed(
+    SessionCompaction.Service,
+    SessionCompaction.Service.of({
+      isOverflow: () => Effect.succeed(false),
+      prune: () => Effect.void,
+      process: (input) =>
+        Effect.sync(() => {
+          compactionProcessCalls.push({ parentID: input.parentID, messages: input.messages, auto: input.auto })
+          return result
+        }),
+      create: () => Effect.void,
+    }),
+  )
+}
+
+function makeHttpRecordingCompaction(result: "stop" | "continue" = "stop") {
+  const root = LayerNode.group([promptRoot, testLLMServerNode])
+  return LayerNode.compile(root, [
+    [SessionSummary.node, summary],
+    [LSP.node, lsp],
+    [MCP.node, makeMcp()],
+    [RuntimeFlags.node, runtimeFlags],
+    [SessionCompaction.node, recordingCompactionLayer(result)],
+  ])
+}
+
+const recordingCompactionIt = testEffect(makeHttpRecordingCompaction())
+const recordingCompactionContinueIt = testEffect(makeHttpRecordingCompaction("continue"))
+
+recordingCompactionIt.instance(
+  "legacy pending compaction remains runnable after an unfinished legacy summary",
+  () =>
+    Effect.gen(function* () {
+      compactionProcessCalls.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ title: "Legacy pending scheduling" })
+      const seeded: LegacySchedulingSeed = yield* seedLegacyScheduling(chat.id, "unfinished")
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(compactionProcessCalls).toHaveLength(1)
+      const call = compactionProcessCalls[0]!
+      expect(call.parentID).toBe(seeded.c2.id)
+      expect(messageIDs(call.messages)).toEqual([
+        seeded.c1.id,
+        seeded.s1.id,
+        seeded.tailUser.id,
+        seeded.tailAssistant.id,
+        seeded.c2.id,
+        seeded.s2.id,
+      ])
+      expect(messageIDs(call.messages)).not.toContain(seeded.head.id)
+    }),
+  { config: cfg },
+)
+
+recordingCompactionIt.instance(
+  "a terminal failed legacy summary suppresses the legacy compaction task",
+  () =>
+    Effect.gen(function* () {
+      compactionProcessCalls.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ title: "Legacy failed scheduling" })
+      const seeded: LegacySchedulingSeed = yield* seedLegacyScheduling(chat.id, "failed")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(compactionProcessCalls).toHaveLength(0)
+      expect(result.info.id).toBe(seeded.s2.id)
+    }),
+  { config: cfg },
+)
+
+recordingCompactionIt.instance(
+  "an explicit synthetic compaction user missing publication metadata is not eligible legacy work",
+  () =>
+    Effect.gen(function* () {
+      compactionProcessCalls.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ title: "Malformed synthetic scheduling" })
+
+      const user = yield* sessions.updateMessage({
+        id: MessageID.make("msg_p3_user"),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: 100 },
+      })
+      yield* sessions.updatePart({
+        id: PartID.make("prt_p3_user"),
+        messageID: user.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "genuine question",
+      })
+      const reply = yield* sessions.updateMessage({
+        id: MessageID.make("msg_p3_reply"),
+        role: "assistant",
+        parentID: user.id,
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: 150 },
+        finish: "stop",
+      })
+      yield* sessions.updatePart({
+        id: PartID.make("prt_p3_reply"),
+        messageID: reply.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "genuine reply",
+      })
+
+      const malformed = yield* sessions.updateMessage({
+        id: MessageID.make("msg_p3_malformed"),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: 200 },
+        origin: "compaction",
+      })
+      yield* sessions.updatePart({
+        id: PartID.make("prt_p3_malformed"),
+        messageID: malformed.id,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: true,
+      })
+      const malformedSummary = yield* sessions.updateMessage({
+        id: MessageID.make("msg_p3_malformed_summary"),
+        role: "assistant",
+        parentID: malformed.id,
+        sessionID: chat.id,
+        mode: "compaction",
+        agent: "compaction",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        summary: true,
+        finish: "stop",
+        time: { created: 250 },
+      })
+      yield* sessions.updatePart({
+        id: PartID.make("prt_p3_malformed_summary"),
+        messageID: malformedSummary.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "misclassified summary",
+      })
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(compactionProcessCalls).toHaveLength(0)
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      expect(messageIDs(msgs)).toEqual([user.id, reply.id])
+      const state = MessageV2.latest(msgs)
+      expect(state.user?.id).toBe(user.id)
+      expect(state.finished?.id).toBe(reply.id)
+      expect(state.tasks).toEqual([])
+    }),
+  { config: cfg },
+)
+
+type QueuedSeed = {
+  x: SessionV1.Info
+  b: SessionV1.Info
+  u: SessionV1.Info
+  y: SessionV1.Info | undefined
+}
+
+const seedQueuedCompaction = Effect.fn("test.seedQueuedCompaction")(function* (
+  sessionID: SessionID,
+  options?: {
+    newerUser?: boolean
+    newerUserModel?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+  },
+) {
+  const session = yield* Session.Service
+  const x = yield* session.updateMessage({
+    id: MessageID.make("msg_qc_x"),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: 100 },
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_qc_x"),
+    messageID: x.id,
+    sessionID,
+    type: "text",
+    text: "question",
+  })
+  const b = yield* session.updateMessage({
+    id: MessageID.make("msg_qc_b"),
+    role: "assistant",
+    parentID: x.id,
+    sessionID,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: 110 },
+    finish: "stop",
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_qc_b"),
+    messageID: b.id,
+    sessionID,
+    type: "text",
+    text: "answer",
+  })
+  const u = yield* session.updateMessage({
+    id: MessageID.make("msg_qc_u"),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: 200 },
+    origin: "compaction",
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_qc_u"),
+    messageID: u.id,
+    sessionID,
+    type: "compaction",
+    auto: true,
+    publication: { state: "queued" },
+  })
+  let y: SessionV1.Info | undefined
+  if (options?.newerUser) {
+    y = yield* session.updateMessage({
+      id: MessageID.make("msg_qc_y"),
+      role: "user",
+      sessionID,
+      agent: "build",
+      model: options.newerUserModel ?? ref,
+      time: { created: 300 },
+    })
+    yield* session.updatePart({
+      id: PartID.make("prt_qc_y"),
+      messageID: y.id,
+      sessionID,
+      type: "text",
+      text: "newer question",
+    })
+  }
+  return { x, b, u, y }
+})
+
+recordingCompactionIt.instance(
+  "T014 compaction uses task.messageID with the projection bounded through that owner",
+  () =>
+    Effect.gen(function* () {
+      compactionProcessCalls.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ title: "Queued owner" })
+      const seeded: QueuedSeed = yield* seedQueuedCompaction(chat.id, { newerUser: true })
+      const rawBefore = JSON.stringify(yield* MessageV2.stream(chat.id))
+
+      yield* prompt.loop({ sessionID: chat.id })
+
+      expect(compactionProcessCalls).toHaveLength(1)
+      const call = compactionProcessCalls[0]!
+      expect(call.parentID).toBe(seeded.u.id)
+      expect(messageIDs(call.messages)).toEqual([seeded.x.id, seeded.b.id, seeded.u.id])
+      expect(messageIDs(call.messages)).not.toContain(seeded.y!.id)
+
+      const acceptance = (parentID: MessageID) => {
+        expect(parentID).toBe(seeded.u.id)
+      }
+      acceptance(call.parentID)
+      expect(() => acceptance(seeded.y!.id)).toThrow()
+
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      expect(messageIDs(msgs)).toContain(seeded.y!.id)
+      expect(messageIDs(msgs)).not.toContain(seeded.u.id)
+      expect(MessageV2.latest(msgs).user?.id).toBe(seeded.y!.id)
+      expect(JSON.stringify(yield* MessageV2.stream(chat.id))).toBe(rawBefore)
+    }),
+  { config: cfg },
+)
+
+recordingCompactionContinueIt.instance(
+  "T015 pending queued work runs before the completed-turn early exit and only once",
+  () =>
+    Effect.gen(function* () {
+      compactionProcessCalls.length = 0
+      const { llm } = yield* useServerConfig(providerCfg)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ title: "Finished turn then queued work" })
+      const seeded: QueuedSeed = yield* seedQueuedCompaction(chat.id)
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(compactionProcessCalls).toHaveLength(1)
+      const call = compactionProcessCalls[0]!
+      expect(call.parentID).toBe(seeded.u.id)
+      expect(messageIDs(call.messages)).toEqual([seeded.x.id, seeded.b.id, seeded.u.id])
+      expect(result.info.id).toBe(seeded.b.id)
+      expect(yield* llm.hits).toHaveLength(0)
+
+      const raw = yield* MessageV2.stream(chat.id)
+      expect(messageIDs(raw)).toContain(seeded.u.id)
+      expect(MessageV2.pendingWork(raw).tasks.map((task) => task.messageID)).toEqual([seeded.u.id])
+    }),
+  30_000,
+)
+
+recordingCompactionContinueIt.instance(
+  "T017 a newer genuine user keeps its own generation identity while queued work stays owned by U",
+  () =>
+    Effect.gen(function* () {
+      compactionProcessCalls.length = 0
+      const { llm } = yield* useServerConfig(providerCfg)
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ title: "Queued work with newer user" })
+      const seeded: QueuedSeed = yield* seedQueuedCompaction(chat.id, { newerUser: true })
+      yield* llm.text("y answer")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+
+      expect(compactionProcessCalls).toHaveLength(1)
+      const call = compactionProcessCalls[0]!
+      expect(call.parentID).toBe(seeded.u.id)
+      expect(messageIDs(call.messages)).toEqual([seeded.x.id, seeded.b.id, seeded.u.id])
+      expect(messageIDs(call.messages)).not.toContain(seeded.y!.id)
+
+      expect(result.info.role).toBe("assistant")
+      if (result.info.role === "assistant") {
+        expect(result.info.parentID).toBe(seeded.y!.id)
+        expect(result.info.finish).toBe("stop")
+      }
+      expect(yield* llm.hits).toHaveLength(1)
+
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      expect(messageIDs(msgs)).toContain(seeded.y!.id)
+      expect(messageIDs(msgs)).not.toContain(seeded.u.id)
+      expect(MessageV2.latest(msgs).user?.id).toBe(seeded.y!.id)
+
+      const raw = yield* MessageV2.stream(chat.id)
+      const pending = MessageV2.pendingWork(raw).tasks
+      expect(pending.map((task) => task.messageID)).toEqual([seeded.u.id])
+      expect(JSON.stringify(yield* MessageV2.stream(chat.id))).toBe(JSON.stringify(raw))
+    }),
+  30_000,
+)
+
+const seedGenuineExchange = Effect.fn("test.seedGenuineExchange")(function* (sessionID: SessionID) {
+  const session = yield* Session.Service
+  const x = yield* session.updateMessage({
+    id: MessageID.make("msg_sgx_x"),
+    role: "user",
+    sessionID,
+    agent: "build",
+    model: ref,
+    time: { created: 100 },
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sgx_x"),
+    messageID: x.id,
+    sessionID,
+    type: "text",
+    text: "question",
+  })
+  const b = yield* session.updateMessage({
+    id: MessageID.make("msg_sgx_b"),
+    role: "assistant",
+    parentID: x.id,
+    sessionID,
+    mode: "build",
+    agent: "build",
+    cost: 0,
+    path: { cwd: "/tmp", root: "/tmp" },
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    modelID: ref.modelID,
+    providerID: ref.providerID,
+    time: { created: 110 },
+    finish: "stop",
+  })
+  yield* session.updatePart({
+    id: PartID.make("prt_sgx_b"),
+    messageID: b.id,
+    sessionID,
+    type: "text",
+    text: "answer",
+  })
+  return { x, b }
+})
+
+type SyntheticShape = {
+  name: string
+  attach: (sessionID: SessionID) => Effect.Effect<SessionV1.Info, never, Session.Service>
+}
+
+const syntheticShapes: SyntheticShape[] = [
+  {
+    name: "orphan compaction user with no part",
+    attach: (sessionID) =>
+      Effect.gen(function* () {
+        const session = yield* Session.Service
+        return yield* session.updateMessage({
+          id: MessageID.make("msg_syn_orphan"),
+          role: "user",
+          sessionID,
+          agent: "build",
+          model: ref,
+          time: { created: 200 },
+          origin: "compaction",
+        })
+      }),
+  },
+  {
+    name: "compaction user whose part lacks publication metadata",
+    attach: (sessionID) =>
+      Effect.gen(function* () {
+        const session = yield* Session.Service
+        const u = yield* session.updateMessage({
+          id: MessageID.make("msg_syn_malformed"),
+          role: "user",
+          sessionID,
+          agent: "build",
+          model: ref,
+          time: { created: 200 },
+          origin: "compaction",
+        })
+        yield* session.updatePart({
+          id: PartID.make("prt_syn_malformed"),
+          messageID: u.id,
+          sessionID,
+          type: "compaction",
+          auto: false,
+        })
+        const s = yield* session.updateMessage({
+          id: MessageID.make("msg_syn_malformed_s"),
+          role: "assistant",
+          parentID: u.id,
+          sessionID,
+          mode: "compaction",
+          agent: "compaction",
+          cost: 0,
+          path: { cwd: "/tmp", root: "/tmp" },
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: ref.modelID,
+          providerID: ref.providerID,
+          time: { created: 210 },
+          summary: true,
+          finish: "stop",
+        })
+        yield* session.updatePart({
+          id: PartID.make("prt_syn_malformed_s"),
+          messageID: s.id,
+          sessionID,
+          type: "text",
+          text: "misclassified summary",
+        })
+        return u
+      }),
+  },
+  {
+    name: "recovery-preparation user with a queued part",
+    attach: (sessionID) =>
+      Effect.gen(function* () {
+        const session = yield* Session.Service
+        const u = yield* session.updateMessage({
+          id: MessageID.make("msg_syn_recovery"),
+          role: "user",
+          sessionID,
+          agent: "build",
+          model: ref,
+          time: { created: 200 },
+          origin: "recovery-preparation",
+        })
+        yield* session.updatePart({
+          id: PartID.make("prt_syn_recovery"),
+          messageID: u.id,
+          sessionID,
+          type: "compaction",
+          auto: false,
+          publication: { state: "queued" },
+        })
+        return u
+      }),
+  },
+  {
+    name: "unknown-origin user with a queued part",
+    attach: (sessionID) =>
+      Effect.gen(function* () {
+        const session = yield* Session.Service
+        const u = yield* session.updateMessage({
+          id: MessageID.make("msg_syn_unknown"),
+          role: "user",
+          sessionID,
+          agent: "build",
+          model: ref,
+          time: { created: 200 },
+          origin: "unknown-future-origin",
+        })
+        yield* session.updatePart({
+          id: PartID.make("prt_syn_unknown"),
+          messageID: u.id,
+          sessionID,
+          type: "compaction",
+          auto: false,
+          publication: { state: "queued" },
+        })
+        return u
+      }),
+  },
+  {
+    name: "compaction user carrying an accidental text part",
+    attach: (sessionID) =>
+      Effect.gen(function* () {
+        const session = yield* Session.Service
+        const u = yield* session.updateMessage({
+          id: MessageID.make("msg_syn_text"),
+          role: "user",
+          sessionID,
+          agent: "build",
+          model: ref,
+          time: { created: 200 },
+          origin: "compaction",
+        })
+        yield* session.updatePart({
+          id: PartID.make("prt_syn_text"),
+          messageID: u.id,
+          sessionID,
+          type: "text",
+          text: "accidental synthetic text",
+        })
+        return u
+      }),
+  },
+]
+
+for (const shape of syntheticShapes) {
+  it.instance(
+    `T016 ${shape.name} cannot start ordinary generation without an earlier genuine user`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: "Synthetic only" })
+        const synthetic = yield* shape.attach(chat.id)
+
+        const exit = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) {
+          expect(String(Cause.squash(exit.cause))).toContain("No user message found")
+        }
+        expect(yield* llm.hits).toHaveLength(0)
+        const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+        expect(messageIDs(msgs)).toEqual([])
+        expect(messageIDs(msgs)).not.toContain(synthetic.id)
+      }),
+    30_000,
+  )
+
+  it.instance(
+    `T016 ${shape.name} cannot displace an earlier genuine user's completed result`,
+    () =>
+      Effect.gen(function* () {
+        const { llm } = yield* useServerConfig(providerCfg)
+        const prompt = yield* SessionPrompt.Service
+        const sessions = yield* Session.Service
+        const chat = yield* sessions.create({ title: "Genuine then synthetic" })
+        const genuine = yield* seedGenuineExchange(chat.id)
+        const synthetic = yield* shape.attach(chat.id)
+
+        const result = yield* prompt.loop({ sessionID: chat.id })
+
+        expect(result.info.id).toBe(genuine.b.id)
+        expect(yield* llm.hits).toHaveLength(0)
+        const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+        expect(messageIDs(msgs)).toEqual([genuine.x.id, genuine.b.id])
+        expect(messageIDs(msgs)).not.toContain(synthetic.id)
+        expect(MessageV2.latest(msgs).user?.id).toBe(genuine.x.id)
+      }),
+    30_000,
+  )
+}
+
+it.instance("T018 completed-but-unpublished summary is not the current response", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Unpublished summary" })
+    const genuine = yield* seedGenuineExchange(chat.id)
+    const u2 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_unpub_u"),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: 200 },
+      origin: "compaction",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_unpub_u"),
+      messageID: u2.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: false,
+      publication: { state: "preparing" },
+    })
+    const s2 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_unpub_s"),
+      role: "assistant",
+      parentID: u2.id,
+      sessionID: chat.id,
+      mode: "compaction",
+      agent: "compaction",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: 210 },
+      summary: true,
+      finish: "stop",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_unpub_s"),
+      messageID: s2.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "unpublished summary text",
+    })
+
+    const naive = yield* sessions.findMessage(chat.id, (m) => m.info.role !== "user")
+    expect(Option.isSome(naive)).toBe(true)
+    if (Option.isSome(naive)) expect(naive.value.info.id).toBe(s2.id)
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.id).toBe(genuine.b.id)
+    expect(yield* llm.hits).toHaveLength(0)
+  }),
+  30_000,
+)
+
+it.instance("T018 streaming provisional summary is not the current response", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Provisional summary" })
+    const genuine = yield* seedGenuineExchange(chat.id)
+    const u2 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_prov_u"),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: 200 },
+      origin: "compaction",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_prov_u"),
+      messageID: u2.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: false,
+      publication: { state: "preparing" },
+    })
+    const s2 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_prov_s"),
+      role: "assistant",
+      parentID: u2.id,
+      sessionID: chat.id,
+      mode: "compaction",
+      agent: "compaction",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: 210 },
+      summary: true,
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_prov_s"),
+      messageID: s2.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "partial summary text",
+    })
+
+    const naive = yield* sessions.findMessage(chat.id, (m) => m.info.role !== "user")
+    expect(Option.isSome(naive)).toBe(true)
+    if (Option.isSome(naive)) expect(naive.value.info.id).toBe(s2.id)
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.id).toBe(genuine.b.id)
+    expect(yield* llm.hits).toHaveLength(0)
+  }),
+  30_000,
+)
+
+it.instance("T018 published candidate rejected for an invalid tail is not the current response", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Invalid tail summary" })
+    const genuine = yield* seedGenuineExchange(chat.id)
+    const u2 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_tail_u"),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: 200 },
+      origin: "compaction",
+    })
+    const s2 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_tail_s"),
+      role: "assistant",
+      parentID: u2.id,
+      sessionID: chat.id,
+      mode: "compaction",
+      agent: "compaction",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: 210 },
+      summary: true,
+      finish: "stop",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_tail_s"),
+      messageID: s2.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "rejected tail summary",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_tail_u"),
+      messageID: u2.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: false,
+      tail_start_id: u2.id,
+      publication: { state: "published", summaryID: MessageID.make("msg_t18_tail_s") },
+    })
+
+    const naive = yield* sessions.findMessage(chat.id, (m) => m.info.role !== "user")
+    expect(Option.isSome(naive)).toBe(true)
+    if (Option.isSome(naive)) expect(naive.value.info.id).toBe(s2.id)
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.id).toBe(genuine.b.id)
+    expect(yield* llm.hits).toHaveLength(0)
+  }),
+  30_000,
+)
+
+it.instance("T018 published compaction summary keeps its continuation semantics", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Published summary response" })
+    yield* seedGenuineExchange(chat.id)
+    const u1 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_pub_u"),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: 200 },
+      origin: "compaction",
+    })
+    const s1 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_pub_s"),
+      role: "assistant",
+      parentID: u1.id,
+      sessionID: chat.id,
+      mode: "compaction",
+      agent: "compaction",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: 210 },
+      summary: true,
+      finish: "stop",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_pub_s"),
+      messageID: s1.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "published summary text",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_pub_u"),
+      messageID: u1.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: false,
+      publication: { state: "published", summaryID: MessageID.make("msg_t18_pub_s") },
+    })
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.id).toBe(s1.id)
+    expect(yield* llm.hits).toHaveLength(0)
+  }),
+  30_000,
+)
+
+it.instance("T018 a genuine later user's assistant stays attributed to that user", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Genuine later user" })
+    yield* seedGenuineExchange(chat.id)
+    const u1 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_y_u"),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: 200 },
+      origin: "compaction",
+    })
+    const s1 = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_y_s"),
+      role: "assistant",
+      parentID: u1.id,
+      sessionID: chat.id,
+      mode: "compaction",
+      agent: "compaction",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: 210 },
+      summary: true,
+      finish: "stop",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_y_s"),
+      messageID: s1.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "published summary text",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_y_u"),
+      messageID: u1.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: false,
+      publication: { state: "published", summaryID: MessageID.make("msg_t18_y_s") },
+    })
+    const y = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t18_y_user"),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: 300 },
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t18_y_user"),
+      messageID: y.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "newer question",
+    })
+    yield* llm.text("y answer")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role === "assistant") {
+      expect(result.info.parentID).toBe(y.id)
+      expect(result.info.finish).toBe("stop")
+    }
+    expect(yield* llm.hits).toHaveLength(1)
+    const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+    expect(MessageV2.latest(msgs).user?.id).toBe(y.id)
+  }),
+  30_000,
+)
+
+recordingCompactionContinueIt.instance(
+  "B1 queued compaction dispatch depends on its exact owner, not the newer user's model",
+  () =>
+    Effect.gen(function* () {
+      compactionProcessCalls.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ title: "Owner model isolation" })
+      const seeded: QueuedSeed = yield* seedQueuedCompaction(chat.id, {
+        newerUser: true,
+        newerUserModel: {
+          providerID: ProviderV2.ID.make("test"),
+          modelID: ModelV2.ID.make("missing-model"),
+        },
+      })
+
+      const exit = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+
+      expect(compactionProcessCalls).toHaveLength(1)
+      const call = compactionProcessCalls[0]!
+      expect(call.parentID).toBe(seeded.u.id)
+      expect(messageIDs(call.messages)).toEqual([seeded.x.id, seeded.b.id, seeded.u.id])
+      expect(messageIDs(call.messages)).not.toContain(seeded.y!.id)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(String(Cause.squash(exit.cause))).toContain("missing-model")
+      }
+
+      const raw = yield* MessageV2.stream(chat.id)
+      expect(messageIDs(raw)).toContain(seeded.u.id)
+      expect(messageIDs(raw)).toContain(seeded.y!.id)
+    }),
+  { config: cfg },
+)
+
+recordingCompactionIt.instance(
+  "final-response edge: no legitimate assistant yields a clear no-valid-response outcome",
+  () =>
+    Effect.gen(function* () {
+      compactionProcessCalls.length = 0
+      const sessions = yield* Session.Service
+      const prompt = yield* SessionPrompt.Service
+      const chat = yield* sessions.create({ title: "Unpublished then queued" })
+
+      const x = yield* sessions.updateMessage({
+        id: MessageID.make("msg_fr_x"),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: 100 },
+      })
+      yield* sessions.updatePart({
+        id: PartID.make("prt_fr_x"),
+        messageID: x.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "question",
+      })
+      const u2 = yield* sessions.updateMessage({
+        id: MessageID.make("msg_fr_u2"),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: 200 },
+        origin: "compaction",
+      })
+      yield* sessions.updatePart({
+        id: PartID.make("prt_fr_u2"),
+        messageID: u2.id,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: false,
+        publication: { state: "preparing" },
+      })
+      const s2 = yield* sessions.updateMessage({
+        id: MessageID.make("msg_fr_s2"),
+        role: "assistant",
+        parentID: u2.id,
+        sessionID: chat.id,
+        mode: "compaction",
+        agent: "compaction",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: 210 },
+        summary: true,
+        finish: "stop",
+      })
+      yield* sessions.updatePart({
+        id: PartID.make("prt_fr_s2"),
+        messageID: s2.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "unpublished summary text",
+      })
+      const uq = yield* sessions.updateMessage({
+        id: MessageID.make("msg_fr_uq"),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: 300 },
+        origin: "compaction",
+      })
+      yield* sessions.updatePart({
+        id: PartID.make("prt_fr_uq"),
+        messageID: uq.id,
+        sessionID: chat.id,
+        type: "compaction",
+        auto: true,
+        publication: { state: "queued" },
+      })
+
+      const rawBefore = JSON.stringify(yield* MessageV2.stream(chat.id))
+      const naive = yield* sessions.findMessage(chat.id, (m) => m.info.role !== "user")
+      expect(Option.isSome(naive)).toBe(true)
+      if (Option.isSome(naive)) expect(naive.value.info.id).toBe(s2.id)
+
+      const exit = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.exit)
+
+      expect(compactionProcessCalls).toHaveLength(1)
+      expect(compactionProcessCalls[0]!.parentID).toBe(uq.id)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const message = String(Cause.squash(exit.cause))
+        expect(message).toContain("No assistant response available")
+        expect(message).not.toContain("unpublished summary text")
+      }
+      expect(JSON.stringify(yield* MessageV2.stream(chat.id))).toBe(rawBefore)
+      const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+      expect(messageIDs(msgs)).toEqual([x.id])
+      expect(messageIDs(msgs)).not.toContain(s2.id)
+    }),
+  { config: cfg },
+)
+
+it.instance("T034 C1: orphan synthetic compaction U without a part dispatches no generation and is not the current response", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Crash C1 orphan" })
+    const genuine = yield* seedGenuineExchange(chat.id)
+    // Boundary C1: durable synthetic U exists without its compaction part.
+    const orphan = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t34_c1_orphan"),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: 200 },
+      origin: "compaction",
+    })
+
+    const rawBefore = JSON.stringify(yield* MessageV2.stream(chat.id))
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    // The orphan never dispatches generation and never becomes the response.
+    expect(yield* llm.hits).toHaveLength(0)
+    expect(result.info.id).toBe(genuine.b.id)
+    const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+    expect(messageIDs(msgs)).not.toContain(orphan.id)
+    // The loop performs no writes for the orphaned synthetic request.
+    expect(JSON.stringify(yield* MessageV2.stream(chat.id))).toBe(rawBefore)
+  }),
+  30_000,
+)
+
+it.instance("T035 C5: a successful complete-but-unpublished summary is never the current response after reopen", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Crash C5 unpublished" })
+    const genuine = yield* seedGenuineExchange(chat.id)
+    // Boundary C5: S is durably successful, finished and readable while P is
+    // still preparing, with no failure evidence and no publication.
+    const u = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t35_c5_u"),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: 200 },
+      origin: "compaction",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t35_c5_u"),
+      messageID: u.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: false,
+      publication: { state: "preparing" },
+    })
+    const s = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t35_c5_s"),
+      role: "assistant",
+      parentID: u.id,
+      sessionID: chat.id,
+      mode: "compaction",
+      agent: "compaction",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: 210 },
+      summary: true,
+      finish: "end_turn",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t35_c5_s"),
+      messageID: s.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "successful unpublished summary",
+    })
+
+    const rawBefore = JSON.stringify(yield* MessageV2.stream(chat.id))
+    const naive = yield* sessions.findMessage(chat.id, (m) => m.info.role !== "user")
+    expect(Option.isSome(naive)).toBe(true)
+    if (Option.isSome(naive)) expect(naive.value.info.id).toBe(s.id)
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    expect(yield* llm.hits).toHaveLength(0)
+    expect(result.info.id).toBe(genuine.b.id)
+    // Reopen-equivalent durable state is untouched by the read path.
+    expect(JSON.stringify(yield* MessageV2.stream(chat.id))).toBe(rawBefore)
+    const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+    expect(messageIDs(msgs)).not.toContain(s.id)
+  }),
+  30_000,
+)
+
+it.instance("T035 C7: a published pair before autocontinue keeps the summary as the response without replay", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Crash C7 published" })
+    const genuine = yield* seedGenuineExchange(chat.id)
+    // Boundary C7: N6 committed (published) and the optional continuation
+    // never ran. The publication itself must remain valid.
+    const u = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t35_c7_u"),
+      role: "user",
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      time: { created: 200 },
+      origin: "compaction",
+    })
+    const s = yield* sessions.updateMessage({
+      id: MessageID.make("msg_t35_c7_s"),
+      role: "assistant",
+      parentID: u.id,
+      sessionID: chat.id,
+      mode: "compaction",
+      agent: "compaction",
+      cost: 0,
+      path: { cwd: "/tmp", root: "/tmp" },
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      modelID: ref.modelID,
+      providerID: ref.providerID,
+      time: { created: 210 },
+      summary: true,
+      finish: "end_turn",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t35_c7_s"),
+      messageID: s.id,
+      sessionID: chat.id,
+      type: "text",
+      text: "published crash-safe summary",
+    })
+    yield* sessions.updatePart({
+      id: PartID.make("prt_t35_c7_u"),
+      messageID: u.id,
+      sessionID: chat.id,
+      type: "compaction",
+      auto: false,
+      publication: { state: "published", summaryID: s.id },
+    })
+
+    const rawBefore = JSON.stringify(yield* MessageV2.stream(chat.id))
+    const result = yield* prompt.loop({ sessionID: chat.id })
+
+    // The published summary is the current response; the original request is
+    // not replayed and no continuation message is invented.
+    expect(result.info.id).toBe(s.id)
+    expect(yield* llm.hits).toHaveLength(0)
+    expect(JSON.stringify(yield* MessageV2.stream(chat.id))).toBe(rawBefore)
+    const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+    expect(messageIDs(msgs)).toContain(s.id)
+    expect(messageIDs(msgs)).not.toContain(genuine.x.id)
+  }),
   30_000,
 )

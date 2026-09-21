@@ -16,6 +16,7 @@ import {
   type Prompt,
   type PromptModel,
   type PromptScope,
+  type PromptCapture,
   type PromptSession,
 } from "./prompt-state"
 
@@ -146,7 +147,7 @@ export const { use: usePrompt, provider: PromptProvider } = createSimpleContext(
 
     return {
       ready,
-      capture: (scope?: PromptScope) => pick(scope).capture(),
+      capture: (scope?: PromptScope): PromptCapture => pick(scope).capture(),
       current: withSuspense(() => session().current()),
       cursor: withSuspense(() => session().cursor()),
       dirty: withSuspense(() => session().dirty()),

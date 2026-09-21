@@ -898,7 +898,7 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
       console.log("Sending message to opencode...")
 
       return runLocalEffect(
-        Effect.gen(function* () {
+        Effect.scoped(Effect.gen(function* () {
           const prompt = sessionPrompt
           const result = yield* prompt.prompt({
             sessionID: session.id,
@@ -977,7 +977,7 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
           const summaryText = extractResponseText(summary.parts)
           if (!summaryText) throw new Error("Failed to get summary from agent")
           return summaryText
-        }),
+        })),
       )
     }
 

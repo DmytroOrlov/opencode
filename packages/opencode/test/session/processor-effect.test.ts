@@ -14,13 +14,14 @@ import { Session } from "@/session/session"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionProcessor } from "../../src/session/processor"
+import { FallbackRuntimeIntent } from "../../src/session/fallback-runtime-intent"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { provideTmpdirInstance, provideTmpdirServer } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
-import { raw, reply, TestLLMServer } from "../lib/llm-server"
+import { pollWithTimeout, testEffect } from "../lib/effect"
+import { httpError, raw, reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -70,16 +71,27 @@ const cfg = {
   },
 }
 
-function providerCfg(url: string) {
+function providerCfg(url: string, options: Record<string, unknown> = {}, includeFallbackModel = false) {
   return {
     ...cfg,
     provider: {
       ...cfg.provider,
       test: {
         ...cfg.provider.test,
+        models: includeFallbackModel
+          ? {
+              ...cfg.provider.test.models,
+              "fallback-model": {
+                ...cfg.provider.test.models["test-model"],
+                id: "fallback-model",
+                name: "Fallback Model",
+              },
+            }
+          : cfg.provider.test.models,
         options: {
           ...cfg.provider.test.options,
           baseURL: url,
+          ...options,
         },
       },
     },
@@ -174,6 +186,7 @@ const root = LayerNode.group([
   EventV2Bridge.node,
   SessionStatus.node,
   CrossSpawnSpawner.node,
+  FallbackRuntimeIntent.node,
 ])
 const replacements = [
   [SessionSummary.node, summary],
@@ -225,6 +238,97 @@ const fragmentFailureLLM = Layer.succeed(
 )
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
+
+const technicalFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.concat(
+        Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.reasoningStart({ id: "reasoning-technical" }),
+          LLMEvent.textStart({ id: "text-technical" }),
+        ),
+        Stream.fail(new Error("fetch failed")),
+      ),
+  }),
+)
+const technicalFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, technicalFailureLLM]])
+const itTechnicalFailure = testEffect(technicalFailureEnv)
+
+const settledToolFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-settled", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-settled", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-settled", name: "lookup", input: {}, providerExecuted: true }),
+        LLMEvent.toolResult({
+          id: "call-settled",
+          name: "lookup",
+          result: { type: "json", value: { output: "read once", title: "Lookup", metadata: {} } },
+          providerExecuted: true,
+        }),
+        LLMEvent.textStart({ id: "text-after-tool" }),
+        LLMEvent.textDelta({ id: "text-after-tool", text: "stale continuation" }),
+        LLMEvent.providerError({ message: "fetch failed" }),
+      ),
+  }),
+)
+const settledToolFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, settledToolFailureLLM]])
+const itSettledToolFailure = testEffect(settledToolFailureEnv)
+
+const unknownToolFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-unknown", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-unknown", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-unknown", name: "lookup", input: {}, providerExecuted: true }),
+        LLMEvent.providerError({ message: "provider boom" }),
+      ),
+  }),
+)
+const unknownToolFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, unknownToolFailureLLM]])
+const itUnknownToolFailure = testEffect(unknownToolFailureEnv)
+
+const proposedToolFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolInputStart({ id: "call-proposed", name: "lookup" }),
+        LLMEvent.toolInputEnd({ id: "call-proposed", name: "lookup" }),
+        LLMEvent.toolCall({ id: "call-proposed", name: "lookup", input: {} }),
+        LLMEvent.providerError({ message: "provider boom" }),
+      ),
+  }),
+)
+const proposedToolFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, proposedToolFailureLLM]])
+const itProposedToolFailure = testEffect(proposedToolFailureEnv)
+
+const stepFinishFailureLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.stepFinish({
+          index: 0,
+          reason: "stop",
+          usage: { inputTokens: 10, outputTokens: 3, reasoningTokens: 2 },
+        }),
+        LLMEvent.providerError({ message: "provider boom" }),
+      ),
+  }),
+)
+const stepFinishFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, stepFinishFailureLLM]])
+const itStepFinishFailure = testEffect(stepFinishFailureEnv)
 
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
@@ -514,7 +618,7 @@ it.live("session.processor effect tests reset reasoning state across retries", (
   ),
 )
 
-it.live("session.processor effect tests do not retry unknown json errors", () =>
+it.live("session.processor effect tests terminalize unknown json errors", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>
       Effect.gen(function* () {
@@ -551,7 +655,8 @@ it.live("session.processor effect tests do not retry unknown json errors", () =>
 
         expect(value).toBe("stop")
         expect(yield* llm.calls).toBe(1)
-        expect(handle.message.error?.name).toBe("APIError")
+        expect(handle.message.error).toBeDefined()
+        expect(handle.message.time.completed).toBeDefined()
       }),
     { config: (url) => providerCfg(url) },
   ),
@@ -759,6 +864,417 @@ it.live("session.processor effect tests publish retry status updates", () =>
         expect(states).toStrictEqual([1])
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor aborts during retry backoff", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const statuses = yield* SessionStatus.Service
+
+        yield* llm.error(503, { error: "retry during backoff" })
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "abort retry backoff")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "abort retry backoff" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* waitFor(
+          statuses
+            .get(chat.id)
+            .pipe(Effect.map((value) => (value.type === "retry" && value.attempt === 1 ? value : undefined))),
+          "timed out waiting for retry backoff",
+        )
+        yield* Fiber.interrupt(run)
+
+        const exit = yield* Fiber.await(run)
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const state = yield* statuses.get(chat.id)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") expect(stored.info.error?.name).toBe("MessageAbortedError")
+        expect(state).toMatchObject({ type: "idle" })
+        expect(yield* llm.calls).toBe(1)
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor recovers from a silent SSE body with the configured fallback", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        yield* llm.hang
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "silent provider stream")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const fallbackRef = { providerID: ref.providerID, modelID: ModelV2.ID.make("fallback-model") }
+        const fallbackModel = yield* provider.getModel(fallbackRef.providerID, fallbackRef.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () => Effect.succeed({ reason: "available" as const, ref: fallbackRef, model: fallbackModel }),
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "silent provider stream" }],
+          tools: {},
+        })
+
+        expect(result).toMatchObject({
+          type: "failover",
+          mode: "restart",
+          fallback: { ref: fallbackRef, model: { id: fallbackModel.id } },
+        })
+        if (typeof result === "object" && result.type === "failover") {
+          const error = result.error as Error
+          expect(error.name).toBe("ProviderResponseStreamError")
+          expect(error.message).toBe("SSE read timed out")
+        }
+        expect(yield* llm.calls).toBe(1)
+        expect((yield* llm.inputs)[0]?.model).toBe("test-model")
+      }),
+    { config: (url) => providerCfg(url, { chunkTimeout: 50 }, true) },
+  ),
+)
+
+it.live("negative control: a completed SDK tool call waits for permission before processor recovery can advance", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const started = defer<void>()
+        const approved = defer<void>()
+        const completed = defer<void>()
+        let sideEffects = 0
+        let fallbackResolutions = 0
+        yield* llm.push(
+          raw({
+            chunks: [
+              {
+                id: "chatcmpl-pending-permission",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+              },
+              {
+                id: "chatcmpl-pending-permission",
+                object: "chat.completion.chunk",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: "call-gated",
+                          type: "function",
+                          function: { name: "gated", arguments: "{}" },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              },
+              {
+                id: "chatcmpl-pending-permission",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+              },
+            ],
+            error: new Error("provider boom"),
+          }),
+        )
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "permission wait overlaps provider failure")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const fallbackRef = { providerID: ref.providerID, modelID: ModelV2.ID.make("fallback-model") }
+        const fallbackModel = yield* provider.getModel(fallbackRef.providerID, fallbackRef.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () =>
+            Effect.sync(() => {
+              fallbackResolutions++
+              return { reason: "available" as const, ref: fallbackRef, model: fallbackModel }
+            }),
+        })
+        const processDone = defer<SessionProcessor.Result>()
+        yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "permission wait overlaps provider failure" }],
+            tools: {
+              gated: tool({
+                description: "Deferred permission-controlled test side effect",
+                inputSchema: z.object({}),
+                execute: async (_args, options) => {
+                  started.resolve()
+                  await approved.promise
+                  await Effect.runPromise(handle.markToolExecutionStarted(options.toolCallId))
+                  sideEffects++
+                  completed.resolve()
+                  return "performed"
+                },
+              }),
+            },
+          })
+          .pipe(
+            Effect.tap((result) => Effect.sync(() => processDone.resolve(result))),
+            Effect.forkChild,
+          )
+        expect(
+          yield* Effect.promise(() =>
+            Promise.race([
+              started.promise.then(() => true),
+              new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000)),
+            ]),
+          ),
+        ).toBe(true)
+        const beforeApproval = yield* Effect.promise(() =>
+          Promise.race([
+            processDone.promise.then((result) => ({ result })),
+            new Promise<{ timeout: true }>((resolve) => setTimeout(() => resolve({ timeout: true }), 100)),
+          ]),
+        )
+        expect(beforeApproval).toEqual({ timeout: true })
+        approved.resolve()
+        expect(
+          yield* Effect.promise(() =>
+            Promise.race([
+              completed.promise.then(() => true),
+              new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1_000)),
+            ]),
+          ),
+        ).toBe(true)
+        const result = yield* Effect.promise(() =>
+          Promise.race([
+            processDone.promise,
+            new Promise<SessionProcessor.Result>((_, reject) =>
+              setTimeout(() => reject(new Error("processor recovery did not finish after permission approval")), 1_000),
+            ),
+          ]),
+        )
+        expect(result).toBe("continue")
+        expect(sideEffects).toBe(1)
+        expect(fallbackResolutions).toBe(0)
+        expect(yield* llm.calls).toBe(1)
+      }),
+    { config: (url) => providerCfg(url, {}, true) },
+  ),
+)
+
+it.live("processor fails over on a mid-SSE error before an incomplete tool call can execute", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const started = defer<void>()
+        let fallbackResolutions = 0
+        yield* llm.push(
+          raw({
+            chunks: [
+              {
+                id: "chatcmpl-incomplete-tool",
+                object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+              },
+              {
+                id: "chatcmpl-incomplete-tool",
+                object: "chat.completion.chunk",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: "call-incomplete",
+                          type: "function",
+                          function: { name: "gated", arguments: "{" },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              },
+            ],
+            reset: true,
+          }),
+        )
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "mid-stream failure before tool call completion")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const fallbackRef = { providerID: ref.providerID, modelID: ModelV2.ID.make("fallback-model") }
+        const fallbackModel = yield* provider.getModel(fallbackRef.providerID, fallbackRef.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () =>
+            Effect.sync(() => {
+              fallbackResolutions++
+              return { reason: "available" as const, ref: fallbackRef, model: fallbackModel }
+            }),
+        })
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "mid-stream failure before tool call completion" }],
+          tools: {
+            gated: tool({
+              description: "Must not execute from an incomplete stream call",
+              inputSchema: z.object({}),
+              execute: async () => {
+                started.resolve()
+                return "unexpected"
+              },
+            }),
+          },
+        })
+        const didStart = yield* Effect.promise(() =>
+          Promise.race([
+            started.promise.then(() => true),
+            new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+          ]),
+        )
+
+        expect(result).toMatchObject({ type: "failover", mode: "restart", fallback: { ref: fallbackRef } })
+        expect(didStart).toBe(false)
+        expect(fallbackResolutions).toBeGreaterThan(0)
+        expect(yield* llm.calls).toBe(1)
+      }),
+    { config: (url) => providerCfg(url, {}, true) },
+  ),
+)
+
+it.live("session.processor keeps abort terminal when a fallback is eligible", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        yield* llm.hang
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "abort with fallback available")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const fallbackRef = { providerID: ref.providerID, modelID: ModelV2.ID.make("fallback-model") }
+        const fallbackModel = yield* provider.getModel(fallbackRef.providerID, fallbackRef.modelID)
+        let fallbackResolutions = 0
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () =>
+            Effect.sync(() => {
+              fallbackResolutions += 1
+              return { reason: "available" as const, ref: fallbackRef, model: fallbackModel }
+            }),
+        })
+
+        const run = yield* handle
+          .process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "abort with fallback available" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* llm.wait(1)
+        yield* Fiber.interrupt(run)
+        const exit = yield* Fiber.await(run)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+        expect(handle.message.error?.name).toBe("MessageAbortedError")
+        expect(fallbackResolutions).toBe(0)
+        expect(yield* llm.calls).toBe(1)
+      }),
+    { config: (url) => providerCfg(url, {}, true) },
   ),
 )
 
@@ -1085,7 +1601,11 @@ itProviderError.live("session.processor effect tests fail provider-executed erro
           seen.push(event.type)
           return Effect.void
         })
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
 
         yield* handle.process({
           user: {
@@ -1133,7 +1653,11 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
           seen.push(event.type)
           return Effect.void
         })
-        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
 
         expect(
           yield* handle.process({
@@ -1165,6 +1689,563 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         expect(seen).toContain(MessageV2.Event.PartUpdated.type)
         expect(seen).toContain(Session.Event.Error.type)
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itTechnicalFailure.live("session.processor rolls back uncommitted technical parts before failover", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "technical failure")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () => Effect.succeed({ reason: "available", ref, model: mdl }),
+        })
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "technical failure" }],
+          tools: {},
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+
+        expect(result).toMatchObject({ type: "failover" })
+        expect(parts).toEqual([])
+        expect(handle.message.error).toBeUndefined()
+        expect(handle.message.time.completed).toBeUndefined()
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettledToolFailure.live("session.processor continues from a settled tool result", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "continue from tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () => Effect.succeed({ reason: "available", ref, model: mdl }),
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "continue from tool" }],
+          tools: {},
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+        const tool = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result).toMatchObject({ type: "failover", mode: "continue" })
+        expect(parts.filter((part) => part.type === "text")).toEqual([])
+        expect(tool?.state.status).toBe("completed")
+        expect(msg.providerID).toBe(ref.providerID)
+        expect(msg.modelID).toBe(ref.modelID)
+        expect(msg.finish).toBe("tool-calls")
+        expect(msg.error).toBeUndefined()
+      }),
+    { config: cfg },
+  ),
+)
+
+itSettledToolFailure.live("session.processor continues from a settled tool result without fallback", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "continue from settled tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "continue from settled tool" }],
+          tools: {},
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+        const tools = parts.filter((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result).toBe("continue")
+        expect(tools).toHaveLength(1)
+        expect(tools[0]?.state.status).toBe("completed")
+        expect(msg.finish).toBe("tool-calls")
+        expect(msg.error).toBeUndefined()
+      }),
+    { config: cfg },
+  ),
+)
+
+itUnknownToolFailure.live("session.processor stops when executed tool outcome is unknown", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "unknown tool outcome")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () => Effect.succeed({ reason: "available", ref, model: mdl }),
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "unknown tool outcome" }],
+          tools: {},
+        })
+        const parts = yield* MessageV2.parts(msg.id)
+        const tool = parts.find((part): part is SessionV1.ToolPart => part.type === "tool")
+
+        expect(result).toBe("stop")
+        expect(tool?.state.status).toBe("error")
+        if (tool?.state.status === "error") expect(tool.state.metadata?.interrupted).toBe(true)
+      }),
+    { config: cfg },
+  ),
+)
+
+itProposedToolFailure.live("session.processor restarts after an unexecuted tool proposal", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "unexecuted tool proposal")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () => Effect.succeed({ reason: "available", ref, model: mdl }),
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "unexecuted tool proposal" }],
+          tools: {},
+        })
+
+        expect(result).toMatchObject({ type: "failover", mode: "restart" })
+        expect(yield* MessageV2.parts(msg.id)).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itStepFinishFailure.live("session.processor restores assistant bookkeeping after step-finish failure", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "step finish failure")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const baseline = {
+          finish: msg.finish,
+          cost: msg.cost,
+          tokens: structuredClone(msg.tokens),
+          completed: msg.time.completed,
+        }
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () => Effect.succeed({ reason: "available", ref, model: mdl }),
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "step finish failure" }],
+          tools: {},
+        })
+
+        expect(result).toMatchObject({ type: "failover", mode: "restart" })
+        expect(msg.finish).toBe(baseline.finish)
+        expect(msg.cost).toBe(baseline.cost)
+        expect(msg.tokens).toEqual(baseline.tokens)
+        expect(msg.time.completed).toBe(baseline.completed)
+        expect(yield* MessageV2.parts(msg.id)).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itTechnicalFailure.live("session.processor resolves fallback freshly at recovery instead of at create", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const intent = yield* FallbackRuntimeIntent.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "fresh resolution")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const resolveFallback = () =>
+          intent.current().pipe(
+            Effect.map((snapshot) =>
+              snapshot.override.type === "some" && snapshot.override.value
+                ? { reason: "available" as const, ref, model: mdl }
+                : { reason: "disabled" as const },
+            ),
+          )
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback,
+        })
+        // The intent is staged after create, so only a fresh read at the recovery
+        // boundary can observe it.
+        yield* intent.stage({ model: "test/test-model", variant: null })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "fresh resolution" }],
+          tools: {},
+        })
+
+        expect(result).toMatchObject({ type: "failover", mode: "restart" })
+        if (typeof result === "object" && result.type === "failover") expect(result.fallback.ref).toEqual(ref)
+        expect(yield* MessageV2.parts(msg.id)).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itTechnicalFailure.live("session.processor keeps the accepted fallback target frozen after a later edit", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const intent = yield* FallbackRuntimeIntent.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "frozen dispatch")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const refB = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("model-b") }
+        const refC = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("model-c") }
+        const resolveFallback = () =>
+          intent.current().pipe(
+            Effect.map((snapshot) => {
+              if (snapshot.override.type !== "some" || !snapshot.override.value) return { reason: "disabled" as const }
+              const selected = snapshot.override.value.model.endsWith("model-c") ? refC : refB
+              return { reason: "available" as const, ref: selected, model: mdl }
+            }),
+          )
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback,
+        })
+        yield* intent.stage({ model: "test/model-b", variant: null })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "frozen dispatch" }],
+          tools: {},
+        })
+
+        expect(result).toMatchObject({ type: "failover", mode: "restart" })
+        const accepted = typeof result === "object" && result.type === "failover" ? result.fallback.ref : undefined
+        expect(accepted).toEqual(refB)
+        expect(msg.modelID).toBe(ref.modelID)
+
+        // A later edit changes the live intent without retargeting the accepted dispatch.
+        yield* intent.stage({ model: "test/model-c", variant: null })
+        expect(yield* resolveFallback()).toMatchObject({ reason: "available", ref: refC })
+        expect(accepted).toEqual(refB)
+      }),
+    { config: cfg },
+  ),
+)
+
+it.live(
+  "session.processor dispatches a fallback staged during retry backoff instead of retrying the primary",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          const intent = yield* FallbackRuntimeIntent.Service
+          const status = yield* SessionStatus.Service
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "stage during backoff")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const fallbackRef = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("model-b") }
+          const resolveFallback = () =>
+            intent.current().pipe(
+              Effect.map((snapshot) =>
+                snapshot.override.type === "some" && snapshot.override.value
+                  ? { reason: "available" as const, ref: fallbackRef, model: mdl }
+                  : { reason: "disabled" as const },
+              ),
+            )
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+            resolveFallback,
+          })
+
+          yield* llm.pushMatch(
+            (hit) => hit.body.model === "test-model",
+            httpError(500, { error: { message: "primary unavailable" } }),
+          )
+          yield* llm.pushMatch(
+            (hit) => hit.body.model === "test-model",
+            httpError(500, { error: { message: "primary still unavailable" } }),
+          )
+
+          const run = yield* handle
+            .process({
+              user: {
+                id: parent.id,
+                sessionID: chat.id,
+                role: "user",
+                time: parent.time,
+                agent: parent.agent,
+                model: { providerID: ref.providerID, modelID: ref.modelID },
+              } satisfies SessionV1.User,
+              sessionID: chat.id,
+              model: mdl,
+              agent: agent(),
+              system: [],
+              messages: [{ role: "user", content: "stage during backoff" }],
+              tools: {},
+            })
+            .pipe(Effect.forkChild)
+
+          // The retry status is published before the backoff starts, so staging
+          // after it is observed happens strictly inside the backoff window.
+          yield* pollWithTimeout(
+            status.get(chat.id).pipe(Effect.map((s) => (s.type === "retry" ? true : undefined))),
+            "retry backoff never started",
+          )
+          yield* intent.stage({ model: "test/model-b", variant: null })
+
+          const result = yield* Fiber.join(run)
+          expect(result).toMatchObject({ type: "failover", mode: "restart" })
+          if (typeof result === "object" && result.type === "failover") expect(result.fallback.ref).toEqual(fallbackRef)
+          expect((yield* llm.inputs).filter((input) => input.model === "test-model")).toHaveLength(1)
+          expect(yield* MessageV2.parts(msg.id)).toEqual([])
+          expect(msg.error).toBeUndefined()
+          expect(handle.message).toBe(msg)
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+)
+
+itFragmentFailure.live("session.processor fails over a configured fallback resolved before generation", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "configured fallback")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        let calls = 0
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+          resolveFallback: () =>
+            Effect.sync(() => {
+              calls += 1
+              return { reason: "available" as const, ref, model: mdl }
+            }),
+        })
+
+        const result = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "configured fallback" }],
+          tools: {},
+        })
+
+        expect(result).toMatchObject({ type: "failover", mode: "restart" })
+        if (typeof result === "object" && result.type === "failover") expect(result.fallback.ref).toEqual(ref)
+        expect(calls).toBeGreaterThanOrEqual(1)
+      }),
+    { config: cfg },
+  ),
+)
+
+itFragmentFailure.live("session.processor keeps fresh non-available fallback resolutions out of failover", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const unavailableRef = { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("missing-model") }
+        const cases = [
+          { name: "same model", resolution: { reason: "same_model" as const, ref } },
+          { name: "model unavailable", resolution: { reason: "model_unavailable" as const, ref: unavailableRef } },
+          { name: "variant unavailable", resolution: { reason: "variant_unavailable" as const, ref: unavailableRef } },
+          { name: "already used", resolution: { reason: "already_used" as const, ref } },
+        ]
+
+        for (const item of cases) {
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, item.name)
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          let calls = 0
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+            resolveFallback: () =>
+              Effect.sync(() => {
+                calls += 1
+                return item.resolution
+              }),
+          })
+
+          const result = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: item.name }],
+            tools: {},
+          })
+
+          expect(result).toBe("stop")
+          expect(calls).toBeGreaterThanOrEqual(1)
+          expect(handle.message.error).toBeDefined()
+        }
       }),
     { config: cfg },
   ),

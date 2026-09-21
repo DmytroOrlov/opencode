@@ -4,12 +4,14 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, Context, Effect, Exit, Layer, Queue } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
+import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { GenerationGate } from "@opencode-ai/core/session/generation-gate"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { registerAdapter } from "../../src/control-plane/adapters"
@@ -36,16 +38,65 @@ import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
-import { pollWithTimeout, testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
   InstanceBootstrapService.Service,
   InstanceBootstrapService.Service.of({ run: Effect.void }),
 )
+
+type WriterHeldPromptGateHarness = {
+  readonly gate: GenerationGate.Interface
+  readonly sharedAdmissions: Queue.Queue<GenerationGate.Reservation>
+}
+
+class WriterHeldPromptGate extends Context.Service<WriterHeldPromptGate, WriterHeldPromptGateHarness>()(
+  "@test/WriterHeldPromptGate",
+) {}
+
+const writerHeldPromptGateNode = makeGlobalNode({
+  service: WriterHeldPromptGate,
+  layer: Layer.effect(
+    WriterHeldPromptGate,
+    Effect.gen(function* () {
+      const actual = yield* GenerationGate.make
+      const sharedAdmissions = yield* Queue.unbounded<GenerationGate.Reservation>()
+      const gate: GenerationGate.Interface = {
+        ...actual,
+        reserveShared: Effect.gen(function* () {
+          const reservation = yield* actual.reserveShared
+          yield* Queue.offer(sharedAdmissions, reservation)
+          return reservation
+        }),
+      }
+      return { gate, sharedAdmissions }
+    }),
+  ),
+  deps: [],
+})
+const writerHeldGenerationGateReplacement = makeGlobalNode({
+  service: GenerationGate.Service,
+  layer: Layer.effect(
+    GenerationGate.Service,
+    Effect.map(WriterHeldPromptGate, (harness) => harness.gate),
+  ),
+  deps: [writerHeldPromptGateNode],
+})
+const generationGateReplacements: LayerNode.Replacements = [
+  [GenerationGate.node, writerHeldGenerationGateReplacement],
+]
 const appLayer = AppNodeBuilder.build(
-  LayerNode.group([InstanceStore.node, Project.node, Session.node, Workspace.node, Database.node, Ripgrep.node]),
-  [[InstanceStore.bootstrapNode, noopBootstrapLayer]],
+  LayerNode.group([
+    InstanceStore.node,
+    Project.node,
+    Session.node,
+    Workspace.node,
+    Database.node,
+    Ripgrep.node,
+    writerHeldPromptGateNode,
+  ]),
+  [[InstanceStore.bootstrapNode, noopBootstrapLayer], ...generationGateReplacements],
 )
 const servedRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
   HttpApiApp.routes,
@@ -60,6 +111,26 @@ const httpApiLayer = servedRoutes.pipe(
   Layer.provideMerge(NodeServices.layer),
 )
 const it = testEffect(Layer.mergeAll(appLayer, httpApiLayer))
+
+const writerHeldHttpApiLayer = Layer.unwrap(
+  Effect.gen(function* () {
+    const { gate } = yield* WriterHeldPromptGate
+    const routes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
+      HttpApiApp.createRoutes({ generationGate: gate }),
+      {
+        disableListenLog: true,
+        disableLogger: true,
+      },
+    )
+    const server = routes.pipe(
+      Layer.provide(layerWebSocketConstructorGlobal),
+      Layer.provideMerge(NodeHttpServer.layerTest),
+      Layer.provideMerge(NodeServices.layer),
+    )
+    return server
+  }),
+)
+const writerHeldIt = testEffect(Layer.provideMerge(writerHeldHttpApiLayer, appLayer))
 
 function pathFor(path: string, params: Record<string, string>) {
   return Object.entries(params).reduce((result, [key, value]) => result.replace(`:${key}`, value), path)
@@ -425,6 +496,107 @@ describe("session HttpApi", () => {
         root: sessionDirectory,
       })
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
+  writerHeldIt.live("keeps an accepted prompt alive while shared admission waits for a writer", () =>
+    Effect.gen(function* () {
+      const harness = yield* WriterHeldPromptGate
+      const llm = yield* TestLLMServer
+      let releaseHeldResponse!: () => void
+      let responseReleased = false
+      const heldResponse = new Promise<void>((resolve) => {
+        releaseHeldResponse = () => {
+          responseReleased = true
+          resolve()
+        }
+      })
+      yield* Effect.addFinalizer(() => Effect.sync(releaseHeldResponse))
+      const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+      const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+      const session = yield* awaitWithTimeout(
+        requestJson<Session.Info>(SessionPaths.create, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ title: "writer-held prompt" }),
+        }),
+        "session creation request did not return",
+        "5 seconds",
+      )
+      yield* llm.hold("ok", heldResponse)
+
+      const writerReservation = yield* harness.gate.reserveExclusive
+      yield* writerReservation.await
+      const writerLease = yield* writerReservation.transfer
+      if (!writerLease) throw new Error("exclusive writer reservation was cancelled")
+      let writerHeld = true
+      const releaseWriter = writerLease.release.pipe(
+        Effect.tap(() => Effect.sync(() => (writerHeld = false))),
+      )
+      yield* Effect.addFinalizer(() => releaseWriter)
+
+      const promptText = "continue after writer release"
+      const response = yield* request(pathFor(SessionPaths.promptAsync, { sessionID: session.id }), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          agent: "build",
+          model: { providerID: "test", modelID: "test-model" },
+          parts: [{ type: "text", text: promptText }],
+        }),
+      })
+      expect(response.status).toBe(204)
+      yield* pollWithTimeout(
+        request(`${pathFor(SessionPaths.messages, { sessionID: session.id })}?limit=20`, { headers }).pipe(
+          Effect.flatMap(json<SessionV1.WithParts[]>),
+          Effect.map((items) =>
+            items.some(
+              (item) =>
+                item.info.role === "user" &&
+                item.parts.some((part) => part.type === "text" && part.text === promptText),
+            )
+              ? items
+              : undefined,
+          ),
+        ),
+        "accepted user message was not persisted",
+        "10 seconds",
+      )
+      yield* awaitWithTimeout(
+        Queue.take(harness.sharedAdmissions),
+        "accepted prompt never reached shared generation admission",
+        "10 seconds",
+      )
+      expect(writerHeld).toBe(true)
+      expect(yield* llm.calls).toBe(0)
+
+      yield* releaseWriter
+      expect(writerHeld).toBe(false)
+      yield* awaitWithTimeout(llm.wait(1), "accepted prompt never reached the fake LLM after writer release")
+      expect(yield* llm.calls).toBe(1)
+      expect(responseReleased).toBe(false)
+      releaseHeldResponse()
+      expect(responseReleased).toBe(true)
+
+      const messages = yield* pollWithTimeout(
+        request(`${pathFor(SessionPaths.messages, { sessionID: session.id })}?limit=20`, { headers }).pipe(
+          Effect.flatMap(json<SessionV1.WithParts[]>),
+          Effect.map((items) =>
+            items.some((item) => item.info.role === "assistant" && item.info.time.completed !== undefined)
+              ? items
+              : undefined,
+          ),
+        ),
+        "accepted prompt did not complete an assistant message",
+      )
+      const assistants = messages.filter((item) => item.info.role === "assistant")
+      expect(assistants).toHaveLength(1)
+      if (assistants[0]?.info.role === "assistant") expect(assistants[0].info.time.completed).toBeNumber()
+      expect(yield* llm.calls).toBe(1)
+    }).pipe(
+      Effect.provide(TestLLMServer.layer),
+      Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+    ),
+    30_000,
   )
 
   it.instance(

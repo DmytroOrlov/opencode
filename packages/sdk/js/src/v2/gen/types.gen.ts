@@ -1656,6 +1656,13 @@ export type ServerConfig = {
   cors?: Array<string>
 }
 
+export type ModelFallbackNull = null
+
+export type ModelFallback = {
+  model: string
+  variant: string | ModelFallbackNull
+}
+
 export type PermissionActionConfig = "ask" | "allow" | "deny"
 
 export type PermissionObjectConfig = {
@@ -1936,6 +1943,10 @@ export type Config = {
   enabled_providers?: Array<string>
   model?: string
   small_model?: string
+  /**
+   * Optional fallback model in provider/model format. Set to null to disable automatic fallback; variant null uses the provider/model default reasoning behavior.
+   */
+  fallback?: ModelFallbackNull | ModelFallback
   default_agent?: string
   subagent_depth?: number
   username?: string

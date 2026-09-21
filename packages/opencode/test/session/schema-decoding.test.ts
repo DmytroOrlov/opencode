@@ -8,6 +8,9 @@ import { SessionStatus } from "../../src/session/status"
 import { SessionSummary } from "../../src/session/summary"
 import { Todo } from "../../src/session/todo"
 import { SessionID, MessageID, PartID } from "../../src/session/schema"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { ProviderV2 } from "@opencode-ai/core/provider"
+import { ModelV2 } from "@opencode-ai/core/model"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 
@@ -304,10 +307,110 @@ describe("SessionPrompt input schemas", () => {
     const decode = decodeUnknown(SessionPrompt.CommandInput)
     const expected = {
       sessionID,
-      arguments: "--flag",
       command: "deploy",
+      arguments: "--flag",
     }
     const input: unknown = expected
     expect(decode(input)).toEqual(expected)
+  })
+})
+
+describe("SessionV1.User origin", () => {
+  const decode = decodeUnknown(SessionV1.User)
+  const ordinary = {
+    id: messageID,
+    sessionID,
+    role: "user",
+    time: { created: 1 },
+    agent: "build",
+    model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+  } as const
+
+  test("genuine ordinary user without origin decodes unchanged (no migration)", () => {
+    const input = { ...ordinary }
+    const decoded = decode(input)
+    expect(decoded).toEqual(input)
+    expect(decoded.origin).toBeUndefined()
+  })
+
+  test("known synthetic origins round-trip", () => {
+    for (const origin of ["compaction", "recovery-preparation"] as const) {
+      const input = { ...ordinary, origin }
+      expect(decode(input)).toEqual(input)
+    }
+  })
+
+  test("unknown present origin remains accepted as an arbitrary synthetic value", () => {
+    const input = { ...ordinary, origin: "future-synthetic" }
+    expect(decode(input)).toEqual(input)
+  })
+
+  test("origin survives the Message union decode", () => {
+    const input = { ...ordinary, origin: "compaction" }
+    expect(decodeUnknown(SessionV1.Info)(input)).toEqual(input)
+    expect(decodeUnknown(SessionV1.Info)(ordinary)).toEqual(ordinary)
+  })
+
+  test("rejects non-string origin", () => {
+    expect(() => decode({ ...ordinary, origin: 42 })).toThrow()
+  })
+})
+
+describe("SessionV1.CompactionPart publication", () => {
+  const decode = decodeUnknown(SessionV1.CompactionPart)
+  const base = {
+    id: partID,
+    sessionID,
+    messageID,
+    type: "compaction",
+    auto: false,
+  } as const
+
+  test("legacy compaction part without publication decodes unchanged (no migration)", () => {
+    const input = { ...base }
+    const decoded = decode(input)
+    expect(decoded).toEqual(input)
+    expect(decoded.publication).toBeUndefined()
+  })
+
+  test("legacy compaction part with tail_start_id and without publication decodes unchanged", () => {
+    const input = { ...base, tail_start_id: messageID }
+    const decoded = decode(input)
+    expect(decoded).toEqual(input)
+    expect(decoded.publication).toBeUndefined()
+  })
+
+  test("queued, preparing, and abandoned publication states round-trip", () => {
+    for (const state of ["queued", "preparing", "abandoned"] as const) {
+      const input = { ...base, publication: { state } }
+      expect(decode(input)).toEqual(input)
+    }
+  })
+
+  test("rejects an unexpected summaryID on queued, preparing, and abandoned", () => {
+    for (const state of ["queued", "preparing", "abandoned"] as const) {
+      const bad = { ...base, publication: { state, summaryID: messageID } } as unknown
+      expect(() => decode(bad)).toThrow()
+    }
+  })
+
+  test("published state round-trips with its exact summaryID", () => {
+    const input = { ...base, publication: { state: "published", summaryID: messageID } as const }
+    expect(decode(input)).toEqual(input)
+  })
+
+  test("rejects published without a summaryID (malformed published identity)", () => {
+    const bad = { ...base, publication: { state: "published" } } as unknown
+    expect(() => decode(bad)).toThrow()
+  })
+
+  test("rejects published with a non-message summaryID", () => {
+    const bad = { ...base, publication: { state: "published", summaryID: "not-a-message-id" } } as unknown
+    expect(() => decode(bad)).toThrow()
+  })
+
+  test("rejects unknown publication state", () => {
+    const bad = { ...base, publication: { state: "retired" } } as unknown
+    expect(() => decode(bad)).toThrow()
   })
 })

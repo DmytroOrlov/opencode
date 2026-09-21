@@ -3,6 +3,8 @@ import { describe, expect, test } from "bun:test"
 import { Context, Effect, Layer, Option } from "effect"
 import { HttpBody, HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
+import { GenerationGate } from "@opencode-ai/core/session/generation-gate"
+import { FallbackRuntimeIntent } from "../../src/session/fallback-runtime-intent"
 import { Auth } from "../../src/auth"
 import { Config } from "../../src/config/config"
 import { Installation } from "../../src/installation"
@@ -28,6 +30,8 @@ const apiLayer = HttpRouter.serve(
   { disableListenLog: true, disableLogger: true },
 ).pipe(
   Layer.provideMerge(NodeHttpServer.layerTest),
+  Layer.provide(Layer.effect(GenerationGate.Service, GenerationGate.make)),
+  Layer.provide(FallbackRuntimeIntent.layer),
   Layer.provide(Layer.mock(Auth.Service)({})),
   Layer.provide(Layer.mock(Config.Service)({})),
   Layer.provide(Layer.mock(MoveSession.Service)({})),

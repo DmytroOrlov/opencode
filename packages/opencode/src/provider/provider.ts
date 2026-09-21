@@ -33,43 +33,178 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderError } from "./error"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 300_000
+const SPLASH_ADAPTIVE_SAMPLE_MIN_WAIT_MS = 100
+const SPLASH_ADAPTIVE_SAMPLE_WINDOW = 5
+const SPLASH_ADAPTIVE_TIMEOUT_MULTIPLIER = 10
+const SPLASH_ADAPTIVE_TIMEOUT_MIN_MS = 30_000
+const SPLASH_ADAPTIVE_TIMEOUT_MAX_MS = 300_000
 
-function wrapSSE(res: Response, ms: number, ctl: AbortController) {
-  if (typeof ms !== "number" || ms <= 0) return res
+type TransportSummary = Record<string, unknown>
+type TransportSummaryLogger = (summary: TransportSummary) => Promise<unknown>
+
+function deriveAdaptiveChunkTimeout(samples: readonly number[]) {
+  const sorted = [...samples].sort((left, right) => left - right)
+  const sustainedWaitMs = sorted[sorted.length - 2] ?? 0
+  return {
+    basisWaitMs: sustainedWaitMs,
+    timeoutMs: Math.min(
+      SPLASH_ADAPTIVE_TIMEOUT_MAX_MS,
+      Math.max(SPLASH_ADAPTIVE_TIMEOUT_MIN_MS, sustainedWaitMs * SPLASH_ADAPTIVE_TIMEOUT_MULTIPLIER),
+    ),
+  }
+}
+
+function isLoopbackHttpEndpoint(endpoint: string | undefined) {
+  if (!endpoint) return false
+  try {
+    const url = new URL(endpoint)
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false
+    const hostname = url.hostname.toLowerCase()
+    if (hostname === "localhost" || hostname === "::1" || hostname === "[::1]") return true
+    const octets = hostname.split(".")
+    return (
+      octets.length === 4 &&
+      octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255) &&
+      Number(octets[0]) === 127
+    )
+  } catch {
+    return false
+  }
+}
+
+function requestUsesEndpointOrigin(input: RequestInfo | URL, endpoint: string | undefined) {
+  if (!endpoint) return false
+  try {
+    const inputUrl = new URL(input instanceof Request ? input.url : input)
+    const endpointUrl = new URL(endpoint)
+    return inputUrl.origin === endpointUrl.origin
+  } catch {
+    return false
+  }
+}
+
+function wrapSSE(
+  res: Response,
+  chunkTimeout: number,
+  ctl: AbortController,
+  metrics: {
+    requestHost?: string
+    responseHeaderWaitMs: number
+    responseAt: number
+    requestSignal?: AbortSignal
+    splashAdaptiveSseTimeoutEligible: boolean
+    logSummary: TransportSummaryLogger
+  },
+) {
   if (!res.body) return res
   if (!res.headers.get("content-type")?.includes("text/event-stream")) return res
 
   const reader = res.body.getReader()
+  let summaryEmitted = false
+  let firstReadWaitMs: number | undefined
+  let maxSuccessfulReadWaitMs = 0
+  let successfulReadCount = 0
+  let chunkCount = 0
+  const qualifyingWaitsMs: number[] = []
+  let adaptiveThresholdMs: number | undefined
+  let adaptiveBasisWaitMs: number | undefined
+  let adaptiveTimingUsed = false
+  const selectReadTimeoutMs = () => {
+    if (!metrics.splashAdaptiveSseTimeoutEligible) return chunkTimeout
+    if (qualifyingWaitsMs.length < SPLASH_ADAPTIVE_SAMPLE_WINDOW) return chunkTimeout
+    const adaptive = deriveAdaptiveChunkTimeout(qualifyingWaitsMs)
+    adaptiveBasisWaitMs = adaptive.basisWaitMs
+    adaptiveThresholdMs = adaptive.timeoutMs
+    adaptiveTimingUsed = true
+    return adaptiveThresholdMs
+  }
+  const finish = (
+    terminalOutcome: "completed" | "timeout" | "abort" | "consumer_cancel" | "other_error",
+    timeoutReadWaitMs?: number,
+  ) => {
+    if (summaryEmitted) return
+    summaryEmitted = true
+    const summary = {
+      ...(metrics.requestHost ? { requestHost: metrics.requestHost } : {}),
+      responseHeaderWaitMs: metrics.responseHeaderWaitMs,
+      ...(firstReadWaitMs === undefined ? {} : { firstReadWaitMs }),
+      maxSuccessfulReadWaitMs,
+      successfulReadCount,
+      chunkCount,
+      sseStreamDurationMs: performance.now() - metrics.responseAt,
+      configuredChunkTimeout: chunkTimeout,
+      splashAdaptiveSseTimeoutEligible: metrics.splashAdaptiveSseTimeoutEligible,
+      adaptiveSampleCount: qualifyingWaitsMs.length,
+      adaptiveTimingUsed,
+      ...(adaptiveThresholdMs === undefined ? {} : { adaptiveThresholdMs }),
+      ...(adaptiveBasisWaitMs === undefined ? {} : { adaptiveBasisWaitMs }),
+      terminalOutcome,
+      ...(timeoutReadWaitMs === undefined ? {} : { timeoutReadWaitMs }),
+    }
+    try {
+      void metrics.logSummary(summary).catch(() => {})
+    } catch {}
+  }
+
   const body = new ReadableStream<Uint8Array>({
     async pull(ctrl) {
-      const part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
-        const id = setTimeout(() => {
-          const err = new ProviderError.ResponseStreamError("SSE read timed out")
-          ctl.abort(err)
-          reader.cancel(err).catch(() => {})
-          reject(err)
-        }, ms)
-
-        reader.read().then(
-          (part) => {
-            clearTimeout(id)
-            resolve(part)
-          },
-          (err) => {
-            clearTimeout(id)
+      const readAt = performance.now()
+      const readTimeoutMs = selectReadTimeoutMs()
+      let part: Awaited<ReturnType<typeof reader.read>>
+      try {
+        part = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+          const id = setTimeout(() => {
+            const err = new ProviderError.ResponseStreamError("SSE read timed out")
+            const timeoutReadWaitMs = performance.now() - readAt
+            firstReadWaitMs ??= timeoutReadWaitMs
+            finish("timeout", timeoutReadWaitMs)
+            ctl.abort(err)
+            reader.cancel(err).catch(() => {})
             reject(err)
-          },
-        )
-      })
+          }, readTimeoutMs)
 
+          reader.read().then(
+            (value) => {
+              clearTimeout(id)
+              resolve(value)
+            },
+            (err) => {
+              clearTimeout(id)
+              reject(err)
+            },
+          )
+        })
+      } catch (err) {
+        if (!summaryEmitted) {
+          firstReadWaitMs ??= performance.now() - readAt
+          finish(metrics.requestSignal?.aborted ? "abort" : "other_error")
+        }
+        throw err
+      }
+
+      const readWaitMs = performance.now() - readAt
+      successfulReadCount += 1
+      firstReadWaitMs ??= readWaitMs
+      maxSuccessfulReadWaitMs = Math.max(maxSuccessfulReadWaitMs, readWaitMs)
       if (part.done) {
+        finish(metrics.requestSignal?.aborted ? "abort" : "completed")
         ctrl.close()
         return
       }
 
+      chunkCount += 1
+      if (
+        metrics.splashAdaptiveSseTimeoutEligible &&
+        part.value.byteLength > 0 &&
+        readWaitMs >= SPLASH_ADAPTIVE_SAMPLE_MIN_WAIT_MS
+      ) {
+        qualifyingWaitsMs.push(readWaitMs)
+        if (qualifyingWaitsMs.length > SPLASH_ADAPTIVE_SAMPLE_WINDOW) qualifyingWaitsMs.shift()
+      }
       ctrl.enqueue(part.value)
     },
     async cancel(reason) {
+      finish(metrics.requestSignal?.aborted ? "abort" : "consumer_cancel")
       ctl.abort(reason)
       await reader.cancel(reason)
     },
@@ -93,7 +228,11 @@ function timeoutController(ms: number) {
 
 // Applies the `headerTimeout`, `chunkTimeout` (SSE idle) and `timeout` provider options at the
 // fetch layer, on top of `options.fetch` when a custom fetch is configured.
-function timeoutFetch(options: Record<string, any>) {
+function timeoutFetch(
+  options: Record<string, any>,
+  logSummary: TransportSummaryLogger,
+  splashAdaptiveSseTimeout: { enabled: boolean; endpoint?: string } = { enabled: false },
+) {
   const customFetch = options["fetch"]
   const chunkTimeout = options["chunkTimeout"] ?? 300_000
   const headerTimeout = options["headerTimeout"] ?? 300_000
@@ -102,6 +241,19 @@ function timeoutFetch(options: Record<string, any>) {
   return async (input: any, init?: BunFetchRequestInit) => {
     const fetchFn = customFetch ?? fetch
     const opts = init ?? {}
+    const requestSignal = opts.signal ?? (input instanceof Request ? input.signal : undefined)
+    const requestStartedAt = performance.now()
+    const requestHost = (() => {
+      try {
+        return new URL(input instanceof Request ? input.url : input).host
+      } catch {
+        return undefined
+      }
+    })()
+    const splashAdaptiveSseTimeoutEligible =
+      splashAdaptiveSseTimeout.enabled &&
+      isLoopbackHttpEndpoint(splashAdaptiveSseTimeout.endpoint) &&
+      requestUsesEndpointOrigin(input, splashAdaptiveSseTimeout.endpoint)
     const chunkAbortCtl = typeof chunkTimeout === "number" && chunkTimeout > 0 ? new AbortController() : undefined
     const headerTimeoutMs = headerTimeout === false ? undefined : headerTimeout
     const headerTimeoutCtl = typeof headerTimeoutMs === "number" ? timeoutController(headerTimeoutMs) : undefined
@@ -122,7 +274,15 @@ function timeoutFetch(options: Record<string, any>) {
     }).finally(() => headerTimeoutCtl?.clear())
 
     if (!chunkAbortCtl) return res
-    return wrapSSE(res, chunkTimeout, chunkAbortCtl)
+    const responseAt = performance.now()
+    return wrapSSE(res, chunkTimeout, chunkAbortCtl, {
+      requestHost,
+      responseHeaderWaitMs: responseAt - requestStartedAt,
+      responseAt,
+      requestSignal,
+      splashAdaptiveSseTimeoutEligible,
+      logSummary,
+    })
   }
 }
 
@@ -206,7 +366,7 @@ function selectBedrockMantleLanguageModel(sdk: BundledSDK, modelID: string) {
   return sdk.responses?.(modelID) ?? sdk.languageModel(modelID)
 }
 
-function custom(dep: CustomDep): Record<string, CustomLoader> {
+function custom(dep: CustomDep, logSummary: TransportSummaryLogger): Record<string, CustomLoader> {
   return {
     anthropic: () =>
       Effect.succeed({
@@ -247,6 +407,11 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
           return sdk.responses(modelID)
         },
         options: { headerTimeout: OPENAI_HEADER_TIMEOUT_DEFAULT },
+      }),
+    "opencode-go": () =>
+      Effect.succeed({
+        autoload: false,
+        options: { chunkTimeout: 150_000 },
       }),
     meta: () =>
       Effect.succeed({
@@ -875,7 +1040,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         async getModel(_sdk: any, modelID: string, options?: Record<string, any>) {
           // This loader builds its own clients instead of using the SDK from resolveSDK, so the
           // timeout options have to be applied to the requests it makes explicitly.
-          const gatewayFetch = timeoutFetch(options ?? {})
+          const gatewayFetch = timeoutFetch(options ?? {}, logSummary)
           // ai-gateway-provider's REST path always calls the global fetch. Its binding path hands
           // the request to `run`, so send the same request the REST path would (options as
           // request-level cf-aig-* headers) through the timeout-aware fetch instead.
@@ -1264,6 +1429,7 @@ interface State {
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
+  logSummary: TransportSummaryLogger
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Provider") {}
@@ -1678,7 +1844,9 @@ const layer = Layer.effect(
           mergeProvider(providerID, patch)
         }
 
-        for (const [id, fn] of Object.entries(custom(dep))) {
+        const logTransportSummary: TransportSummaryLogger = (summary) =>
+          bridge.promise(Effect.logDebug("provider SSE transport summary", summary))
+        for (const [id, fn] of Object.entries(custom(dep, logTransportSummary))) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
           const data = database[providerID]
@@ -1777,6 +1945,7 @@ const layer = Layer.effect(
           sdk,
           modelLoaders,
           varsLoaders,
+          logSummary: logTransportSummary,
         }
       }),
     )
@@ -1832,8 +2001,9 @@ const layer = Layer.effect(
     async function resolveSDK(model: Model, s: State, envs: Record<string, string | undefined>) {
       try {
         const provider = s.providers[model.providerID]
-        // OpenCode-local telemetry controls are stripped before the SDK cache
-        // key and both factory paths so they can never reach provider SDKs.
+        // Cache-neutral telemetry controls are stripped before the SDK cache key.
+        // The Splash timeout option is retained through key generation below so
+        // enabled and disabled configurations cannot share an SDK instance.
         const options = { ...provider.options }
         delete options["mlxTelemetry"]
         delete options["splashTelemetry"]
@@ -1847,6 +2017,8 @@ const layer = Layer.effect(
         }
 
         const baseURL = effectiveBaseURL(model, options, s, envs)
+        const splashAdaptiveSseTimeoutEnabled =
+          options["splashAdaptiveSseTimeout"] === true && options["chunkTimeout"] === undefined
 
         if (baseURL !== undefined) options["baseURL"] = baseURL
         if (options["apiKey"] === undefined && provider.key) options["apiKey"] = provider.key
@@ -1866,7 +2038,13 @@ const layer = Layer.effect(
         const existing = s.sdk.get(key)
         if (existing) return existing
 
-        options["fetch"] = timeoutFetch(options)
+        // This option is local to OpenCode. Keep it in the cache key above, then
+        // remove it before either SDK factory path receives the options.
+        delete options["splashAdaptiveSseTimeout"]
+        options["fetch"] = timeoutFetch(options, s.logSummary, {
+          enabled: splashAdaptiveSseTimeoutEnabled,
+          endpoint: baseURL,
+        })
         delete options["chunkTimeout"]
         delete options["headerTimeout"]
 

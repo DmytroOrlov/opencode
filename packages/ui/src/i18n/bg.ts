@@ -84,6 +84,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "Правене на редакции",
   "ui.sessionTurn.status.runningCommands": "Изпълнение на команди",
   "ui.sessionTurn.status.thinking": "Мислене",
+  "ui.sessionTurn.status.fallback": "Резервен модел",
   "ui.sessionTurn.status.thinkingWithTopic": "Мислене - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Събиране на мисли",
   "ui.sessionTurn.status.consideringNextSteps": "Обмисляне на следващите стъпки",

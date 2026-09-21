@@ -84,6 +84,7 @@ export const dict: Record<string, string> = {
   "ui.sessionTurn.status.makingEdits": "Að gera breytingar",
   "ui.sessionTurn.status.runningCommands": "Keyrandi skipanir",
   "ui.sessionTurn.status.thinking": "Að hugsa",
+  "ui.sessionTurn.status.fallback": "Vararmódel",
   "ui.sessionTurn.status.thinkingWithTopic": "Hugsun - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Að safna saman hugsunum",
   "ui.sessionTurn.status.consideringNextSteps": "Íhugar næstu skref",

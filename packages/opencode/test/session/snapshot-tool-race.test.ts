@@ -25,7 +25,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { provideTmpdirServer } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
-import { TestLLMServer } from "../lib/llm-server"
+import { raw, reply, TestLLMServer } from "../lib/llm-server"
 
 import { LSP } from "@/lsp/lsp"
 import { MCP } from "../../src/mcp"
@@ -123,6 +123,30 @@ const providerCfg = (url: string) => ({
   },
 })
 
+const fallbackProviderCfg = (url: string) => {
+  const base = providerCfg(url)
+  return {
+    ...base,
+    provider: {
+      ...base.provider,
+      mlx: {
+        ...base.provider.test,
+        id: "mlx",
+        name: "MLX",
+        models: {
+          "qwen3.8-27b": {
+            ...base.provider.test.models["test-model"],
+            id: "qwen3.8-27b",
+            name: "Qwen 3.8 27B",
+            reasoning: true,
+            variants: { xhigh: { reasoningEffort: "xhigh" } },
+          },
+        },
+      },
+    },
+  }
+}
+
 it.live("tool execution produces non-empty session diff (snapshot race)", () =>
   provideTmpdirServer(
     Effect.fnUntraced(function* ({ dir, llm }) {
@@ -185,5 +209,52 @@ it.live("tool execution produces non-empty session diff (snapshot race)", () =>
       expect(diff.length).toBeGreaterThan(0)
     }),
     { git: true, config: providerCfg },
+  ),
+)
+
+it.live("continuation preserves executed tool patch provenance", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ dir, llm }) {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const session = yield* sessions.create({
+        title: "snapshot continuation test",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const filePath = path.join(dir, "continuation.txt")
+      const command = `echo 'continuation content' > ${filePath}`
+
+      yield* llm.toolMatch((hit) => JSON.stringify(hit.body).includes("create continuation file"), "bash", { command })
+      yield* llm.pushMatch(
+        (hit) => hit.body.model === "test-model",
+        raw({
+          chunks: [
+            {
+              id: "chatcmpl-snapshot-failure",
+              object: "chat.completion.chunk",
+              choices: [{ index: 0, delta: {}, finish_reason: "network_error" }],
+            },
+          ],
+        }),
+      )
+      yield* llm.pushMatch((hit) => hit.body.model === "qwen3.8-27b", reply().text("continued").stop().item())
+
+      yield* prompt.prompt({
+        sessionID: session.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "create continuation file" }],
+      })
+      const result = yield* prompt.loop({ sessionID: session.id })
+      const messages = yield* MessageV2.filterCompactedEffect(session.id)
+      const parts = messages.flatMap((message) => message.parts)
+      const tool = parts.find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "bash")
+
+      expect(result.info.role).toBe("assistant")
+      expect(tool?.state.status).toBe("completed")
+      expect(parts.some((part) => part.type === "patch" && part.files.some((file) => file === filePath))).toBe(true)
+      expect(parts.some((part) => part.type === "text" && part.text === "continued")).toBe(true)
+    }),
+    { git: true, config: fallbackProviderCfg },
   ),
 )

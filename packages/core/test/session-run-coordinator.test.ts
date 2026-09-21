@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { GenerationGate } from "@opencode-ai/core/session/generation-gate"
 import { SessionRunCoordinator } from "@opencode-ai/core/session/run-coordinator"
 import { testEffect } from "./lib/effect"
 
@@ -388,6 +389,259 @@ describe("SessionRunCoordinator", () => {
         yield* Deferred.await(bothStarted)
         yield* Deferred.succeed(gate, undefined)
         yield* Effect.all([Fiber.join(first), Fiber.join(second)])
+      }),
+    ),
+  )
+
+  it.effect("holds one shared lease for the coordinator-owned drain, including joiners", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const gate = yield* GenerationGate.make
+        const started = yield* Deferred.make<void>()
+        const finish = yield* Deferred.make<void>()
+        let runs = 0
+        const coordinator = yield* SessionRunCoordinator.make({
+          gate,
+          drain: () =>
+            Effect.sync(() => ++runs).pipe(
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              Effect.andThen(Deferred.await(finish)),
+            ),
+        })
+
+        const first = yield* coordinator.run("session").pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        const joiner = yield* coordinator.run("session").pipe(Effect.forkChild)
+        const writer = yield* gate.reserveExclusive
+        const writerWaiting = yield* Deferred.make<void>()
+        const writerStarted = yield* Deferred.make<void>()
+        const finishWriter = yield* Deferred.make<void>()
+        const writerFiber = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(writerWaiting, undefined)
+          yield* writer.await
+          const lease = yield* writer.transfer
+          if (lease === undefined) return yield* Effect.die("writer was not granted")
+          yield* Deferred.succeed(writerStarted, undefined)
+          yield* Deferred.await(finishWriter)
+          yield* lease.release
+        }).pipe(Effect.forkChild)
+
+        yield* Deferred.await(writerWaiting)
+        expect(yield* Deferred.isDone(writerStarted)).toBeFalse()
+        yield* Deferred.succeed(finish, undefined)
+        yield* Deferred.await(writerStarted)
+        yield* Deferred.succeed(finishWriter, undefined)
+        yield* Effect.all([Fiber.join(first), Fiber.join(joiner), Fiber.join(writerFiber)])
+        expect(runs).toBe(1)
+      }),
+    ),
+  )
+
+  it.effect("releases the coordinator lease after drain failure", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const gate = yield* GenerationGate.make
+        const failure = new Error("drain failed")
+        const coordinator = yield* SessionRunCoordinator.make({ gate, drain: () => Effect.fail(failure) })
+
+        const result = yield* coordinator.run("session").pipe(Effect.exit)
+        expect(Exit.isFailure(result) && Cause.hasFails(result.cause)).toBeTrue()
+
+        const writer = yield* gate.reserveExclusive
+        yield* writer.await
+        const lease = yield* writer.transfer
+        expect(lease).toBeDefined()
+        yield* lease!.release
+      }),
+    ),
+  )
+
+  it.effect("orders a pending wake before a writer when the wake reserves first", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const gate = yield* GenerationGate.make
+        const firstStarted = yield* Deferred.make<void>()
+        const firstFinish = yield* Deferred.make<void>()
+        const secondStarted = yield* Deferred.make<void>()
+        const secondFinish = yield* Deferred.make<void>()
+        let runs = 0
+        const actual = yield* SessionRunCoordinator.make({
+          gate,
+          drain: () =>
+            Effect.sync(() => ++runs).pipe(
+              Effect.flatMap((run) =>
+                run === 1
+                  ? Deferred.succeed(firstStarted, undefined).pipe(Effect.andThen(Deferred.await(firstFinish)))
+                  : Deferred.succeed(secondStarted, undefined).pipe(Effect.andThen(Deferred.await(secondFinish))),
+              ),
+            ),
+        })
+        const resumed = yield* actual.run("session").pipe(Effect.forkChild)
+        yield* Deferred.await(firstStarted)
+        yield* actual.wake("session")
+        const writer = yield* gate.reserveExclusive
+        const writerWaiting = yield* Deferred.make<void>()
+        const writerStarted = yield* Deferred.make<void>()
+        const finishWriter = yield* Deferred.make<void>()
+        const writerFiber = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(writerWaiting, undefined)
+          yield* writer.await
+          const lease = yield* writer.transfer
+          if (lease === undefined) return yield* Effect.die("writer was not granted")
+          yield* Deferred.succeed(writerStarted, undefined)
+          yield* Deferred.await(finishWriter)
+          yield* lease.release
+        }).pipe(Effect.forkChild)
+
+        yield* Deferred.succeed(firstFinish, undefined)
+        yield* Deferred.await(secondStarted)
+        yield* Deferred.await(writerWaiting)
+        expect(yield* Deferred.isDone(writerStarted)).toBeFalse()
+        yield* Deferred.succeed(secondFinish, undefined)
+        yield* Deferred.await(writerStarted)
+        yield* Deferred.succeed(finishWriter, undefined)
+        yield* Effect.all([Fiber.join(resumed), Fiber.join(writerFiber)])
+      }),
+    ),
+  )
+
+  it.effect("orders a pending wake after a writer when the writer reserves first", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const gate = yield* GenerationGate.make
+        const firstStarted = yield* Deferred.make<void>()
+        const firstFinish = yield* Deferred.make<void>()
+        const secondStarted = yield* Deferred.make<void>()
+        let runs = 0
+        const coordinator = yield* SessionRunCoordinator.make({
+          gate,
+          drain: () =>
+            Effect.sync(() => ++runs).pipe(
+              Effect.flatMap((run) =>
+                run === 1
+                  ? Deferred.succeed(firstStarted, undefined).pipe(Effect.andThen(Deferred.await(firstFinish)))
+                  : Deferred.succeed(secondStarted, undefined),
+              ),
+            ),
+        })
+        const resumed = yield* coordinator.run("session").pipe(Effect.forkChild)
+        yield* Deferred.await(firstStarted)
+        const writer = yield* gate.reserveExclusive
+        const writerWaiting = yield* Deferred.make<void>()
+        const writerStarted = yield* Deferred.make<void>()
+        const finishWriter = yield* Deferred.make<void>()
+        const writerFiber = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(writerWaiting, undefined)
+          yield* writer.await
+          const lease = yield* writer.transfer
+          if (lease === undefined) return yield* Effect.die("writer was not granted")
+          yield* Deferred.succeed(writerStarted, undefined)
+          yield* Deferred.await(finishWriter)
+          yield* lease.release
+        }).pipe(Effect.forkChild)
+        yield* Deferred.await(writerWaiting)
+        yield* coordinator.wake("session")
+
+        yield* Deferred.succeed(firstFinish, undefined)
+        yield* Deferred.await(writerStarted)
+        expect(yield* Deferred.isDone(secondStarted)).toBeFalse()
+        yield* Deferred.succeed(finishWriter, undefined)
+        yield* Deferred.await(secondStarted)
+        yield* Effect.all([Fiber.join(resumed), Fiber.interrupt(writerFiber)])
+      }),
+    ),
+  )
+
+  it.effect("cancels a queued pending wake when interrupted before successor start", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const gate = yield* GenerationGate.make
+        const started = yield* Deferred.make<void>()
+        const interrupted = yield* Deferred.make<void>()
+        let runs = 0
+        const coordinator = yield* SessionRunCoordinator.make({
+          gate,
+          drain: () =>
+            Effect.sync(() => ++runs).pipe(
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              Effect.andThen(Effect.never),
+              Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+            ),
+        })
+
+        const resumed = yield* coordinator.run("session").pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        const writer = yield* gate.reserveExclusive
+        const writerWaiting = yield* Deferred.make<void>()
+        const writerStarted = yield* Deferred.make<void>()
+        const finishWriter = yield* Deferred.make<void>()
+        const writerFiber = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(writerWaiting, undefined)
+          yield* writer.await
+          const lease = yield* writer.transfer
+          if (lease === undefined) return yield* Effect.die("writer was not granted")
+          yield* Deferred.succeed(writerStarted, undefined)
+          yield* Deferred.await(finishWriter)
+          yield* lease.release
+        }).pipe(Effect.forkChild)
+
+        yield* Deferred.await(writerWaiting)
+        yield* coordinator.wake("session")
+        yield* coordinator.interrupt("session")
+        yield* Deferred.await(interrupted)
+        yield* Deferred.await(writerStarted)
+        expect(yield* Deferred.isDone(started)).toBeTrue()
+        expect(runs).toBe(1)
+        yield* Deferred.succeed(finishWriter, undefined)
+        yield* Fiber.interrupt(resumed)
+        yield* Fiber.join(writerFiber)
+      }),
+    ),
+  )
+
+  it.effect("releases a granted but not started pending wake when interrupted", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const gate = yield* GenerationGate.make
+        const started = yield* Deferred.make<void>()
+        const interrupted = yield* Deferred.make<void>()
+        let runs = 0
+        const coordinator = yield* SessionRunCoordinator.make({
+          gate,
+          drain: () =>
+            Effect.sync(() => ++runs).pipe(
+              Effect.andThen(Deferred.succeed(started, undefined)),
+              Effect.andThen(Effect.never),
+              Effect.onInterrupt(() => Deferred.succeed(interrupted, undefined)),
+            ),
+        })
+
+        const resumed = yield* coordinator.run("session").pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        yield* coordinator.wake("session")
+        const writer = yield* gate.reserveExclusive
+        const writerWaiting = yield* Deferred.make<void>()
+        const writerStarted = yield* Deferred.make<void>()
+        const finishWriter = yield* Deferred.make<void>()
+        const writerFiber = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(writerWaiting, undefined)
+          yield* writer.await
+          const lease = yield* writer.transfer
+          if (lease === undefined) return yield* Effect.die("writer was not granted")
+          yield* Deferred.succeed(writerStarted, undefined)
+          yield* Deferred.await(finishWriter)
+          yield* lease.release
+        }).pipe(Effect.forkChild)
+
+        yield* Deferred.await(writerWaiting)
+        yield* coordinator.interrupt("session")
+        yield* Deferred.await(interrupted)
+        yield* Deferred.await(writerStarted)
+        expect(yield* Deferred.isDone(started)).toBeTrue()
+        expect(runs).toBe(1)
+        yield* Deferred.succeed(finishWriter, undefined)
+        yield* Fiber.interrupt(resumed)
+        yield* Fiber.join(writerFiber)
       }),
     ),
   )

@@ -81,6 +81,7 @@ import { useSync } from "@/context/sync"
 import { notifySessionTabsRemoved } from "@/components/titlebar-session-events"
 import { sessionTitle } from "@/utils/session-title"
 import { scheduleConnectedMeasure } from "./measure"
+import { selectTurnFallbackModel, type TurnFallbackModel } from "./model"
 import { observeElementOffsetReconnectAware } from "./observe-element-offset"
 import { createTimelineProjection } from "./projection"
 import { MessageComment, SummaryDiff, TimelineRow, TimelineRowMap } from "./rows"
@@ -141,18 +142,33 @@ function TimelineThinkingRow(props: {
   reasoningHeading?: string
   showReasoningSummaries: boolean
   telemetry?: GenerationTelemetrySnapshot
+  fallbackModel?: TurnFallbackModel
 }) {
   const language = useLanguage()
 
   return (
     <div data-slot="session-turn-thinking">
-      <TextShimmer
-        text={formatThinkingTelemetry(
-          language.t("ui.sessionTurn.status.thinking"),
-          props.telemetry,
-          language.locale(),
-        )}
-      />
+      <div class="flex items-center gap-2">
+        <Show when={props.fallbackModel}>
+          {(fallback) => (
+            <span data-slot="session-turn-fallback" class="flex items-center gap-1 text-12-regular text-text-weak">
+              <Icon name="arrow-undo-down" size="small" />
+              <span>
+                {language.t("ui.sessionTurn.status.fallback")} · {fallback().providerID}/{fallback().modelID}
+                <Show when={fallback().variant}> · {fallback().variant}</Show>
+              </span>
+            </span>
+          )}
+        </Show>
+
+        <TextShimmer
+          text={formatThinkingTelemetry(
+            language.t("ui.sessionTurn.status.thinking"),
+            props.telemetry,
+            language.locale(),
+          )}
+        />
+      </div>
       <Show when={!props.showReasoningSummaries}>
         <TextReveal text={props.reasoningHeading} class="session-turn-thinking-heading" travel={25} duration={700} />
       </Show>
@@ -1229,6 +1245,13 @@ export function MessageTimeline(props: {
             assistantMessagesByParent().get(thinkingRow().userMessageID) ?? emptyAssistantMessages,
             sessionID() ? sync().data.generation_telemetry[sessionID()!] : undefined,
           )
+        const fallbackModel = () => {
+          const userMessage = messageByID().get(thinkingRow().userMessageID)
+          return selectTurnFallbackModel(
+            userMessage?.role === "user" ? userMessage : undefined,
+            assistantMessagesByParent().get(thinkingRow().userMessageID) ?? emptyAssistantMessages,
+          )
+        }
         return (
           <TimelineRowFrame row={thinkingRow}>
             <div data-slot="session-turn-message-container" class="w-full px-4 md:px-5">
@@ -1236,6 +1259,7 @@ export function MessageTimeline(props: {
                 reasoningHeading={thinkingRow().reasoningHeading}
                 showReasoningSummaries={settings.general.showReasoningSummaries()}
                 telemetry={telemetry()}
+                fallbackModel={fallbackModel()}
               />
             </div>
           </TimelineRowFrame>

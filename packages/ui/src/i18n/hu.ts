@@ -86,6 +86,7 @@ export const dict: Record<string, string> = {
   "ui.sessionTurn.status.makingEdits": "Szerkesztések elvégzése",
   "ui.sessionTurn.status.runningCommands": "Parancsok futtatása",
   "ui.sessionTurn.status.thinking": "Gondolkodás",
+  "ui.sessionTurn.status.fallback": "Tartalékmodell",
   "ui.sessionTurn.status.thinkingWithTopic": "Gondolkodás - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Gondolatok gyűjtése",
   "ui.sessionTurn.status.consideringNextSteps": "A következő lépések mérlegelése",

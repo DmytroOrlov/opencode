@@ -93,7 +93,16 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const disposeContext = Effect.fn("InstanceStore.disposeContext")(function* (ctx: InstanceContext) {
       yield* Effect.logInfo("disposing instance", { directory: ctx.directory })
-      yield* Effect.promise(() => runDisposers(ctx.directory))
+      const outcomes = yield* Effect.promise(() => runDisposers(ctx.directory))
+      for (const outcome of outcomes) {
+        if (outcome.status === "failure") {
+          yield* Effect.logWarning("instance disposer failed", {
+            directory: ctx.directory,
+            disposer: outcome.index,
+            cause: outcome.error,
+          })
+        }
+      }
       yield* emitDisposed({ directory: ctx.directory, project: ctx.project.id })
     })
 
@@ -164,9 +173,10 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     })
 
     const disposeAllOnce = Effect.fnUntraced(function* () {
+      const entries = [...cache.entries()]
       yield* Effect.logInfo("disposing all instances")
       yield* Effect.forEach(
-        [...cache.entries()],
+        entries,
         (item) =>
           Effect.gen(function* () {
             const exit = yield* Deferred.await(item[1].deferred).pipe(Effect.exit)
@@ -175,7 +185,11 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
               yield* removeEntry(item[0], item[1])
               return
             }
-            yield* disposeEntry(item[0], item[1], exit.value)
+            const cleanup = yield* Effect.exit(disposeContext(exit.value))
+            yield* removeEntry(item[0], item[1])
+            if (Exit.isFailure(cleanup)) {
+              yield* Effect.logWarning("instance dispose failed", { key: item[0], cause: cleanup.cause })
+            }
           }),
         { discard: true },
       )
