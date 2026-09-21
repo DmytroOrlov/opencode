@@ -6,6 +6,7 @@ export type ServerInfo = {
   hostname?: string | undefined
   urls: Array<string>
   paths: { tmp: string }
+  tlsCaMode?: "bundled" | "system" | undefined
   capabilities?: { persistentPty?: boolean | undefined } | undefined
 }
 

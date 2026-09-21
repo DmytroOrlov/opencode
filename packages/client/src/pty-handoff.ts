@@ -66,7 +66,7 @@ async function publish(file: string, info: Info, handoff: PersistentPty.Handoff 
   await rename(temporary, file + ".pty-handoff").finally(() => rm(temporary, { force: true }))
 }
 
-export async function environment(file: string, env?: Readonly<Record<string, string>>) {
+export async function environment(file: string, env?: Readonly<Record<string, string | undefined>>) {
   const record = await read(file)
   const current: Info | undefined = await readFile(file, "utf8")
     .then((text) => JSON.parse(text))

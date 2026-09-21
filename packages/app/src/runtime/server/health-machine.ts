@@ -4,9 +4,14 @@ import type { ServerConnection } from "./registry"
 
 export const SERVER_HEALTH_POLL_MS = 10_000
 
-/** The answer of one `/api/info` probe. */
+/** The answer of one `/api/info` probe. `tlsCaMode` is absent when the server does not report its verified CA mode. */
 export type ServerProbeResult =
-  | { readonly type: "healthy"; readonly version?: string; readonly hostname?: string }
+  | {
+      readonly type: "healthy"
+      readonly version?: string
+      readonly hostname?: string
+      readonly tlsCaMode?: "bundled" | "system"
+    }
   | { readonly type: "unauthorized" }
   | { readonly type: "unreachable" }
 
@@ -38,22 +43,29 @@ export type ServerHealthInput =
 type Endpoint = { readonly http: ServerConnection.HttpBase; readonly auth: string; readonly managed: boolean }
 
 /**
- * One server. Every probe carries the slot's `attempt`; an answer for another attempt is stale. `checking` and
- * `refreshing` have a probe in flight, `settled` waits for the next poll.
+ * One server. Every probe carries the slot's `incarnation` and `attempt`; an answer for another incarnation or
+ * attempt is stale. `checking` and `refreshing` have a probe in flight, `settled` waits for the next poll.
  */
 export type ServerHealthSlot =
-  | { readonly type: "staged"; readonly stage: PluginStage; readonly attempt: number }
-  | { readonly type: "checking"; readonly endpoint: Endpoint; readonly attempt: number }
+  | { readonly type: "staged"; readonly stage: PluginStage; readonly incarnation: number; readonly attempt: number }
+  | {
+      readonly type: "checking"
+      readonly endpoint: Endpoint
+      readonly incarnation: number
+      readonly attempt: number
+    }
   | {
       readonly type: "settled"
       readonly endpoint: Endpoint
       readonly result: ServerProbeResult
+      readonly incarnation: number
       readonly attempt: number
     }
   | {
       readonly type: "refreshing"
       readonly endpoint: Endpoint
       readonly result: ServerProbeResult
+      readonly incarnation: number
       readonly attempt: number
     }
 
@@ -66,6 +78,8 @@ type RetryWaiter = {
 export type ServerHealthState = {
   readonly entries: ReadonlyMap<ServerConnection.Key, ServerHealthSlot>
   readonly waiters: readonly RetryWaiter[]
+  /** The next listing identity; only this owner allocates incarnations. */
+  readonly nextIncarnation: number
 }
 
 /** An accepted probe answer, with the endpoint credentials it used. */
@@ -82,6 +96,7 @@ export type ServerHealthEvent =
   | {
       readonly type: "probe.settled"
       readonly key: ServerConnection.Key
+      readonly incarnation: number
       readonly attempt: number
       readonly result: ServerProbeResult
     }
@@ -91,6 +106,7 @@ export type ServerHealthEffect =
   | {
       readonly type: "probe"
       readonly key: ServerConnection.Key
+      readonly incarnation: number
       readonly attempt: number
       readonly http: ServerConnection.HttpBase
     }
@@ -105,7 +121,7 @@ export type ServerHealthTransition = {
 }
 
 export function createServerHealthState(): ServerHealthState {
-  return { entries: new Map(), waiters: [] }
+  return { entries: new Map(), waiters: [], nextIncarnation: 1 }
 }
 
 export function transitionServerHealth(state: ServerHealthState, event: ServerHealthEvent): ServerHealthTransition {
@@ -121,7 +137,7 @@ export function transitionServerHealth(state: ServerHealthState, event: ServerHe
   if (!state.entries.size && !state.waiters.length) return { state, effects: [] }
 
   return {
-    state: createServerHealthState(),
+    state: { ...state, entries: new Map(), waiters: [] },
     effects: [
       ...(polling(state) ? [{ type: "timer.stop" as const }] : []),
       ...resolved(state.waiters.map((waiter) => waiter.resolve)),
@@ -173,6 +189,11 @@ export function selectServerHostname(health: ServerHealth | undefined) {
   return health?.type === "healthy" ? health.hostname : undefined
 }
 
+/** The trust set the server attested at startup. Unknown servers stay unknown; nothing is inferred locally. */
+export function selectServerTlsCaMode(health: ServerHealth | undefined) {
+  return health?.type === "healthy" ? health.tlsCaMode : undefined
+}
+
 /** Sort rank: healthy first, then servers still settling, then failed ones. */
 export function selectServerHealthRank(health: ServerHealth | undefined) {
   if (health?.type === "healthy") return 0
@@ -198,10 +219,12 @@ export function selectServerIndicator(health: ServerHealth | undefined) {
 export type ServerIndicator = ReturnType<typeof selectServerIndicator>
 
 function synced(state: ServerHealthState, servers: readonly ServerHealthInput[]): ServerHealthTransition {
+  let nextIncarnation = state.nextIncarnation
+  const allocate = () => nextIncarnation++
+
   const steps = servers.map((input) => {
     const slot = state.entries.get(input.key)
-
-    return { key: input.key, slot, next: listed(slot, input) }
+    return { key: input.key, slot, next: listed(slot, input, allocate) }
   })
 
   const entries =
@@ -213,17 +236,29 @@ function synced(state: ServerHealthState, servers: readonly ServerHealthInput[])
     state,
     entries,
     steps.flatMap((step) =>
-      step.next.type === "checking" && step.next.attempt !== step.slot?.attempt ? [probe(step.key, step.next)] : [],
+      step.next.type === "checking" &&
+      (step.next.incarnation !== step.slot?.incarnation || step.next.attempt !== step.slot?.attempt)
+        ? [probe(step.key, step.next)]
+        : [],
     ),
+    nextIncarnation,
   )
 }
 
-function listed(slot: ServerHealthSlot | undefined, input: ServerHealthInput): ServerHealthSlot {
+function listed(
+  slot: ServerHealthSlot | undefined,
+  input: ServerHealthInput,
+  allocate: () => number,
+): ServerHealthSlot {
   if (input.type === "staged") {
     if (slot?.type === "staged" && slot.stage === input.stage) return slot
 
-    // The probe in flight, if any, keeps its attempt and so can never land.
-    return { type: "staged", stage: input.stage, attempt: slot?.attempt ?? 0 }
+    return {
+      type: "staged",
+      stage: input.stage,
+      incarnation: slot?.incarnation ?? allocate(),
+      attempt: slot?.attempt ?? 0,
+    }
   }
 
   const auth = endpointCredentials(input.http)
@@ -233,6 +268,7 @@ function listed(slot: ServerHealthSlot | undefined, input: ServerHealthInput): S
     return {
       type: "checking",
       endpoint: { http: input.http, auth, managed: input.managed },
+      incarnation: allocate(),
       attempt: (slot?.attempt ?? 0) + 1,
     }
 
@@ -252,7 +288,7 @@ function polled(state: ServerHealthState): ServerHealthTransition {
   const entries = new Map(state.entries)
   due.forEach((item) => entries.set(item.key, item.next))
 
-  return { state: { entries, waiters: state.waiters }, effects: due.map((item) => probe(item.key, item.next)) }
+  return { state: { ...state, entries }, effects: due.map((item) => probe(item.key, item.next)) }
 }
 
 // A retry replaces any probe in flight, so one that hangs cannot hold the caller.
@@ -275,6 +311,7 @@ function retried(state: ServerHealthState, resolve: () => void): ServerHealthTra
 
   return {
     state: {
+      ...state,
       entries,
       waiters: [
         ...state.waiters,
@@ -295,7 +332,12 @@ function answered(
   const slot = state.entries.get(event.key)
 
   // A superseded, unlisted or disposed probe changes nothing and reaches no listener.
-  if (!slot || (slot.type !== "checking" && slot.type !== "refreshing") || slot.attempt !== event.attempt)
+  if (
+    !slot ||
+    (slot.type !== "checking" && slot.type !== "refreshing") ||
+    slot.incarnation !== event.incarnation ||
+    slot.attempt !== event.attempt
+  )
     return { state, effects: [] }
 
   return settle(
@@ -304,6 +346,7 @@ function answered(
       type: "settled",
       endpoint: slot.endpoint,
       result: event.result,
+      incarnation: slot.incarnation,
       attempt: slot.attempt,
     }),
     [{ type: "notify.probe", probe: { key: event.key, auth: slot.endpoint.auth, result: event.result } }],
@@ -315,6 +358,7 @@ function settle(
   state: ServerHealthState,
   entries: ServerHealthState["entries"],
   effects: readonly ServerHealthEffect[],
+  nextIncarnation = state.nextIncarnation,
 ): ServerHealthTransition {
   if (entries === state.entries) return { state, effects }
 
@@ -324,7 +368,11 @@ function settle(
     return targets.length === waiter.targets.size ? waiter : { resolve: waiter.resolve, targets: new Map(targets) }
   })
 
-  const next = { entries, waiters: remaining.filter((waiter) => waiter.targets.size > 0) }
+  const next = {
+    entries,
+    waiters: remaining.filter((waiter) => waiter.targets.size > 0),
+    nextIncarnation,
+  }
 
   return {
     state: next,
@@ -348,8 +396,21 @@ function polling(state: ServerHealthState) {
   return [...state.entries.values()].some((slot) => slot.type !== "staged")
 }
 
-function probe(key: ServerConnection.Key, slot: { readonly endpoint: Endpoint; readonly attempt: number }) {
-  return { type: "probe" as const, key, attempt: slot.attempt, http: slot.endpoint.http }
+function probe(
+  key: ServerConnection.Key,
+  slot: {
+    readonly endpoint: Endpoint
+    readonly incarnation: number
+    readonly attempt: number
+  },
+) {
+  return {
+    type: "probe" as const,
+    key,
+    incarnation: slot.incarnation,
+    attempt: slot.attempt,
+    http: slot.endpoint.http,
+  }
 }
 
 function resolved(resolvers: readonly (() => void)[]): ServerHealthEffect[] {

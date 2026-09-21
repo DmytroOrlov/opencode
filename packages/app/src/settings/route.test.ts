@@ -1,5 +1,16 @@
 import { describe, expect, test } from "bun:test"
-import { parseSettingsView, settingsViewRedirect, settingsViewUrl, type SettingsView } from "./route"
+import { ServerConnection } from "@/runtime/server/registry"
+import {
+  isSettingsServerView,
+  parseSettingsView,
+  selectSettingsContextServer,
+  settingsServerTabs,
+  settingsViewRedirect,
+  settingsViewUrl,
+  type SettingsPluginTab,
+  type SettingsRootTab,
+  type SettingsView,
+} from "./route"
 
 const parse = (view: SettingsView) => parseSettingsView(new URL(settingsViewUrl(view), "http://localhost").search)
 
@@ -113,5 +124,107 @@ describe("settings route", () => {
       server: undefined,
       subtab: undefined,
     })
+  })
+})
+
+describe("settings context server", () => {
+  const A = ServerConnection.Key.make("A")
+  const B = ServerConnection.Key.make("B")
+  const sidecar = ServerConnection.Key.make("sidecar")
+
+  test("keeps the canonical server-tab order and membership", () => {
+    expect([...settingsServerTabs]).toEqual(["providers", "models", "extensions", "projects", "workspaces"])
+    expect(new Set(settingsServerTabs).size).toBe(settingsServerTabs.length)
+  })
+
+  test("every server-scoped root page uses the selected root", () => {
+    for (const tab of settingsServerTabs) {
+      const view: SettingsView = { type: "root", tab }
+
+      expect(isSettingsServerView(view)).toBe(true)
+      expect(
+        selectSettingsContextServer({
+          view,
+          selectedRoot: A,
+          project: B,
+          source: sidecar,
+        }),
+      ).toBe(A)
+    }
+  })
+
+  test("every client and plugin page uses the captured source", () => {
+    const tabs: Array<SettingsRootTab | SettingsPluginTab> = [
+      "general",
+      "appearance",
+      "notifications",
+      "shortcuts",
+      "servers",
+      "experimental",
+      "about",
+      "example.plugin" as SettingsPluginTab,
+    ]
+
+    for (const tab of tabs) {
+      const view: SettingsView = { type: "root", tab }
+
+      expect(isSettingsServerView(view)).toBe(false)
+      expect(
+        selectSettingsContextServer({
+          view,
+          selectedRoot: A,
+          project: B,
+          source: sidecar,
+        }),
+      ).toBe(sidecar)
+    }
+  })
+
+  test("every project page uses the exact project even when another root is selected", () => {
+    for (const tab of ["general", "workspaces", "extensions"] as const) {
+      const view: SettingsView = { type: "project", server: B, project: "/work", tab }
+
+      expect(isSettingsServerView(view)).toBe(true)
+      expect(
+        selectSettingsContextServer({
+          view,
+          selectedRoot: A,
+          project: B,
+          source: sidecar,
+        }),
+      ).toBe(B)
+    }
+  })
+
+  test("a project key absent from the registry remains exact", () => {
+    const missing = ServerConnection.Key.make("wsl:Removed")
+
+    expect(
+      selectSettingsContextServer({
+        view: { type: "project", server: missing, project: "/work", tab: "general" },
+        selectedRoot: A,
+        project: missing,
+        source: sidecar,
+      }),
+    ).toBe(missing)
+  })
+
+  test("does not synthesize a missing selected root or source", () => {
+    expect(
+      selectSettingsContextServer({
+        view: { type: "root", tab: "providers" },
+        selectedRoot: undefined,
+        project: B,
+        source: sidecar,
+      }),
+    ).toBeUndefined()
+    expect(
+      selectSettingsContextServer({
+        view: { type: "root", tab: "general" },
+        selectedRoot: A,
+        project: B,
+        source: undefined,
+      }),
+    ).toBeUndefined()
   })
 })

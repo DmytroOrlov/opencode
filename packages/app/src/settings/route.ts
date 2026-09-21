@@ -1,3 +1,4 @@
+import type { ServerConnection } from "@/runtime/server/registry"
 import { canHoldProjectRoute, type SettingsServerAvailability } from "./servers/machine"
 
 export type SettingsRootTab =
@@ -20,7 +21,9 @@ declare const pluginTab: unique symbol
 export type SettingsPluginTab = string & { readonly [pluginTab]: true }
 
 /** Root pages that show one server's settings: the selected server, or the default one. */
-export type SettingsServerTab = "projects" | "workspaces" | "providers" | "models" | "extensions"
+export const settingsServerTabs = ["providers", "models", "extensions", "projects", "workspaces"] as const
+
+export type SettingsServerTab = (typeof settingsServerTabs)[number]
 
 export type SettingsProjectTab = "general" | "workspaces" | "extensions"
 
@@ -44,6 +47,21 @@ export type SettingsHostView = ({ type: "root"; tab: SettingsRootTab; server?: s
   SettingsViewState
 
 export type SettingsTransientView = Pick<SettingsView, "target" | "searchActivation">
+
+export function isSettingsServerView(view: SettingsView): boolean {
+  return view.type === "project" || settingsServerTabs.some((tab) => tab === view.tab)
+}
+
+export function selectSettingsContextServer(input: {
+  view: SettingsView
+  selectedRoot: ServerConnection.Key | undefined
+  project: ServerConnection.Key | undefined
+  source: ServerConnection.Key | undefined
+}): ServerConnection.Key | undefined {
+  if (input.view.type === "project") return input.project
+  if (isSettingsServerView(input.view)) return input.selectedRoot
+  return input.source
+}
 
 const rootTabs: Record<SettingsRootTab, true> = {
   general: true,

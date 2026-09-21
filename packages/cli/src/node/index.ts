@@ -1,9 +1,14 @@
-import "./plugin-runtime.promise"
-import "./plugin-runtime.effect"
+import { runTlsCaBootstrap } from "../bootstrap"
 
-process.stdout.on("error", (error) => {
-  if ("code" in error && error.code === "EPIPE") return
-  throw error
+await runTlsCaBootstrap(async () => {
+  await import("./plugin-runtime.promise")
+  await import("./plugin-runtime.effect")
+
+  process.stdout.on("error", (error) => {
+    if ("code" in error && error.code === "EPIPE") return
+    throw error
+  })
+
+  const { runCli } = await import("../main")
+  return runCli()
 })
-
-await import("../index")

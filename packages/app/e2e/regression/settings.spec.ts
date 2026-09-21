@@ -323,7 +323,7 @@ for (const [locale, dict] of [
       ],
       sessionStatus: { [id]: { type: "busy" }, [childID]: { type: "busy" } },
       seed: { locale },
-      pageMessages: () => ({
+      pageMessages: (): { items: SessionMessageInfo[] } => ({
         items: [
           { id: "msg_activity_user", type: "user", text: "Inspect the activity capsule", time: { created: 1 } },
           {
@@ -379,7 +379,10 @@ for (const [locale, dict] of [
     await expect(page.locator("html")).toHaveAttribute("dir", locale === "ar" ? "rtl" : "ltr")
 
     for (const value of ["Center", "Right", "Hidden", "Left", "Right"] as const) {
-      await page.keyboard.press("Control+,")
+      const mac = await page.evaluate(() =>
+        /(Mac|iPod|iPhone|iPad)/.test(navigator.platform),
+      )
+      await page.keyboard.press(mac ? "Meta+," : "Control+,")
       const settings = page.getByTestId("settings-screen")
       const control = settings.getByLabel(label, { exact: true })
       await expect(control).toBeVisible()
@@ -440,7 +443,10 @@ for (const [locale, dict] of [
         page.evaluate(() => JSON.parse(localStorage.getItem("settings.v3") ?? "{}").general?.backgroundActivity),
       )
       .toBe("right")
-    await page.keyboard.press("Control+,")
+    const mac = await page.evaluate(() =>
+      /(Mac|iPod|iPhone|iPad)/.test(navigator.platform),
+    )
+    await page.keyboard.press(mac ? "Meta+," : "Control+,")
     await page.reload()
     await expect(page.getByTestId("settings-screen").getByLabel(label, { exact: true })).toHaveText(names.Right)
   })

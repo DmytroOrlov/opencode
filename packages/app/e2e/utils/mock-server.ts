@@ -50,6 +50,8 @@ export interface MockServerConfig {
   server?: string
   // The machine name `/api/info` reports; omitted like a server that predates it.
   hostname?: string
+  // The verified CA trust set `/api/info` reports; undefined like a server that predates the field.
+  tlsCaMode?: Resolvable<"bundled" | "system" | undefined>
   provider: Resolvable<MockProviderCatalog>
   integrations?: Resolvable<unknown[]>
   // Runs on POST /api/credential/:id/activate; the fixture swaps its integrations and catalog to the new account.
@@ -794,6 +796,7 @@ function mockHandlers(
             version: "2.0.0",
             pid: 1,
             hostname: config.hostname,
+            tlsCaMode: config.tlsCaMode === undefined ? undefined : resolve(config.tlsCaMode),
             urls: config.server ? [config.server] : [],
             paths: { tmp: "/tmp/opencode" },
             capabilities:

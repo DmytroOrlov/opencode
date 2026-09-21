@@ -97,8 +97,16 @@ async function setup(
   }
 }
 
+async function openSettings(page: Page) {
+  const mac = await page.evaluate(() =>
+    /(Mac|iPod|iPhone|iPad)/.test(navigator.platform),
+  )
+
+  await page.keyboard.press(mac ? "Meta+," : "Control+,")
+}
+
 async function enableAutoAccept(page: Page) {
-  await page.keyboard.press("Control+,")
+  await openSettings(page)
   const autoAccept = page.getByTestId("settings-screen").locator('[data-action="settings-auto-accept-permissions"]')
   await autoAccept.locator('[data-slot="switch-control"]').click()
   await expect(autoAccept.getByRole("switch")).toBeChecked()
@@ -146,7 +154,8 @@ test("settings opened from a remote session sweep every server and keep the remo
   await expect(settings).toBeHidden()
   await expectPath(page, sessionHref(sessionB.id, REMOTE_SERVER))
   await expect(page.locator('[data-titlebar-tab][data-active="true"]')).toContainText(sessionB.title)
-  await page.keyboard.press("Control+]")
+  const mac = await page.evaluate(() => /(Mac|iPod|iPhone|iPad)/.test(navigator.platform))
+  await page.keyboard.press(mac ? "Meta+]" : "Control+]")
   await expect(page).toHaveURL("/settings?tab=models")
   await expect(settings.getByRole("tab", { name: "Models", exact: true })).toHaveAttribute("aria-selected", "true")
   await page.keyboard.press("Escape")
@@ -203,6 +212,9 @@ test("a session its server never answers for says the server is unreachable, the
   await page.clock.install()
   await page.goto(sessionHref(late.id))
   await metadata.arrived
+  // The titlebar resolves the route's session on its own. The session route starts its resolution timer only once its
+  // own lookup is in flight; advancing the clock before then leaves that timer unstarted.
+  await expect.poll(() => metadata.requests.length).toBeGreaterThan(1)
   const unreachable = page.getByText("Can't reach this server", { exact: true })
   await expect(unreachable).toHaveCount(0)
 
@@ -365,7 +377,7 @@ test("a project's auto-accept choice overrides the default in both directions", 
   await expect(dock.getByText("git status")).toBeVisible()
 
   // On for api while the default is off; off for web before the default turns on.
-  await page.keyboard.press("Control+,")
+  await openSettings(page)
   await chooseProjectAutoAccept(page, "api", "Use default (Off)", "On")
   await expect.poll(() => replies).toEqual(["permission-api"])
   await chooseProjectAutoAccept(page, "web", "Use default (Off)", "Off")
@@ -380,7 +392,7 @@ test("a project's auto-accept choice overrides the default in both directions", 
   expect(replies).toEqual(["permission-api"])
 
   // Back on the default, web follows it.
-  await page.keyboard.press("Control+,")
+  await openSettings(page)
   await settings.getByRole("tab", { name: "Projects", exact: true }).click()
   await settings.getByRole("button", { name: "web", exact: true }).click()
   await settings.locator('[data-action="settings-project-auto-accept-permissions"]').click()

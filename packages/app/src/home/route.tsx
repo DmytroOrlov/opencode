@@ -1,6 +1,7 @@
 import { ScrollView } from "@opencode/ui/scroll-view"
 import { createMediaQuery } from "@solid-primitives/media"
-import { onMount, Show } from "solid-js"
+import { onCleanup, onMount, Show } from "solid-js"
+import { ServerConnection } from "@/runtime/server/registry"
 import { useLayout } from "@/shell/state/layout"
 import { useSettings } from "@/settings/model"
 import { useProjectNavigation } from "@/shell/project-navigation"
@@ -31,6 +32,14 @@ export function Home() {
 function HomeOverview() {
   const layout = useLayout()
   const home = createHomeController()
+
+  onCleanup(
+    layout.home.bindFocusedServer(() => {
+      const connection = home.server.focused()
+      return connection ? ServerConnection.key(connection) : undefined
+    }),
+  )
+
   const projects = createHomeProjectsController(home)
   const sessions = createHomeSessionsController(home)
   const search = createHomeSessionSearchController(home, sessions)

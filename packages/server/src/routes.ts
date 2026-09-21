@@ -111,6 +111,8 @@ export function createRoutes(
     options,
     serviceURLs,
     overrides,
+    false,
+    undefined,
   )
 }
 
@@ -123,7 +125,7 @@ export function createEmbeddedRoutes(
   overrides: LayerNode.Replacements = [],
   instances?: InstanceNode,
 ) {
-  return makeRoutes(ServerAuth.Config.configLayer({ password: Option.none() }), options, () => [], overrides, instances)
+  return makeRoutes(ServerAuth.Config.configLayer({ password: Option.none() }), options, () => [], overrides, true, instances)
 }
 
 function makeRoutes<AuthError, AuthServices>(
@@ -132,6 +134,7 @@ function makeRoutes<AuthError, AuthServices>(
   serviceURLs: () => ReadonlyArray<string>,
   // Runtime-profile replacements (e.g. workerd) applied after the standard set, so later entries win.
   overrides: LayerNode.Replacements,
+  embedded: boolean,
   instances?: InstanceNode,
 ) {
   const standard: LayerNode.Replacements = [
@@ -202,7 +205,11 @@ function makeRoutes<AuthError, AuthServices>(
             WellKnown.Service,
           )(context),
         ),
-        ServerInfo.layer(serviceURLs, Context.get(context, Global.Service).tmp, options.app),
+        (embedded ? ServerInfo.embeddedLayer : ServerInfo.layer)(
+          serviceURLs,
+          Context.get(context, Global.Service).tmp,
+          options.app,
+        ),
       )
       const api = HttpApiBuilder.layer(Api, { openapiPath: "/openapi.json" }).pipe(
         Layer.provide(handlers.pipe(Layer.provide(services), Layer.provide(Layer.succeed(CorsConfig, options)))),

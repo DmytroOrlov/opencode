@@ -37,6 +37,90 @@ const healthCache = new Map<
   { at: number; fetch: typeof globalThis.fetch; promise: Promise<ServerProbeResult> }
 >()
 
+/** The owner identity carried through one probe; cache entries never share across an incarnation. */
+export type HealthProbeScope = {
+  readonly key: ServerConnection.Key
+  readonly incarnation: number
+}
+
+type HealthChecker = (
+  http: ServerConnection.HttpBase,
+  scope: HealthProbeScope,
+) => Promise<ServerProbeResult>
+
+type HealthCacheEntry = {
+  at: number
+  promise: Promise<ServerProbeResult>
+  timer: ReturnType<typeof setTimeout>
+}
+
+/**
+ * One health owner's probe checker. Cache entries are keyed by owner scope and endpoint credentials, expire on their
+ * own, and never outlive the caller that created them.
+ */
+export function createServerHealthChecker(fetcher: typeof globalThis.fetch): {
+  check: HealthChecker
+  dispose: () => void
+} {
+  const cache = new Map<string, HealthCacheEntry>()
+  let disposed = false
+
+  // Deletes only the entry this callback owns, so a stale timer never removes a newer replacement.
+  const remove = (key: string, entry: HealthCacheEntry) => {
+    if (cache.get(key) !== entry) return
+
+    clearTimeout(entry.timer)
+    cache.delete(key)
+  }
+
+  const retain = (key: string, entry: HealthCacheEntry, at: number) => {
+    clearTimeout(entry.timer)
+    entry.at = at
+    entry.timer = setTimeout(() => remove(key, entry), Math.max(0, at - Date.now()))
+  }
+
+  const check: HealthChecker = (http, scope) => {
+    // A disposed owner starts no more requests; late settlements cannot reinsert anything.
+    if (disposed) return Promise.resolve(unreachable)
+
+    const key = JSON.stringify([scope.key, scope.incarnation, endpointCredentials(http)])
+    const now = Date.now()
+    const hit = cache.get(key)
+
+    // A delayed expiry timer must not authorize an entry whose stored expiry already passed.
+    if (hit && hit.at > now) return hit.promise
+
+    if (hit) remove(key, hit)
+
+    let entry: HealthCacheEntry
+    const promise = checkServerHealth(http, fetcher).finally(() => {
+      if (disposed || cache.get(key) !== entry) return
+
+      const completed = Date.now()
+      // An answer after the start window does not renew itself.
+      if (entry.at <= completed) return remove(key, entry)
+
+      retain(key, entry, completed + cacheMs)
+    })
+
+    entry = {
+      at: now + cacheMs,
+      promise,
+      timer: setTimeout(() => remove(key, entry), cacheMs),
+    }
+    cache.set(key, entry)
+
+    return promise
+  }
+  const dispose = () => {
+    disposed = true
+    cache.forEach((entry) => clearTimeout(entry.timer))
+    cache.clear()
+  }
+
+  return { check, dispose }
+}
+
 /** A signal that aborts after a timeout, and how to stop its timer early when one runs. */
 type Timeout = { readonly signal: AbortSignal; readonly clear?: () => void }
 
@@ -126,7 +210,12 @@ export async function checkServerHealth(
     })
       .server.info({ signal })
       .then((status) => ({
-        data: { type: "healthy" as const, version: status.version, hostname: status.hostname },
+        data: {
+          type: "healthy" as const,
+          version: status.version,
+          hostname: status.hostname,
+          ...(status.tlsCaMode ? { tlsCaMode: status.tlsCaMode } : {}),
+        },
       }))
       .catch((error) => ({ error }))
 
@@ -164,12 +253,16 @@ export function useCheckServerHealth() {
 }
 
 export const useServerHealth = (servers: Accessor<ServerConnection.Any[]>, onProbe?: (probe: ServerProbe) => void) => {
-  return createServerHealth(servers, useCheckServerHealth(), onProbe)
+  const platform = usePlatform()
+  const checker = createServerHealthChecker(platform.fetch ?? globalThis.fetch)
+  onCleanup(checker.dispose)
+
+  return createServerHealth(servers, checker.check, onProbe)
 }
 
 export function createServerHealth(
   servers: Accessor<ServerConnection.Any[]>,
-  check: (http: ServerConnection.HttpBase) => Promise<ServerProbeResult>,
+  check: HealthChecker,
   onProbe?: (probe: ServerProbe) => void,
 ) {
   const [machine, setMachine] = createSignal(createServerHealthState())
@@ -188,9 +281,20 @@ export function createServerHealth(
       result.effects.forEach((effect) => {
         if (effect.type === "probe") {
           const settled = (answer: ServerProbeResult) =>
-            dispatch({ type: "probe.settled", key: effect.key, attempt: effect.attempt, result: answer })
+            dispatch({
+              type: "probe.settled",
+              key: effect.key,
+              incarnation: effect.incarnation,
+              attempt: effect.attempt,
+              result: answer,
+            })
 
-          void Promise.try(() => check(effect.http)).then(settled, () => settled(unreachable))
+          void Promise.try(() =>
+            check(effect.http, {
+              key: effect.key,
+              incarnation: effect.incarnation,
+            }),
+          ).then(settled, () => settled(unreachable))
 
           return
         }

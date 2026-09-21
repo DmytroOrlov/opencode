@@ -2,12 +2,12 @@ import { Button } from "@opencode/ui/button"
 import { displayName } from "@opencode/ui/project-avatar"
 import { uuid } from "@opencode/util/uuid"
 import { Navigate, useLocation } from "@solidjs/router"
-import { Show, untrack } from "solid-js"
+import { onCleanup, Show, untrack } from "solid-js"
 import { useLanguage } from "@/runtime/i18n/language"
-import { useServers } from "@/runtime/server/registry"
+import { ServerConnection, useServers } from "@/runtime/server/registry"
 import { SessionPanelFrame, SessionRouteFrame } from "@/session/session-frame"
 import { tabHref, useTabs } from "@/shell/tabs/tabs"
-import type { LayoutRoute } from "@/shell/state/layout"
+import { useLayout, type LayoutRoute } from "@/shell/state/layout"
 import { useProjectBrowser } from "./browse"
 import { useProjectStart } from "./start"
 
@@ -36,6 +36,15 @@ function EmptyProjects() {
   const browse = useProjectBrowser()
 
   const action = useProjectStart()
+
+  const layout = useLayout()
+
+  onCleanup(
+    layout.home.bindFocusedServer(() => {
+      const connection = action.target().connection
+      return connection ? ServerConnection.key(connection) : undefined
+    }),
+  )
 
   return (
     <SessionRouteFrame padded>

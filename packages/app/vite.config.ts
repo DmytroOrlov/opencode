@@ -43,6 +43,7 @@ export default defineConfig({
               "e2e/utils/settings-wsl.html",
               "e2e/utils/app-direction.html",
               "e2e/utils/windows-menu.html",
+              "e2e/utils/tls-ca-badge.html",
             ],
           },
         }

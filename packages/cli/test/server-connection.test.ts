@@ -1,5 +1,6 @@
 import { NodeFileSystem, NodeServices } from "@effect/platform-node"
 import { Global } from "@opencode/util/global"
+import { verifyTlsCaMode } from "@opencode/util/tls-ca"
 import { OPENCODE_VERSION } from "../src/version"
 import { expect, test } from "bun:test"
 import { Console, Effect, FileSystem, Option, Scope } from "effect"
@@ -12,6 +13,8 @@ import { Spec } from "../src/framework/spec"
 import { ServerConnection } from "../src/services/server-connection"
 import { ServiceConfig } from "../src/services/service-config"
 import { isolatedEnv } from "./fixture/environment"
+
+verifyTlsCaMode("bundled")
 
 test("resolution groups Effect-native lifecycle operations only for the managed service", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-server-resolution-"))

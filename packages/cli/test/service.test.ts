@@ -2,6 +2,7 @@ import { NodeFileSystem } from "@effect/platform-node"
 import { validateRoutes } from "@opentunnel/client/effect"
 import { Service, type Info } from "@opencode/client/effect/service"
 import { Global } from "@opencode/util/global"
+import { TLS_CA_CERTIFICATE_ENVIRONMENT, verifyTlsCaMode, type TlsCaMode } from "@opencode/util/tls-ca"
 import { OPENCODE_VERSION } from "../src/version"
 import { expect, test } from "bun:test"
 import { Deferred, Effect, FileSystem, Schedule, Schema } from "effect"
@@ -15,8 +16,12 @@ import { AppProcess } from "@opencode/util/process"
 import { PortOwner } from "../src/services/port-owner"
 import { ServiceConfig } from "../src/services/service-config"
 import { ServiceRegistration } from "../src/services/service-registration"
+import { selfLaunchEnvironment } from "../src/util/process"
+import { spawnServiceContender } from "../../client/src/service-contender"
 import { isolatedEnv, transpilerCache } from "./fixture/environment"
 import { testEffect } from "../../core/test/lib/effect"
+
+verifyTlsCaMode("bundled")
 
 const it = testEffect(NodeFileSystem.layer)
 
@@ -219,6 +224,518 @@ test("saved service environment cannot move the registration's state directory",
     await fs.rm(root, { recursive: true, force: true })
   }
 })
+
+const tlsFixture = path.join(import.meta.dir, "fixture/tls-ca-mode")
+
+function hostileSavedEnvironment(mode: TlsCaMode) {
+  return {
+    OPENCODE_TLS_CA_MODE: mode === "bundled" ? "system" : "openssl",
+    OPENCODE_TLS_CA_BOOTSTRAPPED: "1",
+    BUN_OPTIONS: "--smol --use-system-ca",
+    NODE_OPTIONS: "--trace-warnings --require ./saved-hostile.js",
+    BUN_BE_BUN: "1",
+    NODE_TLS_REJECT_UNAUTHORIZED: "0",
+    ...(mode === "bundled"
+      ? {
+          NODE_EXTRA_CA_CERTS: "",
+          NODE_USE_SYSTEM_CA: "1",
+          SSL_CERT_FILE: path.join(tlsFixture, "root.pem"),
+          SSL_CERT_DIR: tlsFixture,
+        }
+      : {
+          NODE_EXTRA_CA_CERTS: path.join(tlsFixture, "root.pem"),
+          SSL_CERT_DIR: tlsFixture,
+        }),
+    OPENCODE_SERVICE_ENV_TEST: "saved-sentinel",
+  }
+}
+
+test("self-launch projection removes hostile saved and inherited launch authority", () => {
+  const unrelated = { TLS_CA_UNRELATED: "keep" }
+
+  const bundledSaved = selfLaunchEnvironment("bundled", {}, {
+    ...hostileSavedEnvironment("bundled"),
+    ...unrelated,
+  })
+  expect(bundledSaved).toEqual({ ...unrelated, OPENCODE_SERVICE_ENV_TEST: "saved-sentinel" })
+
+  const bundledInherited = {
+    ...hostileSavedEnvironment("bundled"),
+    TLS_CA_UNRELATED: "keep",
+  }
+  const snapshot = { ...bundledInherited }
+  const bundled = selfLaunchEnvironment("bundled", bundledInherited, {
+    ...hostileSavedEnvironment("bundled"),
+    TLS_CA_UNRELATED: "saved",
+  })
+  expect(bundledInherited).toEqual(snapshot)
+  expect(bundled.TLS_CA_UNRELATED).toBe("saved")
+  for (const key of [...TLS_CA_CERTIFICATE_ENVIRONMENT, ...forbiddenRuntimeKeys]) {
+    expect(Object.hasOwn(bundled, key)).toBe(true)
+    expect(bundled[key]).toBeUndefined()
+    expect(Object.hasOwn(bundledInherited, key)).toBe(true)
+  }
+
+  const system = selfLaunchEnvironment("system", {}, {
+    NODE_EXTRA_CA_CERTS: path.join(tlsFixture, "root.pem"),
+    SSL_CERT_DIR: tlsFixture,
+    NODE_USE_SYSTEM_CA: "1",
+    ...forbiddenSavedRuntimeOptions,
+    ...unrelated,
+  })
+  expect(system).toEqual({
+    NODE_EXTRA_CA_CERTS: path.join(tlsFixture, "root.pem"),
+    SSL_CERT_DIR: tlsFixture,
+    NODE_USE_SYSTEM_CA: "1",
+    ...unrelated,
+  })
+
+  const emptyInherited = selfLaunchEnvironment(
+    "bundled",
+    { NODE_EXTRA_CA_CERTS: "", NODE_USE_SYSTEM_CA: "", SSL_CERT_FILE: "", SSL_CERT_DIR: "" },
+    { A: "1" },
+  )
+  expect(emptyInherited).toEqual({
+    A: "1",
+    NODE_EXTRA_CA_CERTS: undefined,
+    NODE_USE_SYSTEM_CA: undefined,
+    SSL_CERT_FILE: undefined,
+    SSL_CERT_DIR: undefined,
+  })
+
+  for (const mode of ["bundled", "system"] as const) {
+    const saved = { ...forbiddenSavedRuntimeOptions, TLS_CA_UNRELATED: "keep" }
+    const input = { ...saved }
+    expect(selfLaunchEnvironment(mode, {}, saved)).toEqual({ TLS_CA_UNRELATED: "keep" })
+    expect(saved).toEqual(input)
+    const inherited = { ...forbiddenSavedRuntimeOptions, TLS_CA_INHERITED: "keep" }
+    const inheritedSnapshot = { ...inherited }
+    const overlay = selfLaunchEnvironment(mode, inherited, {})
+    expect(inherited).toEqual(inheritedSnapshot)
+    for (const key of forbiddenRuntimeKeys) {
+      expect(overlay[key]).toBeUndefined()
+      expect(Object.hasOwn(overlay, key)).toBe(true)
+    }
+    expect(overlay.OPENCODE_TLS_CA_MODE).toBeUndefined()
+    expect(overlay.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined()
+  }
+})
+
+const forbiddenRuntimeKeys = ["OPENCODE_TLS_CA_BOOTSTRAPPED", "BUN_OPTIONS", "NODE_OPTIONS", "BUN_BE_BUN"] as const
+const forbiddenSavedRuntimeOptions = {
+  OPENCODE_TLS_CA_BOOTSTRAPPED: "1",
+  BUN_OPTIONS: "--inspect",
+  NODE_OPTIONS: "--require ./saved.js",
+  BUN_BE_BUN: "1",
+  OPENCODE_TLS_CA_MODE: "system",
+  NODE_TLS_REJECT_UNAUTHORIZED: "0",
+}
+
+test("self-launch projection handles selectors and disabled verification explicitly", () => {
+  const savedSelector = selfLaunchEnvironment("bundled", {}, { OPENCODE_TLS_CA_MODE: "system" })
+  expect(savedSelector).toEqual({})
+
+  const conflictingInherited = selfLaunchEnvironment(
+    "bundled",
+    { OPENCODE_TLS_CA_MODE: "system" },
+    {},
+  )
+  expect(Object.hasOwn(conflictingInherited, "OPENCODE_TLS_CA_MODE")).toBe(true)
+  expect(conflictingInherited.OPENCODE_TLS_CA_MODE).toBeUndefined()
+
+  const matchingInherited = selfLaunchEnvironment("system", { OPENCODE_TLS_CA_MODE: "system" }, {})
+  expect(matchingInherited).toEqual({})
+
+  const savedDisabled = selfLaunchEnvironment("bundled", {}, { NODE_TLS_REJECT_UNAUTHORIZED: "0", A: "1" })
+  expect(savedDisabled).toEqual({ A: "1" })
+
+  const inheritedDisabled = selfLaunchEnvironment("bundled", { NODE_TLS_REJECT_UNAUTHORIZED: "0" }, { A: "1" })
+  expect(Object.hasOwn(inheritedDisabled, "NODE_TLS_REJECT_UNAUTHORIZED")).toBe(true)
+  expect(inheritedDisabled.NODE_TLS_REJECT_UNAUTHORIZED).toBeUndefined()
+  expect(inheritedDisabled.A).toBe("1")
+
+  const inherited = { NODE_TLS_REJECT_UNAUTHORIZED: "1" }
+  const inheritedEnabled = selfLaunchEnvironment("bundled", inherited, {
+    NODE_TLS_REJECT_UNAUTHORIZED: "0",
+  })
+  expect(inheritedEnabled).toEqual({})
+  expect({ ...inherited, ...inheritedEnabled }.NODE_TLS_REJECT_UNAUTHORIZED).toBe("1")
+  expect(
+    selfLaunchEnvironment("bundled", {}, { NODE_TLS_REJECT_UNAUTHORIZED: "0", NODE_TLS_REJECT_UNAUTHORIZED_SAVED: "1" }),
+  ).toEqual({ NODE_TLS_REJECT_UNAUTHORIZED_SAVED: "1" })
+})
+
+test("the live projection preserves already effective system inputs and applies unrelated saved settings", () => {
+  const inherited = {
+    NODE_EXTRA_CA_CERTS: path.join(tlsFixture, "root.pem"),
+    SSL_CERT_DIR: tlsFixture,
+    NODE_TLS_REJECT_UNAUTHORIZED: "1",
+  }
+  const touched = [
+    ...Object.keys(inherited),
+    "OPENCODE_TLS_CA_MODE",
+    "OPENCODE_TLS_CA_BOOTSTRAPPED",
+    "BUN_OPTIONS",
+    "NODE_OPTIONS",
+    "BUN_BE_BUN",
+    "OPENCODE_SERVICE_ENV_TEST",
+  ]
+  const previous = Object.fromEntries(touched.map((key) => [key, process.env[key]]))
+  Object.assign(process.env, inherited)
+  try {
+    const projection = ServiceConfig.verifiedProcessEnv({
+      ...inherited,
+      NODE_EXTRA_CA_CERTS: "/saved/should-not-apply.pem",
+      OPENCODE_TLS_CA_MODE: "system",
+      OPENCODE_TLS_CA_BOOTSTRAPPED: "1",
+      BUN_OPTIONS: "--inspect",
+      NODE_OPTIONS: "--require ./saved.js",
+      BUN_BE_BUN: "1",
+      OPENCODE_SERVICE_ENV_TEST: "saved",
+    })
+    expect(projection).toEqual({ OPENCODE_SERVICE_ENV_TEST: "saved" })
+    Object.assign(process.env, projection)
+    expect(process.env.NODE_EXTRA_CA_CERTS).toBe(inherited.NODE_EXTRA_CA_CERTS)
+    expect(process.env.SSL_CERT_DIR).toBe(inherited.SSL_CERT_DIR)
+    expect(process.env.NODE_TLS_REJECT_UNAUTHORIZED).toBe("1")
+    expect(process.env.OPENCODE_SERVICE_ENV_TEST).toBe("saved")
+    expect(process.env.BUN_OPTIONS).toBeUndefined()
+    expect(process.env.NODE_OPTIONS).toBeUndefined()
+    expect(process.env.BUN_BE_BUN).toBeUndefined()
+    expect(process.env.OPENCODE_TLS_CA_BOOTSTRAPPED).toBeUndefined()
+  } finally {
+    for (const key of touched) {
+      const value = previous[key]
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+  }
+})
+
+test("undefined overlay entries remove inherited variables at the real contender spawn boundary", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-self-launch-spawn-"))
+  const marker = path.join(root, "environment.json")
+  const inherited: Record<string, string> = {
+    NODE_TLS_REJECT_UNAUTHORIZED: "0",
+    BUN_OPTIONS: "--smol",
+    NODE_OPTIONS: "--require ./inherited.js",
+    BUN_BE_BUN: "1",
+    OPENCODE_TLS_CA_BOOTSTRAPPED: "1",
+    OPENCODE_TLS_CA_MODE: "system",
+    NODE_EXTRA_CA_CERTS: path.join(tlsFixture, "root.pem"),
+    OPENCODE_SELF_LAUNCH_SENTINEL: "inherited",
+  }
+  const previous = Object.fromEntries(Object.keys(inherited).map((key) => [key, process.env[key]]))
+  Object.assign(process.env, inherited)
+  const keys = [...Object.keys(inherited), "OPENCODE_SERVICE_ENV_TEST"]
+  let contender: ReturnType<typeof spawnServiceContender> | undefined
+  try {
+    const overlay = selfLaunchEnvironment("bundled", process.env, {
+      ...forbiddenSavedRuntimeOptions,
+      OPENCODE_SERVICE_ENV_TEST: "saved",
+    })
+    contender = spawnServiceContender(
+      process.execPath,
+      [path.join(import.meta.dir, "fixture/environment-observation.ts"), marker, ...keys],
+      overlay,
+    )
+
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline && !(await Bun.file(marker).exists())) await Bun.sleep(25)
+    const observed = await Bun.file(marker).json()
+    expect(observed).toEqual({
+      NODE_TLS_REJECT_UNAUTHORIZED: null,
+      BUN_OPTIONS: null,
+      NODE_OPTIONS: null,
+      BUN_BE_BUN: null,
+      OPENCODE_TLS_CA_BOOTSTRAPPED: null,
+      OPENCODE_TLS_CA_MODE: null,
+      NODE_EXTRA_CA_CERTS: null,
+      OPENCODE_SELF_LAUNCH_SENTINEL: "inherited",
+      OPENCODE_SERVICE_ENV_TEST: "saved",
+    })
+    expect(contender.error()).toBeUndefined()
+  } finally {
+    contender?.child.kill("SIGKILL")
+    if (contender && !contender.closed())
+      await new Promise<void>((resolve) => contender!.child.once("exit", () => resolve()))
+    contender?.release()
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    await fs.rm(root, { recursive: true, force: true })
+  }
+}, 30_000)
+
+const observationKeys = [
+  ...TLS_CA_CERTIFICATE_ENVIRONMENT,
+  "OPENCODE_TLS_CA_MODE",
+  "OPENCODE_TLS_CA_BOOTSTRAPPED",
+  "BUN_OPTIONS",
+  "NODE_OPTIONS",
+  "BUN_BE_BUN",
+  "NODE_TLS_REJECT_UNAUTHORIZED",
+  "OPENCODE_SERVICE_ENV_TEST",
+]
+
+function observationPlugin(marker: string) {
+  return `import { writeFileSync } from "node:fs"
+const keys = ${JSON.stringify(observationKeys)}
+writeFileSync(${JSON.stringify(marker)}, JSON.stringify(Object.fromEntries(keys.map((key) => [key, Object.hasOwn(process.env, key) ? process.env[key] ?? null : null]))))
+export default { id: "environment-observation", setup: async () => {} }
+`
+}
+
+async function waitForObservation(root: string, marker: string, url: string, headers: HeadersInit) {
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline) {
+    const endpoint = new URL("/api/plugin", url)
+    endpoint.searchParams.set("location[directory]", root)
+    const response = await fetch(endpoint, { headers, signal: AbortSignal.timeout(2_000) }).catch(() => undefined)
+    if (response?.ok && (await Bun.file(marker).exists())) {
+      return (await Bun.file(marker).json()) as Record<string, string | null>
+    }
+    await Bun.sleep(50)
+  }
+  throw new Error("The executing server never loaded the environment observation plugin")
+}
+
+async function startNormalManagedService(prefix: string, mode: TlsCaMode) {
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), prefix)))
+  const port = await availablePort()
+  const configFile = path.join(root, "config", ServiceConfig.filename())
+  const registration = path.join(root, "state", "opencode", ServiceConfig.filename())
+  const marker = path.join(root, "service-environment.json")
+  const saved = { port, env: hostileSavedEnvironment(mode) }
+  await fs.mkdir(path.dirname(configFile), { recursive: true })
+  await fs.writeFile(configFile, JSON.stringify(saved))
+  await fs.mkdir(path.join(root, ".opencode", "plugins"), { recursive: true })
+  await fs.writeFile(path.join(root, ".opencode", "plugins", "environment.ts"), observationPlugin(marker))
+
+  const start = Bun.spawn(
+    [
+      process.execPath,
+      path.join(import.meta.dir, "../src/index.ts"),
+      `--tls-ca-mode=${mode}`,
+      "service",
+      "start",
+    ],
+    { cwd: path.join(import.meta.dir, ".."), env: isolatedEnv(root), stdout: "pipe", stderr: "pipe" },
+  )
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(start.stdout).text(),
+    new Response(start.stderr).text(),
+    start.exited,
+  ])
+  try {
+    expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" })
+    const url = stdout.trim().split("\n").at(-1)
+    expect(url).toStartWith("http://127.0.0.1:")
+    const info = await waitForInfo(registration)
+    expect(new URL(info.url).port).toBe(String(port))
+    const headers = { authorization: "Basic " + btoa(`opencode:${info.password}`) }
+    const observed = await waitForObservation(root, marker, info.url, headers)
+    return {
+      root,
+      port,
+      registration,
+      configFile,
+      saved,
+      startPid: start.pid,
+      info,
+      observed,
+    }
+  } catch (cause) {
+    let cleanup: string | undefined
+    if (start.exitCode === null) {
+      start.kill("SIGTERM")
+      let stopped = await waitForExit(start, 5_000)
+      if (!stopped) {
+        start.kill("SIGKILL")
+        stopped = await waitForExit(start, 2_000)
+      }
+      if (!stopped) cleanup = `Owned service start process ${start.pid} did not exit`
+    }
+    cleanup = await stopPublishedTestService(registration, true).then(
+      () => cleanup,
+      (error: unknown) => [cleanup, error instanceof Error ? error.message : String(error)].filter(Boolean).join("; "),
+    )
+    if (cleanup !== undefined) {
+      throw new Error(
+        `Managed service startup failed and cleanup did not complete; root retained at ${root}: ${cleanup}`,
+        { cause },
+      )
+    }
+    await fs.rm(root, { recursive: true, force: true })
+    throw cause
+  }
+}
+
+async function stopPublishedTestService(registration: string, waitForRegistration = false) {
+  let exists = await Bun.file(registration).exists()
+  if (!exists && waitForRegistration) {
+    const deadline = Date.now() + 5_000
+    while (!exists && Date.now() < deadline) {
+      await Bun.sleep(25)
+      exists = await Bun.file(registration).exists()
+    }
+  }
+  if (!exists) return
+  const raw = await Bun.file(registration)
+    .json()
+    .catch(() => undefined)
+  if (raw === undefined) throw new Error(`Registration ${registration} could not be read for cleanup`)
+  const info = await Schema.decodeUnknownPromise(Service.Info)(raw)
+  await Effect.runPromise(Service.stop({ file: registration }).pipe(Effect.provide(NodeFileSystem.layer)))
+  if (!(await waitForPIDGone(info.pid))) {
+    process.kill(info.pid, "SIGTERM")
+    if (!(await waitForPIDGone(info.pid, 2_000))) {
+      process.kill(info.pid, "SIGKILL")
+      if (!(await waitForPIDGone(info.pid, 2_000)))
+        throw new Error(`Owned service process ${info.pid} did not exit`)
+    }
+  }
+  if (await Bun.file(registration).exists()) throw new Error(`Owned registration ${registration} was not removed`)
+}
+
+async function waitForPIDGone(pid: number, timeout = 10_000) {
+  const deadline = Date.now() + timeout
+  while (Date.now() < deadline) {
+    if (!running(pid)) return true
+    await Bun.sleep(25)
+  }
+  return !running(pid)
+}
+
+test.each(["bundled", "system"] as const)(
+  "normal managed service %s child receives only the verified launch environment",
+  async (mode) => {
+    const service = await startNormalManagedService(`opencode-service-observed-${mode}-`, mode)
+    try {
+      expect(service.info.pid).not.toBe(service.startPid)
+      expect(running(service.info.pid)).toBe(true)
+      expect(service.observed.OPENCODE_TLS_CA_MODE).toBe(mode)
+      expect(service.observed.OPENCODE_TLS_CA_BOOTSTRAPPED).toBeNull()
+      expect(service.observed.BUN_OPTIONS).toBeNull()
+      expect(service.observed.NODE_OPTIONS).toBeNull()
+      expect(service.observed.BUN_BE_BUN).toBeNull()
+      expect(service.observed.NODE_TLS_REJECT_UNAUTHORIZED).toBeNull()
+      expect(service.observed.OPENCODE_SERVICE_ENV_TEST).toBe("saved-sentinel")
+      if (mode === "bundled") {
+        for (const key of TLS_CA_CERTIFICATE_ENVIRONMENT) expect(service.observed[key]).toBeNull()
+      } else {
+        expect(service.observed.NODE_EXTRA_CA_CERTS).toBe(path.join(tlsFixture, "root.pem"))
+        expect(service.observed.SSL_CERT_DIR).toBe(tlsFixture)
+      }
+      expect(await Bun.file(service.configFile).json()).toMatchObject(service.saved)
+      expect(
+        await fetch(new URL("/api/info", service.info.url), { headers: { authorization: "Basic " + btoa(`opencode:${service.info.password}`) } }).then(
+          (response) => response.json(),
+        ),
+      ).toMatchObject({ pid: service.info.pid, tlsCaMode: mode })
+      await Effect.runPromise(Service.stop({ file: service.registration }).pipe(Effect.provide(NodeFileSystem.layer)))
+      for (let attempt = 0; attempt < 400 && running(service.info.pid); attempt++) await Bun.sleep(25)
+      expect(running(service.info.pid)).toBe(false)
+    } finally {
+      await stopObservedService(service)
+    }
+  },
+  60_000,
+)
+
+test.each(["bundled", "system"] as const)(
+  "direct service %s launch filters saved TLS configuration after verification",
+  async (mode) => {
+    const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), `opencode-service-direct-${mode}-`)))
+    const port = await availablePort()
+    const configFile = path.join(root, "config", ServiceConfig.filename())
+    const registration = path.join(root, "state", "opencode", ServiceConfig.filename())
+    const marker = path.join(root, "service-environment.json")
+    const saved = { port, env: hostileSavedEnvironment(mode) }
+    await fs.mkdir(path.dirname(configFile), { recursive: true })
+    await fs.writeFile(configFile, JSON.stringify(saved))
+    await fs.mkdir(path.join(root, ".opencode", "plugins"), { recursive: true })
+    await fs.writeFile(path.join(root, ".opencode", "plugins", "environment.ts"), observationPlugin(marker))
+    const owner = Bun.spawn(
+      [
+        process.execPath,
+        path.join(import.meta.dir, "../src/index.ts"),
+        `--tls-ca-mode=${mode}`,
+        "serve",
+        "--service",
+      ],
+      { cwd: path.join(import.meta.dir, ".."), env: isolatedEnv(root), stdout: "ignore", stderr: "pipe" },
+    )
+    const stderr = new Response(owner.stderr).text()
+    try {
+      const info = await waitForInfo(registration)
+      expect(info.pid).toBeGreaterThan(0)
+      expect(running(info.pid)).toBe(true)
+      const headers = { authorization: "Basic " + btoa(`opencode:${info.password}`) }
+      const observed = await waitForObservation(root, marker, info.url, headers)
+      expect(observed.OPENCODE_TLS_CA_MODE).toBe(mode)
+      expect(observed.OPENCODE_TLS_CA_BOOTSTRAPPED).toBeNull()
+      expect(observed.BUN_OPTIONS).toBeNull()
+      expect(observed.NODE_OPTIONS).toBeNull()
+      expect(observed.BUN_BE_BUN).toBeNull()
+      expect(observed.NODE_TLS_REJECT_UNAUTHORIZED).toBeNull()
+      expect(observed.OPENCODE_SERVICE_ENV_TEST).toBe("saved-sentinel")
+      for (const key of TLS_CA_CERTIFICATE_ENVIRONMENT) expect(observed[key]).toBeNull()
+      expect(await Bun.file(configFile).json()).toMatchObject(saved)
+      await Effect.runPromise(Service.stop({ file: registration }).pipe(Effect.provide(NodeFileSystem.layer)))
+      expect(await waitForPIDGone(info.pid)).toBe(true)
+      expect(await Bun.file(registration).exists()).toBe(false)
+    } finally {
+      const failures: string[] = []
+      try {
+        await stopPublishedTestService(registration)
+      } catch (error) {
+        failures.push(error instanceof Error ? error.message : String(error))
+      }
+      if (owner.exitCode === null) {
+        owner.kill("SIGTERM")
+        if (!(await waitForExit(owner, 5_000))) {
+          owner.kill("SIGKILL")
+          if (!(await waitForExit(owner, 2_000))) failures.push(`Owned direct service process ${owner.pid} did not exit`)
+        }
+      }
+      const output = await stderr
+      if (failures.length)
+        throw new Error(
+          `Direct service cleanup failed; root retained at ${root}: ${failures.join("; ")}\nstderr:\n${output}`,
+        )
+      await fs.rm(root, { recursive: true, force: true })
+    }
+  },
+  60_000,
+)
+
+async function stopObservedService(service: Awaited<ReturnType<typeof startNormalManagedService>>) {
+  await Effect.runPromise(Service.stop({ file: service.registration }).pipe(Effect.provide(NodeFileSystem.layer))).catch(
+    () => {},
+  )
+  if (!(await waitForPIDGone(service.info.pid))) {
+    process.kill(service.info.pid, "SIGTERM")
+    if (!(await waitForPIDGone(service.info.pid, 2_000))) {
+      process.kill(service.info.pid, "SIGKILL")
+      if (!(await waitForPIDGone(service.info.pid, 2_000)))
+        throw new Error(`Owned observed service process ${service.info.pid} did not exit`)
+    }
+  }
+  if (await Bun.file(service.registration).exists())
+    throw new Error(`Owned observed service registration ${service.registration} was not removed`)
+  await fs.rm(service.root, { recursive: true, force: true })
+}
+
+function running(pid: number) {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
 
 test.skipIf(process.platform === "win32" || !Bun.which("lsof"))("port owner names the listening process", async () => {
   using listener = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() })
@@ -628,14 +1145,66 @@ test("unresponsive managed port occupancy reports a bounded conflict", async () 
     password: "stale",
   }
   await fs.writeFile(registration, JSON.stringify(stale))
-  // The port lookup is a child of the service, so it shows the state directory tools would inherit.
+  // The port lookup is a child of the service, so it shows the state directory tools would inherit. Capture the
+  // actual OS answers while our listener is alive, then replay them through the child PATH fixture. This keeps the
+  // production lookup/parser/message path under test without requiring an unrelated OS-wide lsof scan to finish
+  // inside its best-effort deadline.
   const lsof = process.platform === "win32" ? null : Bun.which("lsof")
-  if (lsof) {
-    await Bun.write(
-      path.join(root, "bin", "lsof"),
-      `#!/bin/sh\nprintf %s "$XDG_STATE_HOME" > "${path.join(root, "inherited-state")}"\nexec "${lsof}" "$@"\n`,
-    )
-    await fs.chmod(path.join(root, "bin", "lsof"), 0o755)
+  try {
+    if (lsof) {
+      const capture = async (executable: string, args: string[]) => {
+        const child = Bun.spawn([executable, ...args], {
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        })
+        const stdout = new Response(child.stdout).text()
+        const stderr = new Response(child.stderr).text()
+        if (!(await waitForExit(child, 5_000))) {
+          child.kill("SIGKILL")
+          if (!(await waitForExit(child, 2_000))) {
+            throw new Error(`Port-owner fixture lookup did not stop: ${executable}`)
+          }
+          await Promise.all([stdout, stderr])
+          throw new Error(`Port-owner fixture lookup timed out: ${executable}`)
+        }
+        const [out, err] = await Promise.all([stdout, stderr])
+        if (child.exitCode !== 0 || out.trim() === "")
+          throw new Error(`Port-owner fixture lookup failed: ${executable}, exit=${child.exitCode}, stderr=${err}`)
+        return out
+      }
+
+      const lsofArgs = ["-nP", `-iTCP:${listener.port}`, "-sTCP:LISTEN", "-Fpn"]
+      const psArgs = ["-o", "command=", "-p", String(process.pid)]
+      const lsofOutput = await capture(lsof, lsofArgs)
+      const psOutput = await capture("ps", psArgs)
+      const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'"
+      const writeLookup = async (name: string, args: string[], output: string, extra = "") => {
+        const file = path.join(root, "bin", name)
+        const checks = [
+          `test "$#" -eq ${args.length}`,
+          ...args.map((arg, index) => `test "$${index + 1}" = ${quote(arg)}`),
+        ]
+        await Bun.write(
+          file,
+          ["#!/bin/sh", "set -eu", ...checks, extra, `printf '%s' ${quote(output)}`, ""].filter(Boolean).join("\n") +
+            "\n",
+        )
+        await fs.chmod(file, 0o755)
+      }
+
+      await fs.mkdir(path.join(root, "bin"), { recursive: true })
+      await writeLookup(
+        "lsof",
+        lsofArgs,
+        lsofOutput,
+        `printf '%s' "$XDG_STATE_HOME" > ${quote(path.join(root, "inherited-state"))}`,
+      )
+      await writeLookup("ps", psArgs, psOutput)
+    }
+  } catch (cause) {
+    await fs.rm(root, { recursive: true, force: true })
+    throw cause
   }
   const contender = Bun.spawn([process.execPath, path.join(import.meta.dir, "../src/index.ts"), "serve", "--service"], {
     env: { ...serviceEnv(root), PATH: `${path.join(root, "bin")}${path.delimiter}${process.env.PATH}` },

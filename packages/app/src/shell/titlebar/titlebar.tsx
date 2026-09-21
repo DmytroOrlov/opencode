@@ -28,6 +28,7 @@ import { makeEventListener } from "@solid-primitives/event-listener"
 import { createMediaQuery } from "@solid-primitives/media"
 import { readSessionTabsRemovedDetail, SESSION_TABS_REMOVED_EVENT } from "@/shell/titlebar/session-events"
 import { useGlobal } from "@/runtime/server/runtime"
+import { selectServerTlsCaMode } from "@/runtime/server/health-machine"
 import { ServerConnection } from "@/runtime/server/registry"
 import { tabKey, useTabs } from "@/shell/tabs/tabs"
 import type { ComposerState } from "@/composer/persistence"
@@ -39,8 +40,10 @@ import { useSessionTabAvatarState } from "@/shell/layout/project-avatar-state"
 import { ActivityRing } from "@opencode/ui/activity-ring"
 import { RecentlyClosedTabsMenu } from "./recently-closed-tabs-menu"
 import { useSettingsCommand, useSettingsDialog } from "@/settings/command"
+import { useSettingsSurface } from "@/settings/surface"
 import { TitlebarItems, useTitlebarItems } from "@/runtime/plugin/titlebar-items"
 import { createRouteTabSync } from "./route-sync"
+import { caBadgeMapping, selectCaBadgeServer } from "./titlebar-ca-badge"
 import {
   INITIAL_MOBILE_TABS_STATE,
   selectMobileTabsOpen,
@@ -234,6 +237,7 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
           {(_) => {
             const layout = useLayout()
             const global = useGlobal()
+            const settingsSurface = useSettingsSurface()
 
             const projectNavigation = useProjectNavigation()
 
@@ -261,6 +265,31 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
             const preparing = routeSync.preparing
             const session = routeSync.session
             const currentTab = routeSync.currentTab
+
+            /** The CA trust set this route's server attested at startup; unknown until the server reports it. */
+            const caBadge = createMemo(() => {
+              const route = layout.route()
+
+              const key = selectCaBadgeServer({
+                route,
+                draftServer:
+                  route.type === "draft"
+                    ? currentTab()?.server
+                    : undefined,
+                homeServer:
+                  route.type === "home"
+                    ? layout.home.focusedServer()
+                    : undefined,
+                settingsServer:
+                  route.type === "settings"
+                    ? settingsSurface.contextServer()
+                    : undefined,
+              })
+
+              const health = key ? global.servers.health[key] : undefined
+
+              return caBadgeMapping(selectServerTlsCaMode(health))
+            })
 
             makeEventListener(window, SESSION_TABS_REMOVED_EVENT, (event) => {
               const detail = readSessionTabsRemovedDetail(event)
@@ -897,6 +926,14 @@ export function Titlebar(props: { verticalTabs?: { mount?: HTMLElement } }) {
                 <Show when={!props.verticalTabs}>
                   <div class="relative z-20 flex shrink-0 items-center justify-end gap-0 overflow-visible">
                     <TitlebarItems items={titlebarItems} />
+                    <Tooltip placement="bottom" value={language.t(caBadge().tooltipKey)}>
+                      <span
+                        class={`rounded-[4px] px-1.5 py-1 text-[10px] font-semibold leading-3 ${caBadge().className}`}
+                        role="status"
+                      >
+                        {language.t(caBadge().labelKey)}
+                      </span>
+                    </Tooltip>
                   </div>
                 </Show>
               </div>

@@ -1514,7 +1514,7 @@ test.describe("compaction", () => {
       sessionStatus: { [sessionID]: { type: "busy" } },
     })
 
-    await timeline.send(compactionStarted({ sessionID, reason: "manual", recent: "" }))
+    await timeline.send(compactionStarted({ sessionID, reason: "manual" }))
     const compaction = page.locator('[data-component="session-compaction-message"]')
     await expect(compaction.getByText("Session compaction started", { exact: true })).toBeVisible()
     await expect(compaction.getByRole("status").getByLabel("Compacting", { exact: true })).toBeVisible()
@@ -1546,7 +1546,6 @@ test.describe("compaction", () => {
         sessionID,
         reason: "manual",
         text: "## Checkpoint\n\nFinal implementation details.",
-        recent: "",
       }),
     )
     await expect(compaction).toContainText("Final implementation details.")
@@ -1631,7 +1630,7 @@ test.describe("compaction", () => {
 
       for (const [index, name] of names.entries()) {
         const outcome = outcomes[name]
-        await timeline.send(compactionStarted({ sessionID, reason: outcome.reason, recent: "" }))
+        await timeline.send(compactionStarted({ sessionID, reason: outcome.reason }))
         await timeline.send(compactionDelta({ sessionID, text: outcome.partial }))
         await expect(compactions).toHaveCount(index + 1)
         const compaction = compactions.nth(index)
@@ -3326,7 +3325,9 @@ function pauseExitAnimations(locator: Locator) {
   return locator.evaluateHandle((element) => {
     const animations: Animation[] = []
 
-    const pause = (event: AnimationEvent) => {
+    const pause = (event: Event) => {
+      if (!(event instanceof AnimationEvent)) return
+
       if (event.target !== element || event.animationName !== "exit") return
 
       animations.push(...element.getAnimations())

@@ -5,7 +5,8 @@ import { Service } from "@opencode/client/effect/service"
 import { Effect, FileSystem, Option, Schedule, Schema } from "effect"
 import { randomBytes } from "crypto"
 import path from "path"
-import { selfCommand } from "../util/process"
+import { TLS_CA_CERTIFICATE_ENVIRONMENT, getVerifiedTlsCaMode } from "@opencode/util/tls-ca"
+import { selfCommand, selfLaunchEnvironment } from "../util/process"
 import { RemoteTunnel } from "./remote-tunnel"
 
 // The CLI's service configuration file, plus the Service.EnsureOptions binding that
@@ -140,13 +141,37 @@ export function processEnv(env: Info["env"]) {
   return rest
 }
 
+// A directly launched service can read saved configuration after bootstrap has already attested the process. TLS
+// launch inputs must have been applied before attestation, so they are never reapplied to the live environment.
+export function verifiedProcessEnv(env: Info["env"]) {
+  const saved = processEnv(env)
+  if (saved === undefined) return undefined
+  const result: Record<string, string> = { ...saved }
+
+  for (const key of [
+    ...TLS_CA_CERTIFICATE_ENVIRONMENT,
+    "OPENCODE_TLS_CA_MODE",
+    "OPENCODE_TLS_CA_BOOTSTRAPPED",
+    "BUN_OPTIONS",
+    "NODE_OPTIONS",
+    "BUN_BE_BUN",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+  ]) {
+    delete result[key]
+  }
+
+  return result
+}
+
 export const options = Effect.fnUntraced(function* (input: { readonly checkVersion?: boolean } = {}) {
   const { file, legacyRegistrationFiles } = yield* paths
   yield* Effect.forEach(legacyRegistrationFiles, (legacy) => migrateRegistration(legacy, file))
+  const saved = processEnv((yield* read()).env)
+  const env = selfLaunchEnvironment(getVerifiedTlsCaMode(), process.env, saved)
   return {
     file,
     version: input.checkVersion ? OPENCODE_VERSION : undefined,
-    env: processEnv((yield* read()).env),
+    env: Object.keys(env).length === 0 ? undefined : env,
     command: [...selfCommand(), "serve", "--service"],
   }
 })

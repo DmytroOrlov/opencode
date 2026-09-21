@@ -1,8 +1,21 @@
-import { expect } from "bun:test"
+import { expect, test } from "bun:test"
+import { verifyTlsCaMode } from "@opencode/util/tls-ca"
 import { Effect } from "effect"
 import { HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { it } from "../../core/test/lib/effect"
 import { ServerProcess } from "../src/process"
+
+verifyTlsCaMode("bundled")
+
+test("rejects a forged TLS mode before an unverified host can listen", async () => {
+  const child = Bun.spawn([process.execPath, new URL("./fixture/unverified-server.ts", import.meta.url).pathname], {
+    stdout: "pipe",
+    stderr: "pipe",
+  })
+  const [exitCode, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()])
+  expect(exitCode).toBe(0)
+  expect(stdout).toContain("cannot listen before effective TLS CA policy is verified")
+})
 
 it.live("authenticates API requests behind the frontend transform while allowing browser preflight", () =>
   Effect.gen(function* () {
@@ -52,7 +65,10 @@ it.live("authenticates API requests behind the frontend transform while allowing
 
     expect(status.status).toBe(200)
     expect(status.headers.get("access-control-allow-origin")).toBe("http://localhost:3000")
-    expect(yield* Effect.promise(() => status.json())).toMatchObject({ version: "test-version" })
+    expect(yield* Effect.promise(() => status.json())).toMatchObject({
+      version: "test-version",
+      tlsCaMode: "bundled",
+    })
 
     yield* Effect.forEach(
       ["http://192.168.1.10:3001", "https://example.com", "https://untrusted.example.com"],

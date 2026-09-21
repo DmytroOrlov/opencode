@@ -3,11 +3,12 @@
 import { NodeFileSystem } from "@effect/platform-node"
 import { Service } from "@opencode/client/effect/service"
 import { MCP_CLIENT_PATH } from "@opencode/protocol/groups/mcp"
-import { ServerInfo } from "@opencode/protocol/groups/server"
 import { Effect, Schema } from "effect"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { runNativeMatrix } from "./native-matrix"
+import { exitsWithin, waitForReady, waitForRegistration } from "./service-smoke-process"
 
 const nodeBuild = process.argv.includes("--node")
 const target = `cli${nodeBuild ? "-node" : ""}-${process.platform === "win32" ? "windows" : process.platform}-${process.arch}`
@@ -37,7 +38,7 @@ try {
   await fs.mkdir(path.join(root, ".opencode", "plugins"), { recursive: true })
   spawnService()
   spawnService()
-  const registration = await waitForRegistration()
+  const registration = await waitForRegistration(path.join(root, "state", "opencode"))
   const info = await Schema.decodeUnknownPromise(Service.Info)(await Bun.file(registration).json())
   if (info.id === undefined || info.password === undefined) throw new Error("Registration is missing service identity")
   const credential = btoa(`opencode:${info.password}`)
@@ -106,24 +107,15 @@ if (failure)
     cause: failure,
   })
 
+// The lifecycle smoke above uses direct `serve --service` contenders. The matrices below exercise the normal
+// managed, standalone and recovery launch owners (and controlled HTTPS) inside each actual artifact.
+await runNativeMatrix(binary, nodeBuild)
+
 function spawnService() {
   const process = Bun.spawn([binary, "serve", "--service"], { env, stdout: "ignore", stderr: "pipe" })
   processes.push(process)
   errors.push(new Response(process.stderr).text())
   return process
-}
-
-async function waitForRegistration() {
-  const directory = path.join(root, "state", "opencode")
-  for (let attempt = 0; attempt < 400; attempt++) {
-    const files = await fs.readdir(directory).catch(() => [])
-    const file = files.find(
-      (file) => file === "service.json" || (file.startsWith("service-") && file.endsWith(".json")),
-    )
-    if (file) return path.join(directory, file)
-    await Bun.sleep(25)
-  }
-  throw new Error("Compiled service did not publish registration")
 }
 
 // Reads the web UI from the binary's embedded archive: the shell, and the entry script it names.
@@ -155,29 +147,6 @@ async function verifyClientMcpSocket(url: string, token: string) {
     }
   }).finally(() => socket.close())
   if (!message.includes('"initialize"')) throw new Error("Compiled service did not initialize the client MCP socket")
-}
-
-async function waitForReady(url: string, headers: HeadersInit) {
-  const deadline = Date.now() + 20_000
-  while (Date.now() < deadline) {
-    const response = await fetch(new URL("/api/info", url), {
-      headers,
-      signal: AbortSignal.timeout(1_000),
-    }).catch(() => undefined)
-    if (response?.ok) return Schema.decodeUnknownPromise(ServerInfo)(await response.json())
-    await Bun.sleep(25)
-  }
-  throw new Error("Compiled service did not become ready")
-}
-
-function exitsWithin(process: Bun.Subprocess, milliseconds: number) {
-  return new Promise<boolean>((resolve) => {
-    const timeout = setTimeout(() => resolve(false), milliseconds)
-    process.exited.then(() => {
-      clearTimeout(timeout)
-      resolve(true)
-    })
-  })
 }
 
 function pluginSource() {

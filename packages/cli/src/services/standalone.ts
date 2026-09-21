@@ -3,7 +3,8 @@ import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Deferred, Effect, Schema, Stream } from "effect"
 import { ChildProcess, ChildProcessSpawner } from "effect/process"
 import { randomBytes } from "node:crypto"
-import { selfCommand } from "../util/process"
+import { getVerifiedTlsCaMode } from "@opencode/util/tls-ca"
+import { selfCommand, selfLaunchEnvironment } from "../util/process"
 
 const Ready = Schema.Struct({ url: Schema.String })
 const decodeReady = Schema.decodeUnknownPromise(Schema.fromJsonString(Ready))
@@ -21,7 +22,10 @@ function command(password: string, options: Options) {
     cwd: startupDirectory,
     // Explicit entry wins over anything inherited, so a user-exported
     // OPENCODE_PASSWORD cannot shadow the child's lease credential.
-    env: { OPENCODE_PASSWORD: password },
+    env: {
+      ...(options.command === undefined ? selfLaunchEnvironment(getVerifiedTlsCaMode(), process.env) : {}),
+      OPENCODE_PASSWORD: password,
+    },
     extendEnv: true,
     // The server treats EOF on this pipe as the end of its ownership lease.
     // The OS closes it even when the TUI is killed before Effect finalizers run.

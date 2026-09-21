@@ -31,7 +31,7 @@ import { SettingsNavigation, type SettingsNavGroup } from "./navigation"
 import { SettingsProjectGeneral } from "./workspaces/project"
 import { ProjectSettingsExtensions } from "./workspaces/project-extensions"
 import { useSettingsSurface } from "./surface"
-import { settingsViewRedirect } from "./route"
+import { settingsServerTabs, settingsViewRedirect } from "./route"
 import { pageIcons, pageLabels } from "./pages"
 import { PluginSettingsPages } from "@/runtime/plugin/settings-page-view"
 import "@/settings/settings.css"
@@ -43,13 +43,11 @@ const rootClientTabs = [
   { value: "shortcuts", icon: pageIcons.shortcuts, label: "settings.tab.shortcuts" },
 ] as const
 
-const serverTabs = [
-  { value: "providers", icon: pageIcons.providers, label: "settings.providers.title" },
-  { value: "models", icon: pageIcons.models, label: "settings.models.title" },
-  { value: "extensions", icon: pageIcons.extensions, label: "settings.tab.extensions" },
-  { value: "projects", icon: pageIcons.projects, label: "settings.tab.projects" },
-  { value: "workspaces", icon: pageIcons.workspaces, label: "settings.tab.workspaces" },
-] as const
+const serverTabs = settingsServerTabs.map((value) => ({
+  value,
+  icon: pageIcons[value],
+  label: pageLabels[value],
+}))
 
 // The heading of each per-server page, which its unreachable state keeps.
 const serverPages = {

@@ -53,6 +53,7 @@ export type ServerInfoOutput = {
   readonly hostname?: string | undefined
   readonly urls: ReadonlyArray<string>
   readonly paths: { readonly tmp: string }
+  readonly tlsCaMode?: "bundled" | "system" | undefined
   readonly capabilities?: { readonly persistentPty?: boolean | undefined } | undefined
 }
 export type ServerInfoOperation<E = never> = () => Effect.Effect<ServerInfoOutput, E>

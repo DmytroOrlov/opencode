@@ -4,7 +4,7 @@ import { createSimpleContext } from "@opencode/ui/context"
 import { useLayout, type LayoutRoute } from "@/shell/state/layout"
 import { useTabs } from "@/shell/tabs/tabs"
 import { useProjectNavigation } from "@/shell/project-navigation"
-import { useServers } from "@/runtime/server/registry"
+import { ServerConnection, useServers } from "@/runtime/server/registry"
 import { useCommand } from "@/shell/commands/command"
 import { createSettingsPages } from "@/runtime/plugin/settings-pages"
 import { useSettingsServers } from "./servers/inventory"
@@ -26,6 +26,7 @@ import {
   isProjectTab,
   isRootTab,
   parseSettingsView,
+  selectSettingsContextServer,
   settingsViewUrl,
   type SettingsPluginTab,
   type SettingsProjectTab,
@@ -56,7 +57,11 @@ export const { use: useSettingsSurface, provider: SettingsSurfaceProvider } = cr
     const projectNavigation = useProjectNavigation()
 
     const location = useLocation<{
-      settings?: { route: Exclude<LayoutRoute, { type: "settings" }>; view?: SettingsTransientView }
+      settings?: {
+        route: Exclude<LayoutRoute, { type: "settings" }>
+        view?: SettingsTransientView
+        sourceKey?: ServerConnection.Key | null
+      }
     }>()
 
     const plugins = createSettingsPages()
@@ -73,8 +78,25 @@ export const { use: useSettingsSurface, provider: SettingsSurfaceProvider } = cr
 
     const view = () => parseSettingsView(location.search, location.state?.settings?.view, plugins.tabs())
 
+    const currentContextServer = () => {
+      const route = layout.route()
+
+      if (route.type === "session") return route.server
+
+      if (route.type === "draft")
+        return tabs.store.find((item) => item.type === "draft" && item.draftID === route.draftID)?.server
+
+      if (route.type === "home") return layout.home.focusedServer()
+    }
+
     // The server of the tab settings opened from, which per-server pages show until another is selected.
     const sourceServer = createMemo(() => {
+      if (open()) {
+        const captured = location.state?.settings?.sourceKey
+
+        if (captured !== undefined) return captured ?? undefined
+      }
+
       const route = source()
 
       if (projectNavigation() && open())
@@ -99,6 +121,20 @@ export const { use: useSettingsSurface, provider: SettingsSurfaceProvider } = cr
       )
     })
 
+    const contextServer = createMemo(() => {
+      const current = view()
+
+      return selectSettingsContextServer({
+        view: current,
+        selectedRoot: server()?.key,
+        project:
+          current.type === "project"
+            ? ServerConnection.Key.make(current.server)
+            : undefined,
+        source: sourceServer(),
+      })
+    })
+
     const [searchState, setSearchState] = createSignal(createSettingsSearchState())
     let focus: HTMLElement | undefined
     let screen: HTMLElement | undefined
@@ -107,6 +143,10 @@ export const { use: useSettingsSurface, provider: SettingsSurfaceProvider } = cr
 
     const show = (view: SettingsView) => {
       const route = layout.route()
+      const sourceKey =
+        route.type === "settings"
+          ? sourceServer() ?? null
+          : currentContextServer() ?? null
 
       if (route.type !== "settings" && document.activeElement instanceof HTMLElement) focus = document.activeElement
       navigate(settingsViewUrl(view), {
@@ -114,6 +154,7 @@ export const { use: useSettingsSurface, provider: SettingsSurfaceProvider } = cr
         state: {
           settings: {
             route: route.type === "settings" ? source() : route,
+            sourceKey,
             view: { target: view.target, searchActivation: view.searchActivation },
           },
         },
@@ -203,6 +244,7 @@ export const { use: useSettingsSurface, provider: SettingsSurfaceProvider } = cr
       /** The server per-server pages show; undefined only while no server is listed. */
       server,
       sourceServer,
+      contextServer,
       plugins,
       search: {
         query: () => selectSearchQuery(searchState()),

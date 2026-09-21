@@ -249,6 +249,25 @@ export function initialLayout(server?: ServerConnection.Key): typeof layoutSchem
   }
 }
 
+export function createHomeServerBinding() {
+  const [bound, setBound] =
+    createSignal<Accessor<ServerConnection.Key | undefined>>()
+
+  return {
+    focusedServer: () => bound()?.(),
+    bindFocusedServer(accessor: Accessor<ServerConnection.Key | undefined>) {
+      // A fresh wrapper identifies even a repeated binding of the same accessor.
+      const binding = () => accessor()
+      setBound(() => binding)
+
+      return () =>
+        setBound((current) =>
+          current === binding ? undefined : current,
+        )
+    },
+  }
+}
+
 export const { use: useLayout, provider: LayoutProvider } = createSimpleContext({
   name: "Layout",
   gate: false,
@@ -269,6 +288,8 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
     })
 
     const route = useCurrentRoute()
+
+    const homeServer = createHomeServerBinding()
 
     // One-shot work a shortcut or a pane's "+" menu leaves for the screen or tab it opens.
     const [intentState, setIntentState] = createSignal(createLayoutIntentState())
@@ -513,6 +534,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       route,
       ready,
       home: {
+        ...homeServer,
         selection: createMemo(() => store.home.selection),
         setSelection(selection: HomeProjectSelection) {
           setStore("home", "selection", reconcile(selection))

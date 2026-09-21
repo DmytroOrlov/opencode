@@ -24,6 +24,7 @@ export const ServerHandler = HttpApiBuilder.group(Api, "server.server", (handler
             hostname: hostname() || undefined,
             urls: info.urls(),
             paths: info.paths,
+            ...(info.tlsCaMode === undefined ? {} : { tlsCaMode: info.tlsCaMode }),
             capabilities: { persistentPty: PersistentPty.available },
           }
         }),

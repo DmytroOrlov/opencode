@@ -2,12 +2,111 @@ import { describe, expect, test } from "bun:test"
 import { Schema } from "effect"
 import { ServerConnection } from "@/runtime/server/registry"
 import { Persistence } from "@/runtime/persistence/schema"
-import { currentRoute, initialLayout, layoutPersistence, layoutSchema } from "./layout"
-import { createSignal } from "solid-js"
+import { createHomeServerBinding, currentRoute, initialLayout, layoutPersistence, layoutSchema } from "./layout"
+import { createMemo, createRoot, createSignal, onCleanup } from "solid-js"
 import { createSessionKeyReader, ensureSessionKey, pruneSessionKeys } from "./helpers"
 
 test.each(["settings", "connect"] as const)("%s has its own layout route", (type) => {
   expect(currentRoute(`/${type}`, "")).toEqual({ type })
+})
+
+describe("createHomeServerBinding", () => {
+  test("an existing reactive reader observes a later binding, key changes and explicit undefined", () => {
+    createRoot((dispose) => {
+      try {
+        const binding = createHomeServerBinding()
+        const reader = createMemo(() => binding.focusedServer())
+        const [key, setKey] = createSignal<ServerConnection.Key | undefined>()
+
+        expect(reader()).toBeUndefined()
+
+        const release = binding.bindFocusedServer(key)
+        expect(reader()).toBeUndefined()
+
+        setKey(ServerConnection.Key.make("A"))
+        expect(reader()).toBe(ServerConnection.Key.make("A"))
+
+        setKey(ServerConnection.Key.make("B"))
+        expect(reader()).toBe(ServerConnection.Key.make("B"))
+
+        setKey(undefined)
+        expect(reader()).toBeUndefined()
+
+        release()
+        expect(reader()).toBeUndefined()
+      } finally {
+        dispose()
+      }
+    })
+  })
+
+  test("a stale cleanup cannot clear a newer binding or a repeated binding of the same accessor", () => {
+    createRoot((dispose) => {
+      try {
+        const binding = createHomeServerBinding()
+        const reader = createMemo(() => binding.focusedServer())
+        const [a, setA] = createSignal<ServerConnection.Key | undefined>(ServerConnection.Key.make("A"))
+        const [b, setB] = createSignal<ServerConnection.Key | undefined>(ServerConnection.Key.make("B"))
+
+        const releaseA = binding.bindFocusedServer(a)
+        const releaseB = binding.bindFocusedServer(b)
+        expect(reader()).toBe(ServerConnection.Key.make("B"))
+
+        releaseA()
+        expect(reader()).toBe(ServerConnection.Key.make("B"))
+
+        releaseB()
+        expect(reader()).toBeUndefined()
+
+        const releaseFirst = binding.bindFocusedServer(a)
+        const releaseSecond = binding.bindFocusedServer(a)
+        expect(reader()).toBe(ServerConnection.Key.make("A"))
+
+        releaseFirst()
+        expect(reader()).toBe(ServerConnection.Key.make("A"))
+
+        setA(ServerConnection.Key.make("A2"))
+        expect(reader()).toBe(ServerConnection.Key.make("A2"))
+
+        releaseSecond()
+        expect(reader()).toBeUndefined()
+
+        setB(ServerConnection.Key.make("B2"))
+        expect(reader()).toBeUndefined()
+      } finally {
+        dispose()
+      }
+    })
+  })
+
+  test("owner cleanup removes only the binding it owns", () => {
+    createRoot((dispose) => {
+      try {
+        const binding = createHomeServerBinding()
+        const reader = createMemo(() => binding.focusedServer())
+        const [key, setKey] = createSignal<ServerConnection.Key | undefined>(ServerConnection.Key.make("A"))
+        let disposeOwner!: () => void
+
+        createRoot((disposeInner) => {
+          disposeOwner = disposeInner
+          onCleanup(binding.bindFocusedServer(key))
+        })
+
+        expect(reader()).toBe(ServerConnection.Key.make("A"))
+
+        setKey(ServerConnection.Key.make("B"))
+        expect(reader()).toBe(ServerConnection.Key.make("B"))
+
+        disposeOwner()
+        expect(reader()).toBeUndefined()
+
+        setKey(ServerConnection.Key.make("C"))
+        expect(reader()).toBeUndefined()
+      } finally {
+        dispose()
+      }
+    })
+  })
 })
 
 describe("layout persistence", () => {

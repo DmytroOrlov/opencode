@@ -1,4 +1,5 @@
 import { Context, Layer } from "effect"
+import { getVerifiedTlsCaMode, getVerifiedTlsCaModeIfAvailable, type TlsCaMode } from "@opencode/util/tls-ca"
 import { networkInterfaces } from "node:os"
 import type { ServerOptions } from "./options"
 
@@ -8,11 +9,26 @@ export class Service extends Context.Service<
     readonly urls: () => ReadonlyArray<string>
     readonly app: NonNullable<ServerOptions["app"]>
     readonly paths: { readonly tmp: string }
+    readonly tlsCaMode?: TlsCaMode
   }
 >()("@opencode/server/ServerInfo") {}
 
 export function layer(urls: () => ReadonlyArray<string>, tmp: string, app: ServerOptions["app"] = {}) {
-  return Layer.succeed(Service, Service.of({ urls, app, paths: { tmp } }))
+  return Layer.succeed(Service, Service.of({ urls, app, paths: { tmp }, tlsCaMode: getVerifiedTlsCaMode() }))
+}
+
+export function embeddedLayer(urls: () => ReadonlyArray<string>, tmp: string, app: ServerOptions["app"] = {}) {
+  const mode = getVerifiedTlsCaModeIfAvailable()
+
+  return Layer.succeed(
+    Service,
+    Service.of({
+      urls,
+      app,
+      paths: { tmp },
+      ...(mode === undefined ? {} : { tlsCaMode: mode }),
+    }),
+  )
 }
 
 export function connectionURLs(value: string, requestedHostname?: string) {
