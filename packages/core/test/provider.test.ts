@@ -38,6 +38,8 @@ describe("Provider", () => {
         apiKey: "secret",
         reasoningEffort: "high",
         chunkTimeout: 1000,
+        mlxTelemetry: true,
+        splashTelemetry: false,
         compaction: { type: "native" },
         transport: "websocket",
       }),

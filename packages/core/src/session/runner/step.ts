@@ -9,7 +9,10 @@ import {
   type ProviderErrorEvent,
   type ToolCall,
 } from "@opencode/ai"
+import { attachMlxObserver } from "@opencode/ai/telemetry/mlx"
+import { createSplashObserver } from "@opencode/ai/telemetry/splash"
 import type { Agent } from "@opencode/schema/agent"
+import { Event } from "@opencode/schema/event"
 import { Cause, Clock, Data, Effect, Exit, Fiber, Option, Stream } from "effect"
 import { SessionError } from "@opencode/schema/session-error"
 import { Bus } from "../../bus.js"
@@ -28,6 +31,7 @@ import { SessionUsage } from "../usage.js"
 import { SessionRunnerModel } from "./model.js"
 import { createLLMEventPublisher } from "./publish-llm-event.js"
 import { SessionRunnerRetry } from "./retry.js"
+import { closeTelemetry, createFallback } from "./telemetry.js"
 
 export type Outcome = Data.TaggedEnum<{
   Completed: { readonly needsContinuation: boolean }
@@ -58,6 +62,12 @@ interface Input {
   readonly recoverOverflow: Effect.Effect<boolean>
 }
 
+export function selectTelemetryAdapter(model: Pick<SessionRunnerModel.Resolved, "mlxTelemetry" | "splashTelemetry">) {
+  if (model.mlxTelemetry === true) return "mlx"
+  if (model.splashTelemetry === true) return "splash"
+  return undefined
+}
+
 const TOOLS_INTERRUPTED = { type: "aborted", message: "Tool execution interrupted" } as const
 const STEP_INTERRUPTED = { type: "aborted", message: "Step interrupted" } as const
 const RESULT_MISSING = { type: "tool.result-missing", message: "Provider did not return a tool result" } as const
@@ -67,6 +77,8 @@ const INPUT_INCOMPLETE = {
     "Tool call arguments were not completed and were not executed. Re-issue the tool call with complete arguments.",
 } as const
 
+let telemetryAttemptSequence = 0
+
 /** Captures Location-scoped dependencies without introducing another service or execution loop. */
 export const make = Effect.gen(function* () {
   const bus = yield* Bus.Service
@@ -75,6 +87,134 @@ export const make = Effect.gen(function* () {
   const toolOutput = yield* ToolOutput.Service
 
   const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
+    const attemptID = Event.ID.create()
+    const attemptSequence = ++telemetryAttemptSequence
+    const publish = Effect.runPromiseWith(yield* Effect.context())
+    let telemetryOpen = true
+    let telemetryCompleted = false
+    let providerDecodeAccepted = false
+    let prefill: SessionEvent.TelemetryMeasurement | undefined
+    let decode: SessionEvent.TelemetryMeasurement | undefined
+    let telemetryPublication = Promise.resolve()
+    const telemetryAbort = new AbortController()
+    const queueTelemetry = (phase: SessionEvent.Telemetry["data"]["phase"]) => {
+      const measurements = [prefill, decode].filter(
+        (value): value is SessionEvent.TelemetryMeasurement => value !== undefined,
+      )
+      const data = {
+        sessionID: input.sessionID,
+        assistantMessageID: input.assistantMessageID,
+        attemptID,
+        attemptSequence,
+        phase,
+        measurements,
+      }
+      telemetryPublication = telemetryPublication.then(
+        () => publish(bus.publish(SessionEvent.Telemetry, data)).then(() => undefined, () => undefined),
+        () => undefined,
+      )
+    }
+    const observeTelemetry = (
+      observation:
+        | { readonly phase: "prefill"; readonly processed: number; readonly total: number }
+        | { readonly phase: "decode"; readonly tokensPerSecond: number },
+      source: "provider-native" | "estimated",
+    ) => {
+      if (!telemetryOpen) return
+      if (observation.phase === "prefill") {
+        if (
+          !Number.isFinite(observation.processed) ||
+          observation.processed < 0 ||
+          !Number.isFinite(observation.total) ||
+          observation.total <= 0 ||
+          observation.processed > observation.total ||
+          (prefill?.metric === "prefill-progress" &&
+            (prefill.total !== observation.total || prefill.processed >= observation.processed))
+        )
+          return
+        prefill = {
+          metric: "prefill-progress",
+          processed: observation.processed,
+          total: observation.total,
+          source,
+          approximate: source === "estimated",
+        }
+        queueTelemetry("prefill")
+        return
+      }
+      if (!Number.isFinite(observation.tokensPerSecond) || observation.tokensPerSecond <= 0) return
+      if (source === "estimated" && providerDecodeAccepted) return
+      if (source === "provider-native") {
+        providerDecodeAccepted = true
+        if (decode?.source === "estimated") decode = undefined
+      }
+      decode = {
+        metric: "decode-rate",
+        tokensPerSecond: observation.tokensPerSecond,
+        source,
+        approximate: source === "estimated",
+      }
+      queueTelemetry("decode")
+    }
+    const fallback = createFallback({
+      observe: (observation) => observeTelemetry(observation, "estimated"),
+      suppressed: () => providerDecodeAccepted || !telemetryOpen,
+    })
+    const telemetryAdapter = selectTelemetryAdapter(input.model)
+    let mlxObserver: { readonly finalize: () => void; readonly discard: () => void } | undefined
+    const splashObserver =
+      telemetryAdapter !== "splash"
+        ? undefined
+        : createSplashObserver({
+            observe: (observation) => observeTelemetry(observation, "provider-native"),
+          })
+
+    queueTelemetry("start")
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        if (!telemetryOpen) return
+        if (telemetryCompleted) {
+          closeTelemetry({
+            completed: true,
+            finalize: () => {
+              mlxObserver?.finalize()
+              splashObserver?.finalize()
+              fallback.finalize()
+            },
+            discard: () => undefined,
+            abort: () => telemetryAbort.abort(),
+          })
+          telemetryOpen = false
+          queueTelemetry("complete")
+          return
+        }
+        telemetryOpen = false
+        closeTelemetry({
+          completed: false,
+          finalize: () => undefined,
+          discard: () => {
+            mlxObserver?.discard()
+            splashObserver?.discard()
+            fallback.discard()
+          },
+          abort: () => telemetryAbort.abort(),
+        })
+        prefill = undefined
+        decode = undefined
+        queueTelemetry("discard")
+      }),
+    )
+
+    if (telemetryAdapter === "mlx") {
+      mlxObserver = yield* attachMlxObserver({
+        endpoint: input.prepared.request.model.route.endpoint.baseURL,
+        auth: input.prepared.request.model.route.auth,
+        request: input.prepared.request,
+        signal: telemetryAbort.signal,
+        observe: (observation) => observeTelemetry(observation, "provider-native"),
+      }).pipe(Effect.catch(() => Effect.succeed(undefined)))
+    }
+
     // The start snapshot only has to exist before local tools run, which cannot happen before Step.Started,
     // so it is captured while the provider request is in flight instead of delaying it.
     const pendingStartSnapshot = yield* snapshots.capture().pipe(Effect.forkScoped)
@@ -108,7 +248,10 @@ export const make = Effect.gen(function* () {
     // A local execution starts only after its Tool.Called publication completes.
     let overflowFailure: ProviderErrorEvent | undefined
     // Read to the end, not just the finish event, so the next request can reuse this response.
-    const providerStream = llm.stream(input.prepared.request, input.prepared.options).pipe(
+    const providerOptions = splashObserver
+      ? { ...input.prepared.options, observeFrame: splashObserver.observeFrame }
+      : input.prepared.options
+    const providerStream = llm.stream(input.prepared.request, providerOptions).pipe(
       Stream.runForEach((event) =>
         Effect.gen(function* () {
           if (overflowFailure || publisher.hasProviderError()) return
@@ -122,6 +265,7 @@ export const make = Effect.gen(function* () {
             overflowFailure = event
             return
           }
+          fallback.push(event)
           yield* publisher.publish(event)
           if (event.type !== "tool-call" || event.providerExecuted) return
           toolRuns.push({
@@ -183,6 +327,12 @@ export const make = Effect.gen(function* () {
             : undefined
         const llmFailure = streamFailure instanceof AIError ? streamFailure : unknownFinish
         const llmError = llmFailure && !recorded.providerFailed ? toSessionError(llmFailure) : undefined
+        telemetryCompleted =
+          Exit.isSuccess(stream) &&
+          !streamInterrupted &&
+          recorded.finish !== undefined &&
+          recorded.finish.finish !== "unknown" &&
+          !recorded.providerFailed
         if (
           input.recoverContinuation &&
           llmFailure?.reason._tag === "Transport" &&

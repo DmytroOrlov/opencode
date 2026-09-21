@@ -333,6 +333,8 @@ export type ProviderSettings = {
   timeout?: number | false
   headerTimeout?: number | false
   chunkTimeout?: number | false
+  mlxTelemetry?: boolean
+  splashTelemetry?: boolean
   compaction?: ProviderCompaction
   transport?: ProviderTransport
 } & { [x: string]: any }
@@ -1482,6 +1484,36 @@ export type SessionUsageUpdated = {
   data: { sessionID: SessionID; cost: MoneyUSD; tokens: TokenUsageInfo }
 }
 
+export type SessionTelemetry = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.telemetry"
+  location?: LocationRef
+  data: {
+    sessionID: SessionID
+    assistantMessageID: SessionMessageID
+    attemptID: EventID
+    attemptSequence: number
+    phase: "start" | "prefill" | "decode" | "complete" | "discard"
+    measurements: Array<
+      | {
+          metric: "prefill-progress"
+          processed: number
+          total: number
+          source: "provider-native" | "estimated"
+          approximate: boolean
+        }
+      | {
+          metric: "decode-rate"
+          tokensPerSecond: number
+          source: "provider-native" | "estimated"
+          approximate: boolean
+        }
+    >
+  }
+}
+
 export type SessionTextDelta = {
   id: EventID
   created: number
@@ -2536,6 +2568,7 @@ export type V2Event =
   | SessionPermissions
   | SessionViewed
   | SessionUsageUpdated
+  | SessionTelemetry
   | SessionDeleted
   | SessionForked
   | SessionInboxDelivered

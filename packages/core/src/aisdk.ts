@@ -133,6 +133,8 @@ function prepareOptions(model: RuntimeInfo, pkg: string) {
   delete options.chunkTimeout
   delete options.compaction
   delete options.transport
+  delete options.mlxTelemetry
+  delete options.splashTelemetry
   options.fetch = async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const opts = { ...(init ?? {}) }
     // A plain AbortSignal.timeout would keep running into the body stream, so the header limit uses
@@ -465,6 +467,8 @@ function requestSettings(settings: Readonly<Record<string, unknown>> | undefined
           "compaction",
           "fetch",
           "headerTimeout",
+          "mlxTelemetry",
+          "splashTelemetry",
           "timeout",
           "transport",
         ].includes(key),

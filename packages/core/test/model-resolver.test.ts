@@ -323,11 +323,11 @@ describe("ModelResolver", () => {
     ),
   )
 
-  it.effect("uses no native API-key auth for explicitly enabled providers without credentials", () => {
+  it.effect("resolves effective telemetry settings without native API-key auth for enabled providers", () => {
     const selected = model(Provider.aisdk("@ai-sdk/google"), {
       providerID: Provider.ID.make("gateway"),
       canonical: Provider.ID.google,
-      settings: { baseURL: "https://gateway.example.com/v1" },
+      settings: { baseURL: "https://gateway.example.com/v1", mlxTelemetry: true, splashTelemetry: false },
       headers: { "cf-access-token": "access-token" },
     })
     const selections = [
@@ -419,6 +419,7 @@ describe("ModelResolver", () => {
 
             expect(resolved.limit).toEqual(selection.limit)
             expect(resolved.ref.providerID).toBe(selection.providerID)
+            if (selection === selected) expect(resolved).toMatchObject({ mlxTelemetry: true, splashTelemetry: false })
             expect(String(resolved.model.provider)).toBe(selection.canonical ?? selection.providerID)
             expect(headers["cf-access-token"]).toBe("access-token")
             expect(headers.authorization).toBeUndefined()

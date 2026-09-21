@@ -124,6 +124,9 @@ export interface Resolved {
   readonly transport?: Provider.Transport
   /** Milliseconds without streamed data before a WebSocket exchange fails; `false` disables the limit. */
   readonly chunkTimeout?: number | false
+  /** Explicit opt-ins for provider telemetry observers; never forwarded to providers. */
+  readonly mlxTelemetry?: boolean
+  readonly splashTelemetry?: boolean
 }
 
 export interface Interface {
@@ -403,6 +406,8 @@ export const layer = Layer.effect(
         compaction: runtimeInfo.settings?.compaction,
         transport: provider?.settings?.transport,
         chunkTimeout: Provider.timeout(provider?.settings?.chunkTimeout),
+        mlxTelemetry: runtimeInfo.settings?.mlxTelemetry,
+        splashTelemetry: runtimeInfo.settings?.splashTelemetry,
       }
     })
     return Service.of({

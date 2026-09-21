@@ -183,6 +183,8 @@ export interface Interface {
 export interface StreamOptions {
   readonly http?: HttpMiddleware
   readonly webSocket?: WebSocketChannelExecutor
+  /** Session-independent observer hook for already-decoded provider protocol frames. */
+  readonly observeFrame?: (protocol: string, frame: unknown) => void
 }
 
 export interface StreamMethod {
@@ -448,7 +450,14 @@ function makeFromTransport<Body, Prepared, Frame, Event, State>(
                     Effect.catchCause((cause) =>
                       Effect.fail(streamError(route, `Failed to decode ${route} event`, cause)),
                     ),
-                    Effect.map((event) => ({ event, frame })),
+                    Effect.map((event) => {
+                      try {
+                        options?.observeFrame?.(protocol.id, event)
+                      } catch {
+                        // Protocol observers are observational and cannot fail generation.
+                      }
+                      return { event, frame }
+                    }),
                     Effect.mapError(frameError(frame)),
                   ),
                 ),

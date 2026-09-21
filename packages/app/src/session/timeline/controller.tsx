@@ -2,7 +2,7 @@ import type { SessionMessageInfo } from "@opencode/client/promise"
 import { DialogFooter, DialogHeader, DialogTitleGroup, Dialog } from "@opencode/ui/dialog"
 import { Button } from "@opencode/ui/button"
 import { useNavigate } from "@solidjs/router"
-import { createEffect, createMemo, on } from "solid-js"
+import { createEffect, createMemo, createSignal, on, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Option, Predicate, Schema } from "effect"
 import { notifySessionTabsRemoved } from "@/shell/titlebar/session-events"
@@ -24,6 +24,11 @@ import { createTimelineProjection } from "./projection"
 import { useServer } from "@/runtime/server/current"
 import { getSessionMessageHandoff } from "@/session/handoff"
 import type { ReasoningMode } from "@opencode/session-ui/timeline/projection"
+import {
+  reduce as reduceTelemetry,
+  resetForConnectionEpoch,
+  type State as TelemetryState,
+} from "./telemetry"
 
 const emptyMessages: SessionMessageInfo[] = []
 
@@ -67,6 +72,23 @@ export function createTimelineController(input: { session: TimelineSessionSource
   const dialog = useDialog()
   const language = useLanguage()
   const platform = usePlatform()
+  const [telemetry, setTelemetry] = createSignal<TelemetryState>({})
+
+  createEffect(() => {
+    const id = input.session.identity.sessionID()
+    if (!id) return
+    const unsubscribeConnected = serverSDK.event.on("server.connected", () => {
+      setTelemetry(resetForConnectionEpoch())
+    })
+    const unsubscribeTelemetry = serverSDK.event.on("session.telemetry", (event) => {
+      if (event.data.sessionID !== id) return
+      setTelemetry((state) => reduceTelemetry(state, event.data))
+    })
+    onCleanup(() => {
+      unsubscribeConnected()
+      unsubscribeTelemetry()
+    })
+  })
 
   const handedOffMessages = createMemo(() =>
     applyTimelineMessageHandoff(
@@ -320,6 +342,7 @@ export function createTimelineController(input: { session: TimelineSessionSource
       reasoningMode,
       shellToolPartsExpanded,
       editToolPartsExpanded,
+      telemetry: (assistantMessageID: string) => telemetry()[assistantMessageID],
     },
     pending: {
       rename: () => pending.rename,

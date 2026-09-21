@@ -174,6 +174,38 @@ export const UsageUpdated = Event.ephemeral({
 })
 export type UsageUpdated = typeof UsageUpdated.Type
 
+export const TelemetryMeasurement = Schema.Union([
+  Schema.Struct({
+    metric: Schema.Literal("prefill-progress"),
+    processed: Schema.Finite,
+    total: Schema.Finite,
+    source: Schema.Literals(["provider-native", "estimated"]),
+    approximate: Schema.Boolean,
+  }),
+  Schema.Struct({
+    metric: Schema.Literal("decode-rate"),
+    tokensPerSecond: Schema.Finite,
+    source: Schema.Literals(["provider-native", "estimated"]),
+    approximate: Schema.Boolean,
+  }),
+]).pipe(Schema.toTaggedUnion("metric"))
+export type TelemetryMeasurement = typeof TelemetryMeasurement.Type
+
+/** Live physical-attempt measurements; intentionally excluded from durable session history. */
+export const Telemetry = Event.ephemeral({
+  type: "session.telemetry",
+  schema: {
+    ...Base,
+    assistantMessageID: SessionMessage.ID,
+    attemptID: Event.ID,
+    /** Process-local creation order used to reject delayed starts from older attempts. */
+    attemptSequence: PositiveInt,
+    phase: Schema.Literals(["start", "prefill", "decode", "complete", "discard"]),
+    measurements: Schema.Array(TelemetryMeasurement),
+  },
+})
+export type Telemetry = typeof Telemetry.Type
+
 export const Deleted = Event.durable({
   type: "session.deleted",
   durable: {
@@ -659,6 +691,7 @@ export const Definitions = Event.inventory(
   Permissions,
   Viewed,
   UsageUpdated,
+  Telemetry,
   Deleted,
   Forked,
   InboxDelivered,

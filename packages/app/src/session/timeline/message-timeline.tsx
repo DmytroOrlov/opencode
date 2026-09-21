@@ -27,6 +27,7 @@ import { useCommand } from "@/shell/commands/command"
 import { SessionAncestorTrail, SessionProjectMenu, SessionTitleHeader } from "../session-identity-header"
 import { SessionHeaderSpacer } from "@/session/header/session-header"
 import { SessionRunningMenu } from "@/session/header/session-running-menu"
+import { formatThinkingTelemetry } from "@opencode/session-ui/timeline/generation-telemetry"
 
 type BlockingTask = { type: "shell" | "subagent"; partID: string; id?: string; label?: string }
 
@@ -164,6 +165,17 @@ function MessageTimelineView(
   const showHeader = createMemo(() => !props.hideHeader && (props.data.showHeader() || workspaceSession()))
   const pinned = createMemo(() => props.pinned)
   const messageByID = projection.messageByID
+  const workingText = createMemo(() => {
+    const base = language.t("session.timeline.working")
+    const active = projection.activeMessageID()
+    const assistant = active ? projection.assistantMessagesByParent().get(active)?.at(-1) : undefined
+    if (!assistant) return base
+    const attempt = props.data.telemetry(assistant.id)
+    if (!attempt || attempt.phase === "complete") return base
+    const current = attempt.measurements.findLast((measurement) => measurement.metric === "decode-rate") ??
+      attempt.measurements.findLast((measurement) => measurement.metric === "prefill-progress")
+    return formatThinkingTelemetry(base, current, language.locale())
+  })
 
   const virtualized = createTimelineVirtualizer({
     active: () => props.active !== false,
@@ -308,6 +320,7 @@ function MessageTimelineView(
     centered: () => props.centered,
     padding: turnPadding,
     anchor: props.anchor,
+    telemetry: props.data.telemetry,
   })
 
   const backgroundHintPartID = createMemo(() => {
@@ -418,7 +431,7 @@ function MessageTimelineView(
             >
               <Show when={showWorking()}>
                 <div data-component="session-working" role="status">
-                  <TextShimmer text={language.t("session.timeline.working")} active />
+                  <TextShimmer text={workingText()} active />
                 </div>
               </Show>
               <Show when={backgroundHintPresence.present()}>

@@ -168,6 +168,8 @@ it.effect("projects request settings, headers, and body overlays", () =>
 
     const input = model("@ai-sdk/google", {
       apiKey: "secret",
+      mlxTelemetry: true,
+      splashTelemetry: true,
       thinkingConfig: { thinkingBudget: 1024 },
       compaction: { type: "native" },
       transport: "websocket",
@@ -195,6 +197,8 @@ it.effect("projects request settings, headers, and body overlays", () =>
     expect(body).toEqual({ safety_setting: "strict" })
     expect(options).not.toHaveProperty("compaction")
     expect(options).not.toHaveProperty("transport")
+    expect(options).not.toHaveProperty("mlxTelemetry")
+    expect(options).not.toHaveProperty("splashTelemetry")
   }),
 )
 
