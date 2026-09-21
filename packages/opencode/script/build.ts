@@ -176,7 +176,7 @@ for (const item of targets) {
       autoloadPackageJson: true,
       target: name.replace(pkg.name, "bun") as any,
       outfile: `dist/${name}/bin/opencode`,
-      execArgv: [`--user-agent=opencode/${Script.version}`, "--use-system-ca", "--"],
+      execArgv: [`--user-agent=opencode/${Script.version}`],
       windows: {},
     },
     files: {
@@ -184,7 +184,7 @@ for (const item of targets) {
       ...(embeddedFileMap ? { "opencode-web-ui.gen.ts": embeddedFileMap } : {}),
     },
     entrypoints: [
-      "./src/index.ts",
+      "./src/bootstrap.ts",
       workerPath,
       treeSitterWorkerPath,
       ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
@@ -201,24 +201,30 @@ for (const item of targets) {
     },
   })
 
-  // Embedding the bundle invalidates the linker's ad-hoc signature, and macOS 27+
+    // Embedding the bundle invalidates the linker's ad-hoc signature, and macOS 27+
   // SIGKILLs binaries with invalid pages. Re-sign ad-hoc; release CI re-signs with Developer ID.
   if (item.os === "darwin" && process.platform === "darwin") {
     await $`codesign --force --sign - dist/${name}/bin/opencode`
   }
 
   // Smoke test: only run if binary is for current platform
-  if (item.os === process.platform && item.arch === process.arch && !item.abi) {
-    const binaryPath = `dist/${name}/bin/opencode`
-    console.log(`Running smoke test: ${binaryPath} --version`)
-    try {
-      const versionOutput = await $`${binaryPath} --version`.text()
-      console.log(`Smoke test passed: ${versionOutput.trim()}`)
-    } catch (e) {
-      console.error(`Smoke test failed for ${name}:`, e)
-      process.exit(1)
+    if (item.os === process.platform && item.arch === process.arch && !item.abi) {
+      const binaryPath = `dist/${name}/bin/opencode`
+      for (const args of [
+        ["--version"],
+        ["--tls-ca-mode=system", "--version"],
+        ["--tls-ca-mode=bundled", "--version"],
+      ]) {
+        console.log(`Running smoke test: ${binaryPath} ${args.join(" ")}`)
+        try {
+          const output = await $`${binaryPath} ${args}`.text()
+          console.log(`Smoke test passed: ${output.trim().split("\n")[0]}`)
+        } catch (e) {
+          console.error(`Smoke test failed for ${name} with ${args.join(" ")}:`, e)
+          process.exit(1)
+        }
+      }
     }
-  }
 
   await $`rm -rf ./dist/${name}/bin/tui`
   await Bun.file(`dist/${name}/package.json`).write(

@@ -37,6 +37,7 @@ import { ServerConnection, useServer } from "@/context/server"
 import { tabKey, useTabs } from "@/context/tabs"
 import type { PromptSession } from "@/context/prompt"
 import "./titlebar.css"
+import { type CaBadge, caBadgeMapping } from "./titlebar-ca-badge"
 import { newTabTooltipKeybind } from "./command-tooltip-keybind"
 import { normalizeSessionInfo } from "@/utils/session"
 
@@ -646,28 +647,46 @@ function TitlebarUpdateIconButton(props: { state: TitlebarUpdatePillState }) {
 }
 
 function ChannelIndicator(props: { debugTools?: { visible: boolean; toggle: () => void } }) {
+  const global = useGlobal()
+  const server = useServer()
+  const mode = () => global.servers.health[server.key]?.tlsCaMode
   const channel = import.meta.env.VITE_OPENCODE_CHANNEL
-  if (channel === "dev" && props.debugTools) {
+
+  const badge = () => caBadgeMapping(mode())
+
+  if (channel === "dev") {
+    if (props.debugTools) {
+      return (
+        <button
+          type="button"
+          class={`font-medium px-2 rounded-sm uppercase font-mono cursor-pointer shrink-0 ${badge().className}`}
+          onClick={props.debugTools.toggle}
+          aria-label="Toggle debug tools"
+          aria-pressed={props.debugTools.visible}
+          title={badge().tooltip}
+        >
+          {badge().label}
+        </button>
+      )
+    }
+
     return (
-      <button
-        type="button"
-        class="bg-icon-interactive-base text-[#FFF] font-medium px-2 rounded-sm uppercase font-mono cursor-pointer"
-        onClick={props.debugTools.toggle}
-        aria-label="Toggle debug tools"
-        aria-pressed={props.debugTools.visible}
+      <div
+        class={`font-medium px-2 rounded-sm uppercase font-mono select-none shrink-0 ${badge().className}`}
+        title={badge().tooltip}
       >
-        DEV
-      </button>
+        {badge().label}
+      </div>
     )
   }
 
-  return (
-    <>
-      {["beta", "dev"].includes(channel) && (
-        <div class="bg-icon-interactive-base text-[#FFF] font-medium px-2 rounded-sm uppercase font-mono">
-          {channel.toUpperCase()}
-        </div>
-      )}
-    </>
-  )
+  if (channel === "beta") {
+    return (
+      <div class="bg-icon-interactive-base text-[#FFF] font-medium px-2 rounded-sm uppercase font-mono select-none shrink-0">
+        BETA
+      </div>
+    )
+  }
+
+  return null
 }
