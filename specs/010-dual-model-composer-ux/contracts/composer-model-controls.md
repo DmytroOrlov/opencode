@@ -1,0 +1,71 @@
+# Contract: composer model controls
+
+Internal contract only (no product API). Each clause names the FRs it carries and the code that must hold it.
+
+## 1. Control-surface shape (`packages/app/src/composer/adapter.ts`)
+
+```ts
+ComposerControls["model"] = {
+  selection,                       // primary slot: ModelSelection (session/draft)
+  fallback,                        // fallback slot: ModelSelection & { enabled() }
+  fallbackStatus: "model" | "off" | "inactive",  // derived, recomputed
+  exchange: (target: ModelKey, from: "primary" | "fallback") => boolean,
+  providerName?, label?, paid, loading, preview?,
+}
+```
+
+- `swap: () => void` is **removed** (FR-004). Its only callers were the two buttons in `composer.tsx` (`composer-fallback-swap` at `:318`, `composer-fallback-clear` at `:332`), which no test selects; mocks and stories that implement `ComposerControls` are updated (`composer/submit.test.ts:55`, `composer/composer.stories.tsx:295`, `composer/composer-touch.stories.tsx:200`, `session/story-model.tsx:189`, `new-session/draft.standalone.stories.tsx:180`).
+- `exchange` returns whether the pair was applied, so the refusal path (FR-020) is observable to callers without exceptions or events.
+- `fallbackStatus` is a recomputed selector over the two owners. Nothing may store a copy of it (Principle III, FR-035).
+
+## 2. Control-row order (`packages/app/src/composer/editor/editor.tsx`)
+
+| Clause | FRs | Contract |
+|---|---|---|
+| Order | FR-001 | Exactly: primary model chip → primary variant control → fallback model chip → fallback variant control, in document order inside `[data-slot="composer-controls"]`. Direction comes from the row's `direction`, so LTR and RTL both read in that order; no absolute positioning or `order:` values. |
+| Pairing | FR-002 | Each variant control is adjacent to its own model control. The two variant controls are separate controls with separate options/current/onSelect; neither is hidden when the other has choices. |
+| Quiet-at-rest parity | FR-003 | Each control that currently reports `default` carries `composer-variant-default` (`editor.css:78` hides it while the composer is neither hovered nor `:focus-visible`/`[data-expanded]`). Hiding is per control, never row-wide. |
+| Keyboard | FR-022 | Both variant controls keep `keybind` tooltips and the existing cycling command for the primary (`model.variant.cycle`); tab order follows displayed order; picker open/close focus rules unchanged (pointer-open returns text-entry focus, keyboard-open returns to the control). |
+| Stability | FR-023 | Control height `28px`, row `h-full`, `min-w-0`, label truncation (`max-w-[60cqw]` for the primary model chip, `max-w-[170px]` for the fallback chip) unchanged. Row overflow (`overflow-x: auto`, `overscroll-x-contain`, `no-scrollbar`) and the fixed `[data-component="composer-actions"]` group stay as `component-tests/composer.spec.ts` asserts (its toolbar-overflow story selects the variant control by name). |
+| Touch | FR-023/FR-022 | Under `(max-width: 767px)` both model pickers and both variant controls open as drawers (`mobileDrawer`, `ModelSelectorDrawer`), matching `e2e/regression/mobile-model-pickers.spec.ts`. |
+
+## 3. Picker display (`packages/app/src/providers/models/select-dialog.tsx`)
+
+| Clause | FRs | Contract |
+|---|---|---|
+| Opposite slot offered | FR-033, FR-024 | `createModelSelectorController`/`ModelList`/`DialogSelectModel`/`ModelSelectorDrawer` accept `include?: () => ModelKey \| undefined`; the included model appears as a normal row even when `visible()` is false (hidden model, default fallback). Deduplicated against the ordinary list by provider + model. |
+| Distinct selection | FR-008 | Selecting the included row is the exchange trigger, not a plain write (see §4). |
+| "None" row | FR-012, FR-013 | Only the fallback picker offers "None"; selecting it calls `fallback.set(undefined)` → `save(null)`, leaves the primary slot's model and variant untouched, and the row reads as current while `enabled()` is false. The primary picker gains no "None" row. |
+| Refusal | FR-020 | Choosing a model whose provider is not connected or that is absent from the workspace catalog changes neither slot; the picker's existing unavailable affordance (`dialog.model.unavailable`) still applies to chips. |
+| Variant menu | FR-010, FR-034 | The flyout's options stay `[Default, ...supported]`; an explicit Default continues to mean the model's default, and a variant unsupported by the destination is never applied (pair math clears it). |
+
+## 4. Exchange semantics (`packages/app/src/composer/selection.ts`)
+
+| Clause | FRs | Contract |
+|---|---|---|
+| Pre-flight refusal | FR-010, FR-020 | Both targets are checked against **the guard of the slot each is moving into** before the phase claims anything: the primary target against `validModel` (`selection.tsx:616`) or `valid()` (`composer/selection.ts:263`) — different predicates, so the check must ask the slot, not a hard-coded rule — and the fallback target against `models.find` (`:865`). Anything failing: no phase transition, neither slot's model or variant changes, `exchange` returns `false`. |
+| Trigger | FR-005, FR-006 | Either picker, command, unpaid dialog or variant flyout, on a model whose identity equals the other slot's model — because every composer write path goes through the wrapped slot objects (`region.tsx:311` and `new-session/screen.tsx:55` must pass them; `commands.tsx:27`'s `input.model ?? local.model` fallback is the bypass that closes). An empty fallback slot means nothing to exchange: both slots' models and variants stay unchanged. |
+| One selection intent | FR-002, FR-009 | A pick is one intent carrying `(model, variant?)`: the wrapped `set()` applies the model, then the wrapped `variant.set()` applies the variant **only when the caller named one**. A model-row click (row `:202`, `SearchList` `onSelect` `:1123`, `unpaid.tsx:55`) names no variant, so a row click never destroys a variant; the flyout (`activateMenu` `:703-706`) and keyboard `Enter` (`:928-930`) name one, and that explicit value wins over a carried one. Variant-only actions (`view.variant` selects, `model.variant.cycle`) change no model. Per slot, the model write precedes its variant write: `variant.set` resolves its target from `current()` (`selection.tsx:662`, `composer/selection.ts:318`). |
+| Pair, not two actions | FR-019 | Both owners are written inside one `batch`, **the slot the user acted in first** (primary picker: primary model → primary variant → fallback model+variant; fallback picker: fallback first), and the pair's carried variants come from `swapModelPair`. `batch` coalesces rendering and save scheduling only: it grants no durable atomicity and does not couple the two asynchronous failures. There is no rendered frame where the same model occupies both slots, because of that batch plus the `inactive` presentation. |
+| Variants | FR-009, FR-010, FR-003 | Each model keeps its own variant, dropped to its default when the destination does not support it (`swapModelPair` with `primaryVariants`/`fallbackVariants`). One selector, `pairVariant`, answers "which variant does this model carry in this pair" and is read by **both** the exchange's writes and the wrapped `variant.current(item)` that the picker uses for its flyout check mark (`:1040`, `aria-checked` `:1177`) and keyboard pre-highlight (`:964`). Two implementations are forbidden: a menu that previews one value and writes another is a defect, and the `Enter` path would otherwise write Default over a carried variant. |
+| Displacement | FR-005 | The previously shown primary model lands in the fallback slot even when the primary slot showed an inherited/default model the user never picked. |
+| Visibility | FR-024, FR-033 | `{ recent: true }` changes only the recent list (`models.tsx` `push`, `RECENT_LIMIT = 5`). The three write sites flip visibility unconditionally (`selection.tsx:630`, `:881`, `composer/selection.ts:272`); an exchange MUST undo that for a model the user hid — capture `models.visible(target)` for both targets and re-apply `setVisibility(item, false)` inside the same batch — and passes `recent` only for the model the user clicked. Being *offered* in a picker is display only and does not change a model's stored visibility. FR-033 now states this preservation as intentional behavior with its own acceptance scenario, and names it an explicit exception to the existing selection-side re-show rule, which stays in force outside the composer's exchange. |
+| Failure | FR-016, FR-017 correction, FR-032 | Fallback-only failure reverts the fallback slot alone (existing). An exchange whose **config** write is rejected re-writes the primary from the phase's `restore`. An exchange whose **record** write fails (`write.failed`, `persist.ts:86` → `persist-machine.ts:108-112`, observed through the added `recordFailure()` **observation** — the owner's `{ attempted, fallback }` payload plus a monotonic id — ~100 ms later or on a flush) re-writes **both** halves from `restore`: the fallback cannot rely on `publish(undefined)` there, because a half that already succeeded cleared its override and the last recorded value is the new pair. **Attribution rule (corrected):** the observation entitles the claiming exchange to compensate only when (a) the failed write's `attempted` payload carries the pair this exchange wrote for this composer's session key, (b) no successful save of that document has landed since the exchange's write was issued, and (c) the phase still holds that attempt. A monotonic id only orders observations and detects one superseded by a later successful save; it never establishes that this exchange caused the failure, and no contract here may claim action-level causation — edits to that document coalesce into one save window (`persist.ts:75-101`), so there is no per-action write to fail. A compensation that itself fails ends the phase `unresolved`: one report through the existing toast, no coordinator retry loop, and the displayed pair stays collision-free via the `inactive` presentation. The contract promises the displayed pair and the write attempts, never that both durable records hold the pair after a double failure. A missing server acknowledgment (`commit.timed-out`) is not a failure and never compensates. |
+| Staleness | FR-018, FR-032 precedence | Each owner keeps its own suppression (fallback `revision`, primary commit attempt ids) **and** the exchange phase holds its own `attempt` token, because a compensation is issued by the coordinator into the *other* owner and neither owner's check can see it. A `record.failed` whose attempt the phase no longer holds produces no write. Any newer write to either slot, a session/route/server identity change, or composer unmount drops the pending exchange without compensating. **FR-018 outranks FR-032 once an exchange is superseded.** Required case: initial A/B → exchange to B/A → user selects C → old exchange fails ⇒ final pair **C/B** — C in the primary slot (the newer selection survives) and **B** in the fallback slot, because the rejected write's optimistic override is dropped by the owner (`fallback-update.ts:44-50`) and that slot returns to its own last recorded value. Never **C/A** (a value that was never recorded cannot survive its own rejection), never A/B, never a duplicated pair — provided no later fallback write succeeded after the rejected one. |
+| Nothing to exchange | FR-006 + Assumptions | An `off` fallback (no model) and an `inactive` fallback (same model in both identities) both make the action a no-op: neither slot's model or variant changes, and the primary slot is never emptied. |
+| Variant control visibility | FR-002/FR-003 + Assumptions | The fallback variant control renders only when the fallback holds a model offering more than one variant (the same gate the primary control uses, `control.options().length > 1`): absent when the fallback is `off` or its model has no variants; still rendered in the `inactive` state, where its record is separate from the primary's. |
+
+## 5. Names and copy
+
+| Key | File | Value | Note |
+|---|---|---|---|
+| `ui.promptInput.chooseVariant` | `packages/ui/src/i18n/en.ts:247` (existing) | "Choose model variant" | **Unchanged**: primary variant control, and the accessible name existing component/e2e tests select. |
+| `ui.promptInput.chooseFallbackVariant` | `packages/ui/src/i18n/en.ts` (new) | "Choose fallback model variant" | Distinct accessible name for the fallback variant control (FR-003); without it, strict `getByRole("button", { name: "Choose model variant", exact: true })` locators in `component-tests/composer.spec.ts` and `e2e/regression/mobile-model-pickers.spec.ts` break. |
+| `ui.sessionTurn.status.fallback.none` | `packages/app/src/runtime/i18n/en.ts` (new) | "None" | Explicit no-fallback chip state (FR-013/015). |
+| `ui.sessionTurn.status.fallback.sameModel` | `packages/app/src/runtime/i18n/en.ts` (new) | "Same model" | Fallback-inactive-on-collision state (FR-029/FR-030). The concise visible label is required to be accompanied by an accessible description naming the state and its reason — the fallback is inactive because it would repeat the primary model — so the two-word label is never the only carrier of that meaning (FR-029, SC-001). |
+
+English source keys only; other locales fall back at runtime, per `packages/app/AGENTS.md` → Localization ("Feature work adds English source strings only. Leave non-English keys absent so the runtime English fallback applies"). The constitution contains no localization rule, and none is invoked here. `ui.sessionTurn.status.fallback` (existing "Fallback") stays for the tooltip and the session-turn status label.
+
+## 6. Selectors that must keep working
+
+`[data-action="composer-model"]` (perf: `packages/app/perf/navigation.bench.ts:35`; e2e: `composer.spec.ts`, `new-session.spec.ts`, `mobile-model-pickers.spec.ts`, `model-selection-flow.spec.ts`; component tests: `component-tests/composer.spec.ts:475/720`) and `[data-action="composer-fallback-model"]` (`composer.tsx:272/298`) stay. No new `data-*` attribute is introduced for tests (test rule). `[data-slot="composer-controls"]`, `[data-component="composer"]`, `[data-slot="model-dialog-flyout-*"]` and the drawer's dialog roles are unchanged.
