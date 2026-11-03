@@ -355,6 +355,29 @@ export const ShellTool = Tool.define(
       return FSUtil.normalizePath(file)
     })
 
+    const normalizeWorkdir = Effect.fn("ShellTool.normalizeWorkdir")(function* (
+      text: string,
+      instance: InstanceContext,
+      shell: string,
+    ) {
+      const match = /^([^\r\n]+)\n<\/parameter>?[ \t]*$/.exec(text)
+      if (!match || match[0] !== text) return text
+      // An existing directory with unusual characters is a literal workdir, not argument corruption.
+      if (yield* fs.isDir(yield* resolvePath(text, instance.directory, shell))) return text
+      const cleaned = yield* resolvePath(match[1], instance.directory, shell)
+      const real = yield* fs.realPath(cleaned).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      // Require both lexical and real containment so a local symlink cannot repair into external access.
+      if (!containsPath(cleaned, instance) || !real || !containsPath(real, instance) || !(yield* fs.isDir(real))) {
+        throw new Error(
+          "Invalid shell workdir: malformed parameter suffix cannot be safely repaired within the project.",
+        )
+      }
+      yield* Effect.logWarning("shell workdir repaired", {
+        reason: "malformed_parameter_suffix",
+      })
+      return real
+    })
+
     const resolvePath = Effect.fn("ShellTool.resolvePath")(function* (text: string, root: string, shell: string) {
       if (process.platform === "win32") {
         if (Shell.posix(shell) && text.startsWith("/") && FSUtil.windowsPath(text) === text) {
@@ -610,7 +633,11 @@ export const ShellTool = Tool.define(
             Effect.gen(function* () {
               const instanceCtx = yield* InstanceState.context
               const cwd = params.workdir
-                ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
+                ? yield* resolvePath(
+                    yield* normalizeWorkdir(params.workdir, instanceCtx, shell),
+                    instanceCtx.directory,
+                    shell,
+                  )
                 : instanceCtx.directory
               if (params.timeout !== undefined && params.timeout < 0) {
                 throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)

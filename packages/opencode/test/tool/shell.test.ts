@@ -756,13 +756,126 @@ describe("tool.shell permissions", () => {
     }),
   )
 
-  each("asks for external_directory permission when workdir is outside project", () =>
+  for (const workdir of [".", "absolute", "\n</parameter>", "\n</parameter", "\n</parameter> \t", "\n</parameter\t "]) {
+    each(`executes in the project with workdir ${JSON.stringify(workdir)}`, () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            const result = yield* run(
+              {
+                command: "echo repaired > executed.txt",
+                workdir: workdir === "." ? "." : workdir === "absolute" ? tmp : tmp + workdir,
+              },
+              capture(requests),
+            )
+            expect(result.metadata.exit).toBe(0)
+            expect(yield* Effect.promise(() => Bun.file(path.join(tmp, "executed.txt")).text())).toContain("repaired")
+            expect(requests.filter((req) => req.permission === "external_directory")).toEqual([])
+          }),
+        )
+      }),
+    )
+  }
+
+  for (const suffix of ["\n</parameter>", "\n</parameter"]) {
+    each(`rejects malformed external workdir ${JSON.stringify(suffix)} as an ordinary tool error`, () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const external = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            const err = yield* fail(
+              { command: "echo unexpected > executed.txt", workdir: external + suffix },
+              capture(requests),
+            )
+            expect(err.message).toContain("Invalid shell workdir")
+            expect(err).not.toBeInstanceOf(PermissionV1.RejectedError)
+            expect(requests).toEqual([])
+            expect(yield* Effect.promise(() => Bun.file(path.join(external, "executed.txt")).exists())).toBe(false)
+            expect(yield* Effect.promise(() => Bun.file(path.join(tmp, "executed.txt")).exists())).toBe(false)
+            const result = yield* run({ command: "echo recovered", workdir: tmp }, capture(requests))
+            expect(result.metadata.exit).toBe(0)
+            expect(result.output).toContain("recovered")
+          }),
+        )
+      }),
+    )
+  }
+
+  if (process.platform !== "win32") {
+    each("does not repair an unrecognized workdir suffix", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            yield* fail({ command: "echo unexpected > executed.txt", workdir: tmp + "\n</other>" }, capture(requests))
+            expect(yield* Effect.promise(() => Bun.file(path.join(tmp, "executed.txt")).exists())).toBe(false)
+          }),
+        )
+      }),
+    )
+
+    for (const suffix of ["\n</other>", "\n</parameter>extra", "\n</parameter>\n", "\n</parameter>"]) {
+      each(`preserves literal unusual workdir ${JSON.stringify(suffix)}`, () =>
+        Effect.gen(function* () {
+          const tmp = yield* tmpdirScoped()
+          const fs = yield* FSUtil.Service
+          const literal = path.join(tmp, "literal" + suffix)
+          yield* fs.makeDirectory(literal, { recursive: true })
+          yield* runIn(
+            tmp,
+            Effect.gen(function* () {
+              const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+              const result = yield* run({ command: "echo literal > executed.txt", workdir: literal }, capture(requests))
+              expect(result.metadata.exit).toBe(0)
+              expect(yield* Effect.promise(() => Bun.file(path.join(literal, "executed.txt")).text())).toContain(
+                "literal",
+              )
+              expect(yield* Effect.promise(() => Bun.file(path.join(tmp, "executed.txt")).exists())).toBe(false)
+              expect(requests.filter((req) => req.permission === "external_directory")).toEqual([])
+            }),
+          )
+        }),
+      )
+    }
+
+    each("rejects repairing a project symlink to an external workdir", () =>
+      Effect.gen(function* () {
+        const tmp = yield* tmpdirScoped()
+        const external = yield* tmpdirScoped()
+        const fs = yield* FSUtil.Service
+        yield* fs.symlink(external, path.join(tmp, "outside"))
+        yield* runIn(
+          tmp,
+          Effect.gen(function* () {
+            const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+            const err = yield* fail(
+              { command: "echo unexpected > executed.txt", workdir: path.join(tmp, "outside") + "\n</parameter>" },
+              capture(requests),
+            )
+            expect(err.message).toContain("Invalid shell workdir")
+            expect(requests).toEqual([])
+            expect(yield* Effect.promise(() => Bun.file(path.join(external, "executed.txt")).exists())).toBe(false)
+          }),
+        )
+      }),
+    )
+  }
+
+  each("preserves permission rejection when workdir is outside project", () =>
     Effect.gen(function* () {
       const tmp = yield* tmpdirScoped()
       yield* runIn(
         tmp,
         Effect.gen(function* () {
-          const err = new Error("stop after permission")
+          const err = new PermissionV1.RejectedError({})
           const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
           expect(
             yield* fail(
@@ -772,7 +885,7 @@ describe("tool.shell permissions", () => {
               },
               capture(requests, err),
             ),
-          ).toMatchObject({ message: err.message })
+          ).toBe(err)
           const extDirReq = requests.find((r) => r.permission === "external_directory")
           expect(extDirReq).toBeDefined()
           expect(extDirReq!.patterns).toContain(glob(path.join(os.tmpdir(), "*")))
@@ -874,39 +987,44 @@ describe("tool.shell permissions", () => {
     }
   }
 
-  each("asks for external_directory permission when file arg is outside project", () =>
-    Effect.gen(function* () {
-      const outerTmp = yield* tmpdirScoped()
-      yield* Effect.promise(() => Bun.write(path.join(outerTmp, "outside.txt"), "x"))
-      const tmp = yield* tmpdirScoped()
-      yield* runIn(
-        tmp,
+  for (const suffix of ["", "\n</parameter>", "\n</parameter"]) {
+    each(
+      `asks for external_directory permission when file arg is outside project with workdir suffix ${JSON.stringify(suffix)}`,
+      () =>
         Effect.gen(function* () {
-          const err = new Error("stop after permission")
-          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
-          const filepath = path.join(outerTmp, "outside.txt")
-          expect(
-            yield* fail(
-              {
+          const outerTmp = yield* tmpdirScoped()
+          yield* Effect.promise(() => Bun.write(path.join(outerTmp, "outside.txt"), "x"))
+          const tmp = yield* tmpdirScoped()
+          yield* runIn(
+            tmp,
+            Effect.gen(function* () {
+              const err = new Error("stop after permission")
+              const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+              const filepath = path.join(outerTmp, "outside.txt")
+              expect(
+                yield* fail(
+                  {
+                    command: `cat ${filepath}`,
+                    workdir: tmp + suffix,
+                  },
+                  capture(requests, err),
+                ),
+              ).toMatchObject({ message: err.message })
+              const extDirReq = requests.find((r) => r.permission === "external_directory")
+              const expected = glob(path.join(outerTmp, "*"))
+              expect(extDirReq).toBeDefined()
+              expect(extDirReq!.patterns).toContain(expected)
+              expect(extDirReq!.always).toContain(expected)
+              expect(extDirReq!.metadata).toMatchObject({
                 command: `cat ${filepath}`,
-              },
-              capture(requests, err),
-            ),
-          ).toMatchObject({ message: err.message })
-          const extDirReq = requests.find((r) => r.permission === "external_directory")
-          const expected = glob(path.join(outerTmp, "*"))
-          expect(extDirReq).toBeDefined()
-          expect(extDirReq!.patterns).toContain(expected)
-          expect(extDirReq!.always).toContain(expected)
-          expect(extDirReq!.metadata).toMatchObject({
-            command: `cat ${filepath}`,
-            directories: [outerTmp],
-            patterns: [expected],
-          })
+                directories: [outerTmp],
+                patterns: [expected],
+              })
+            }),
+          )
         }),
-      )
-    }),
-  )
+    )
+  }
 
   each("does not ask for external_directory permission when rm inside project", () =>
     Effect.gen(function* () {
