@@ -47,6 +47,16 @@ const selectedModel = {
   latest: true,
 } satisfies NonNullable<ReturnType<ModelSelection["current"]>>
 
+/** What the fallback chip states for a story's `fallbackState`: an `unavailable` model is still a model the config
+ *  names, so it reads as `model` here exactly as the real `composerFallbackStatus` would (FR-029/FR-030). */
+function storyFallbackStatus(state: "model" | "off" | "inactive" | "unavailable" | undefined) {
+  if (state === "off") return "off"
+
+  if (state === "inactive") return "inactive"
+
+  return "model"
+}
+
 function ComposerStory(props: {
   prompt?: ComposerPersistedState["prompt"]
   comments?: ComposerPersistedState["context"]["items"]
@@ -59,6 +69,14 @@ function ComposerStory(props: {
   inspectRequest?: boolean
   continueOnStop?: boolean
   longLabels?: boolean
+  /** Whether this scenario's row also carries the fallback slot's own variant control. */
+  fallbackVariant?: boolean
+  /** Which state the fallback chip states: another model, disabled, a repeat of this composer's own model, or a model
+   * the workspace catalog cannot name. */
+  fallbackState?: "model" | "off" | "inactive" | "unavailable"
+  /** A second catalog model this user hid, held in the fallback slot, so only a pair picker offers it as a row
+   * (FR-024/FR-033). Its own variant record differs from this composer's model's, so a flyout can be proven per model. */
+  fallbackHidden?: boolean
   alternate?: "none" | "queue" | "steer"
   manySuggestions?: boolean
   history?: boolean
@@ -80,11 +98,22 @@ function ComposerStory(props: {
   const [story, setStory] = createStore({
     activity: props.label ?? "Ready",
     variant: STORY_MODEL.variant,
+    fallbackVariant: STORY_MODEL.variant,
   })
 
   const modelOption = createMemo(() => ({
     ...selectedModel,
     name: props.longLabels ? "Claude Sonnet with an unusually long model name" : selectedModel.name,
+  }))
+
+  // A catalog model this composer's user chose to hide. The fallback slot holds it, so a picker still offers it as a
+  // row while the ordinary list leaves it out, and this composer's own record names `high` for it alone: a flyout reads
+  // the variant of the model under the row, not of whichever slot opened the dialog.
+  const hiddenOption = createMemo(() => ({
+    ...selectedModel,
+    id: "hidden-model",
+    name: "Hidden Model",
+    release_date: "2025-03-01",
   }))
 
   const modelSelection = {
@@ -93,19 +122,48 @@ function ComposerStory(props: {
     current: () => modelOption(),
     recent: () => [modelOption()],
     favorite: { list: () => [], toggle() {} },
-    list: () => [modelOption()],
+    list: () => (props.fallbackHidden ? [modelOption(), hiddenOption()] : [modelOption()]),
     cycle() {},
-    set() {},
-    visible: () => true,
+    // The identity the picker asked this slot to hold, stated where the story already reports its own actions, so a
+    // keyboard selection of an offered row is observable and not just a DOM event.
+    set: (item, options) => setStory("activity", `Selected ${item?.modelID ?? "none"}${options?.variant ? ` ${options.variant}` : ""}`),
+    visible: (model: { providerID: string; modelID: string }) =>
+      !props.fallbackHidden || model.modelID !== "hidden-model",
     setVisibility() {},
     variant: {
       configured: () => STORY_MODEL.variant,
-      current: () => story.variant,
+      current: (model?: { providerID: string; modelID: string }) =>
+        props.fallbackHidden && model?.modelID === "hidden-model" ? "high" : story.variant,
       list: () => ["balanced", "high"],
       set: (variant: string | undefined) => setStory("variant", variant ?? "balanced"),
       cycle() {},
     },
   } satisfies ModelSelection
+
+  // The fallback slot holds the model this user hid, so the ordinary list leaves it out while a pair picker still
+  // offers it (FR-024/FR-033).
+  const fallbackHiddenPair = props.fallbackHidden
+    ? {
+        current: () => hiddenOption(),
+        key: () => ({ providerID: STORY_MODEL.providerID, modelID: "hidden-model" }),
+      }
+    : {}
+
+  // A fallback slot that knows which model it holds while the workspace catalog cannot name it. The chip must keep
+  // the picker's existing `dialog.model.unavailable` affordance rather than go blank (FR-020 read with FR-030).
+  const fallbackUnavailable = props.fallbackState === "unavailable"
+    ? {
+        current: () => undefined,
+        key: () => ({ providerID: STORY_MODEL.providerID, modelID: "legacy-model" }),
+      }
+    : {}
+
+  const fallbackSelection = {
+    ...modelSelection,
+    enabled: () => props.fallbackState !== "off",
+    ...fallbackHiddenPair,
+    ...fallbackUnavailable,
+  }
 
   const commands: ComposerSuggestion[] = [
     { id: "command.test", kind: "command", label: "/test", trigger: "test", title: "Run tests" },
@@ -150,6 +208,25 @@ function ComposerStory(props: {
       },
     },
   ]
+
+  // Scenarios that model a fallback with variants turn this on: the real control is built in `composer/model.ts` over
+  // the wrapped fallback slot, so it writes config and carries the pair rule; here it only records the choice.
+  const fallbackVariantControl = props.fallbackVariant
+    ? {
+        // The fallback slot's own variant control, which the row renders beside the fallback chip (FR-001/FR-002). The
+        // real one is built in `composer/model.ts` over the wrapped fallback slot, so it writes config and carries the
+        // pair rule; here it only records what the control chose.
+        fallbackVariant: {
+          options: () => [
+            { id: "default", label: "default" },
+            { id: "balanced", label: "balanced" },
+            { id: "high", label: "high" },
+          ],
+          current: () => story.fallbackVariant,
+          onSelect: (variant: string) => setStory("fallbackVariant", variant),
+        },
+      }
+    : {}
 
   const editor = createComposerEditor({
     store: [draft, setDraft],
@@ -231,6 +308,9 @@ function ComposerStory(props: {
         current: () => story.variant,
         onSelect: (variant) => setStory("variant", variant),
       },
+      // Scenarios that model a fallback with variants turn this on: the real control is built in `composer/model.ts`
+      // over the wrapped fallback slot, so it writes config and carries the pair rule; here it only records the choice.
+      ...fallbackVariantControl,
       submit: {
         stopping: () => !!props.stopping,
         working: () => !!props.working,
@@ -290,7 +370,15 @@ function ComposerStory(props: {
 
   const model = {
     ...editor,
-    model: { selection: modelSelection, paid: true, loading: false },
+    model: {
+      selection: modelSelection,
+      fallback: fallbackSelection,
+      // The chip's content is the derived status; `unavailable` is still a model state, only one the catalog cannot name.
+      fallbackStatus: storyFallbackStatus(props.fallbackState),
+      exchange: () => false,
+      paid: true,
+      loading: false,
+    },
   } satisfies ComposerModel
 
   const suggest = (kind: typeof props.suggestions) => {

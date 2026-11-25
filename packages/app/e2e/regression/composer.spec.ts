@@ -1,5 +1,5 @@
 import { expect, test, type Locator, type Page } from "@playwright/test"
-import { NO_PROVIDER, SERVER, T0, expectPath, holdRoute, pageMessagesFrom, provider, sessionHref } from "../utils/app"
+import { NO_PROVIDER, SERVER, T0, draftHref, expectPath, holdRoute, pageMessagesFrom, provider, sessionHref, workspaceKey } from "../utils/app"
 import { mockWorkspace, openDraft, openSession } from "../utils/workspace"
 import { mockPluginsActivating, type MockServerConfig } from "../utils/mock-server"
 
@@ -624,6 +624,533 @@ test("an existing session's model never shows a fallback while its agent loads",
   await agentLoaded
   await expect(control).toHaveText("Alpha")
   expect(await page.evaluate(() => [...(window.__chipTexts ?? [])])).toEqual(["Alpha"])
+})
+
+// FR-004/FR-033/FR-031 through the real app: the row carries no affordance that acts on the pair - `composer-fallback-swap`
+// is what this spec replaces, and `composer-fallback-clear` never shipped - and the fallback chip's own picker writes
+// config instead of this Session, while offering this composer's own model as an ordinary row.
+test("the composer offers no affordance that acts on the pair, and its fallback picker writes config", async ({
+  page,
+}) => {
+  const workspace = await mockWorkspace(page, {
+    name: "ComposerFallbackRow",
+    directory: "C:/OpenCode/ComposerFallbackRow",
+    sessions: [{ id: "ses_fallback_row", agent: "build", model: { id: "alpha", providerID: "opencode" } }],
+    provider: provider(
+      { id: "alpha", name: "Alpha", variants: { high: {}, low: {} } },
+      { id: "beta", name: "Beta", variants: { high: {}, low: {} } },
+    ),
+  })
+
+  // This case is about the affordance the row does NOT carry, so it seeds no fallback of its own: the config-driven
+  // chip states, and the pair's config writes, are the next case's subject, where the mock's documents are read back
+  // through the app's own config query (`runtime/server/sync.tsx`).
+  await page.goto(sessionHref(workspace.sessions[0]!.id))
+  const controls = page.locator('[data-slot="composer-controls"]')
+  await expect(controls).toBeVisible()
+
+  // FR-004: no affordance that acts on the pair, and no copy naming one, in either direction.
+  for (const direction of ["ltr", "rtl"]) {
+    await page.evaluate((value) => (document.documentElement.dir = value), direction)
+    await expect(controls.locator('[data-action="composer-fallback-swap"]')).toHaveCount(0)
+    await expect(controls.locator('[data-action="composer-fallback-clear"]')).toHaveCount(0)
+    await expect(page.getByText("Swap primary and fallback models")).toHaveCount(0)
+    // Both model controls stay reachable, each with its own variant control beside it, and the row's accessible names
+    // keep the two variant controls distinguishable (FR-001/FR-002/FR-034).
+    await expect(controls.locator('[data-action="composer-model"]')).toHaveCount(1)
+    await expect(controls.locator('[data-action="composer-fallback-model"]')).toHaveCount(1)
+    await expect(controls.getByRole("button", { name: "Choose model variant", exact: true })).toHaveCount(1)
+  }
+
+  const chip = page.locator('[data-action="composer-fallback-model"]')
+  await chip.click()
+  const dialog = page.getByRole("dialog", { name: "Select model" })
+  await expect(dialog).toBeVisible()
+  // This composer's own primary model is offered as an ordinary row (FR-024/FR-033).
+  await expect(dialog.locator('[data-option-key="opencode:alpha"]')).toBeVisible()
+
+  // Choosing another model there writes the config (`PATCH /api/experimental/config`), not this Session: the primary
+  // chip is untouched afterwards.
+  const written = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/experimental/config")
+  await dialog.locator('[data-option-key="opencode:beta"]').click()
+  await written
+  await expect(page.locator('[data-action="composer-model"]')).toHaveText("Alpha")
+})
+
+// SC-001/FR-005/FR-029 through the real app: the header alone states which of the three fallback states the app is
+// in, with the picker never opened, and the collision state says WHY in its accessible description. The mock's config
+// documents are re-read through the app's own `config.updated` handling, so one page shows all three.
+test("the fallback chip states a configured model, one that repeats the primary, and a saved no-fallback", async ({
+  page,
+}) => {
+  const configPath = "/home/test/.config/opencode/opencode.jsonc"
+
+  const workspace = await mockWorkspace(page, {
+    name: "FallbackChipStates",
+    directory: "C:/OpenCode/FallbackChipStates",
+    sessions: [{ id: "ses_chip_states", agent: "build", model: { id: "alpha", providerID: "opencode" } }],
+    provider: provider(
+      { id: "alpha", name: "Alpha", variants: { high: {}, low: {} } },
+      { id: "beta", name: "Beta", variants: { high: {}, low: {} } },
+    ),
+    configEntries: [{ type: "document", path: configPath, info: { fallback: "opencode/beta#high" } }],
+  })
+
+  // FR-029/FR-030: arriving at, or passing through, the collision state never writes the config field it is naming.
+  const patches: unknown[] = []
+  page.on("response", (response) => {
+    if (new URL(response.url()).pathname === "/api/experimental/config") patches.push(response.status())
+  })
+
+  await page.goto(sessionHref(workspace.sessions[0]!.id))
+  const chip = page.locator('[data-action="composer-fallback-model"]')
+  const controls = page.locator('[data-slot="composer-controls"]')
+  await expect(controls).toBeVisible()
+
+
+  // 1. A configured fallback other than the primary model: the chip names the model.
+  await expect(chip).toHaveText("Beta")
+  await expect(chip).not.toHaveAttribute("aria-description", "Fallback inactive: it would repeat the primary model")
+
+  // FR-001/FR-003 at this boundary: a pair whose models both offer a choice carries exactly four controls, the two
+  // variant controls resolve under distinct accessible names, and the row keeps primary model → its variant → fallback
+  // model → its variant in each direction's own inline axis. Whether anything overlaps or is clipped stays owned by
+  // the component keeper, which measures that geometry (FR-028: one contract, one owner).
+  const primary = page.locator('[data-action="composer-model"]')
+  const primaryVariant = controls.getByRole("button", { name: "Choose model variant", exact: true })
+  const fallbackVariant = controls.getByRole("button", { name: "Choose fallback model variant", exact: true })
+
+  for (const control of [primary, primaryVariant, chip, fallbackVariant]) await expect(control).toHaveCount(1)
+
+  for (const direction of ["ltr", "rtl"]) {
+    await page.evaluate((value) => (document.documentElement.dir = value), direction)
+    const boxes = await Promise.all([primary, primaryVariant, chip, fallbackVariant].map((control) => control.boundingBox()))
+    const [model, variant, pairModel, pairVariant] = boxes
+
+    if (!model || !variant || !pairModel || !pairVariant) throw new Error(`Missing a control in the row at ${direction}`)
+
+    // One row, so all four share a vertical centre, and each control starts at or past the previous one's end in
+    // that direction's own inline axis, which is the reading order the header states.
+    const centres = [model, variant, pairModel, pairVariant].map((box) => box.y + box.height / 2)
+    expect(Math.max(...centres) - Math.min(...centres)).toBeLessThan(2)
+
+    for (const [from, to] of [
+      [model, variant],
+      [variant, pairModel],
+      [pairModel, pairVariant],
+    ]) {
+      const ahead = direction === "ltr" ? to.x - (from.x + from.width) : from.x - (to.x + to.width)
+      expect(ahead, `${direction}: controls out of reading order`).toBeGreaterThanOrEqual(0)
+    }
+  }
+
+  // 2. The config now names the model this composer shows as its primary: the label is short, and the description
+  // carries the reason, so the two-word label is never the only carrier (FR-029).
+  workspace.config.entries[0] = { type: "document", path: configPath, info: { fallback: "opencode/alpha" } }
+  await workspace.push([{ id: "evt_chip_same_model", created: 1, type: "config.updated", data: {} }])
+  await expect(chip).toHaveText("Same model")
+  await expect(chip).toHaveAttribute(
+    "aria-description",
+    "Fallback inactive: it would repeat the primary model",
+  )
+  // The primary chip keeps naming its own model, and the picker is still closed: the state was read, not acted on.
+  await expect(page.locator('[data-action="composer-model"]')).toHaveText("Alpha")
+  await expect(page.getByRole("dialog", { name: "Select model" })).toHaveCount(0)
+
+  // 3. A saved no-fallback is a DIFFERENT state from the collision above: it reads "None" and keeps no inactive
+  // description, which is what keeps `off` and `inactive` from being interchangeable (SC-014).
+  workspace.config.entries[0] = { type: "document", path: configPath, info: { fallback: null } }
+  await workspace.push([{ id: "evt_chip_none", created: 1, type: "config.updated", data: {} }])
+  await expect(chip).toHaveText("None")
+  await expect(chip).not.toHaveAttribute(
+    "aria-description",
+    "Fallback inactive: it would repeat the primary model",
+  )
+
+  // Nothing in that sequence wrote the config it was only displaying (FR-029 read with FR-030).
+  expect(patches).toEqual([])
+})
+
+// FR-029/FR-030 with FR-028 and FR-021: a fallback that differs from the primary only by variant is the SAME MODEL, so
+// the composer reads it inactive - and it keeps displaying that slot's recorded variant without ever writing it back.
+// Only the other slot changing makes it active again, and that needs no click in this picker (T021).
+test("a variant-only fallback repeats its primary model, keeps its variant control, and writes nothing", async ({
+  page,
+}) => {
+  const configPath = "/home/test/.config/opencode/opencode.jsonc"
+  const patches: string[] = []
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/experimental/config") patches.push(request.method())
+  })
+
+  const workspace = await mockWorkspace(page, {
+    name: "InactiveFallbackVariant",
+    directory: "C:/OpenCode/InactiveFallbackVariant",
+    sessions: [{ id: "ses_inactive_variant", agent: "build", model: { id: "alpha", providerID: "opencode", variant: "low" } }],
+    // A paid catalog, so the primary chip opens the ordinary model dialog with its rows (T021 moves the primary).
+    provider: provider(
+      { id: "alpha", name: "Alpha", cost: { input: 3, output: 15 }, variants: { high: {}, low: {} } },
+      { id: "beta", name: "Beta", cost: { input: 3, output: 15 }, variants: { high: {}, low: {} } },
+    ),
+    // The config's own value differs from the primary by its variant alone: the identity rule decides, not the string.
+    configEntries: [{ type: "document", path: configPath, info: { fallback: "opencode/alpha#high" } }],
+    // Both models visible in the paid list, so this picker's ordinary rows are what the case clicks.
+    seed: {
+      storage: {
+        "opencode.global.dat:model": {
+          user: [
+            { providerID: "opencode", modelID: "alpha", visibility: "show" },
+            { providerID: "opencode", modelID: "beta", visibility: "show" },
+          ],
+          recent: [],
+          variant: {},
+        },
+      },
+    },
+  })
+
+  await page.goto(sessionHref(workspace.sessions[0]!.id))
+  const controls = page.locator('[data-slot="composer-controls"]')
+  const primary = controls.locator('[data-action="composer-model"]')
+  const chip = controls.locator('[data-action="composer-fallback-model"]')
+  const primaryVariant = controls.getByRole("button", { name: "Choose model variant", exact: true })
+  const fallbackVariant = controls.getByRole("button", { name: "Choose fallback model variant", exact: true })
+  await expect(controls).toBeVisible()
+
+  // The collision names itself with the reason in its description, and the fallback slot still offers its own variant
+  // choice - the inactive state is a display verdict, never a clear of the saved field (FR-028 read with FR-030).
+  await expect(chip).toHaveText("Same model")
+  await expect(chip).toHaveAttribute("aria-description", "Fallback inactive: it would repeat the primary model")
+  await expect(primaryVariant).toHaveText("low")
+  await expect(fallbackVariant).toHaveText("high")
+
+  // Changing the primary's variant touches the other slot only: still the same model, so still inactive, still the
+  // recorded `high`, and no request at all (FR-029).
+  await primaryVariant.click()
+  await page.getByRole("menuitemradio", { name: "high", exact: true }).click()
+  await expect(primaryVariant).toHaveText("high")
+  await expect(chip).toHaveText("Same model")
+  await expect(fallbackVariant).toHaveText("high")
+  expect(patches).toEqual([])
+
+  // Moving the primary to another model makes that stored fallback usable again, with its recorded variant, without
+  // the user touching this picker. The row click names a model that is NOT the other slot's model, so no exchange runs
+  // either: the field keeps what it already holds (FR-030 read with FR-001).
+  await primary.click()
+  const dialog = page.getByRole("dialog", { name: "Select model" })
+  await expect(dialog).toBeVisible()
+  await dialog.locator('[data-option-key="opencode:beta"]').click()
+  await expect(primary).toHaveText("Beta")
+  await expect(chip).toHaveText("Alpha")
+  await expect(chip).not.toHaveAttribute("aria-description", "Fallback inactive: it would repeat the primary model")
+  await expect(fallbackVariant).toHaveText("high")
+  expect(patches).toEqual([])
+})
+
+// FR-012/FR-028: the fallback slot's variant control exists only where that slot has a model with a variant to choose.
+// A saved no-fallback has no model at all, and a model the catalog lists without variants has no choice to offer, and
+// neither state reaches into the other slot's control or writes the config field it is merely describing (T021).
+test("an off fallback and a variant-less one each leave the other slot's variant control alone", async ({
+  page,
+}) => {
+  const configPath = "/home/test/.config/opencode/opencode.jsonc"
+  const patches: string[] = []
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/experimental/config") patches.push(request.method())
+  })
+
+  const workspace = await mockWorkspace(page, {
+    name: "FallbackVariantControls",
+    directory: "C:/OpenCode/FallbackVariantControls",
+    sessions: [{ id: "ses_fallback_variant_controls", agent: "build", model: { id: "alpha", providerID: "opencode", variant: "low" } }],
+    provider: provider(
+      { id: "alpha", name: "Alpha", variants: { high: {}, low: {} } },
+      // A model with no variants of its own: `Default` is its only option, so no control renders.
+      { id: "gamma", name: "Gamma" },
+    ),
+    configEntries: [{ type: "document", path: configPath, info: { fallback: null } }],
+  })
+
+  await page.goto(sessionHref(workspace.sessions[0]!.id))
+  const controls = page.locator('[data-slot="composer-controls"]')
+  const chip = controls.locator('[data-action="composer-fallback-model"]')
+  const primaryVariant = controls.getByRole("button", { name: "Choose model variant", exact: true })
+  const fallbackVariant = controls.getByRole("button", { name: "Choose fallback model variant", exact: true })
+  await expect(controls).toBeVisible()
+
+  // 1. Off: no fallback model, so the fallback slot has no variant control while the primary keeps its own.
+  await expect(chip).toHaveText("None")
+  await expect(fallbackVariant).toHaveCount(0)
+  await expect(primaryVariant).toHaveText("low")
+
+  // A variant change in the other slot leaves the off state exactly as it was: still `None`, still no control, and the
+  // field it is describing is untouched (FR-013 read with FR-028).
+  await primaryVariant.click()
+  await page.getByRole("menuitemradio", { name: "high", exact: true }).click()
+  await expect(primaryVariant).toHaveText("high")
+  await expect(chip).toHaveText("None")
+  await expect(chip).not.toHaveAttribute("aria-description", "Fallback inactive: it would repeat the primary model")
+  await expect(fallbackVariant).toHaveCount(0)
+  expect(patches).toEqual([])
+
+  // 2. A fallback the catalog lists with no variants: named by the chip, and still no variant control for that slot,
+  // because the gate reads the option list rather than the state (FR-028).
+  workspace.config.entries[0] = { type: "document", path: configPath, info: { fallback: "opencode/gamma" } }
+  await workspace.push([{ id: "evt_variant_less_fallback", created: 1, type: "config.updated", data: {} }])
+  await expect(chip).toHaveText("Gamma")
+  await expect(fallbackVariant).toHaveCount(0)
+  await expect(primaryVariant).toHaveText("high")
+  expect(patches).toEqual([])
+})
+
+// FR-029/FR-030 with the shipped default (`packages/app/src/providers/models/selection.tsx:773`): a config that never
+// names a fallback still HAS an effective one, and where that model is this composer's primary the app says so - while
+// leaving the field ABSENT, which is a different saved state from a written `null` (FR-013, T021).
+test("an unconfigured default that repeats the primary model reads inactive and is never written", async ({
+  page,
+}) => {
+  const patches: string[] = []
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/experimental/config") patches.push(request.method())
+  })
+
+  const workspace = await mockWorkspace(page, {
+    name: "DefaultFallbackCollision",
+    directory: "C:/OpenCode/DefaultFallbackCollision",
+    // The session's model is the very model the shipped default names, and no config document names a fallback at all.
+    sessions: [{ id: "ses_default_fallback", agent: "build", model: { id: "qwen3.8-27b", providerID: "mlx", variant: "low" } }],
+    provider: {
+      all: [
+        {
+          id: "mlx",
+          name: "MLX",
+          models: {
+            "qwen3.8-27b": {
+              id: "qwen3.8-27b",
+              name: "Qwen3.8",
+              limit: { context: 200_000 },
+              variants: { xhigh: {}, low: {} },
+            },
+          },
+        },
+      ],
+      connected: ["mlx"],
+      default: { providerID: "mlx", modelID: "qwen3.8-27b" },
+    },
+  })
+
+  await page.goto(sessionHref(workspace.sessions[0]!.id))
+  const controls = page.locator('[data-slot="composer-controls"]')
+  const chip = controls.locator('[data-action="composer-fallback-model"]')
+  const fallbackVariant = controls.getByRole("button", { name: "Choose fallback model variant", exact: true })
+  await expect(controls).toBeVisible()
+
+  await expect(chip).toHaveText("Same model")
+  await expect(chip).toHaveAttribute("aria-description", "Fallback inactive: it would repeat the primary model")
+  // The default's recorded variant is what that control shows: the effective value, shown rather than persisted (FR-028).
+  await expect(fallbackVariant).toHaveText("xhigh")
+  // Displaying the default never adopts it: the config field stays absent, so a later `None` is still the only way to
+  // write an off state (FR-030 read with FR-013).
+  expect(patches).toEqual([])
+})
+
+// FR-014/T026 through the real app: an exchange is ONE composer's action. The Session it was clicked in takes the new
+// pair, another Session's composer keeps showing its OWN primary model, every composer in the workspace names the one
+// recorded fallback, and neither that other Session's record entry nor a draft's own selection moves.
+test("an exchange stays with its own Session: another Session's composer and a draft keep their own primary model", async ({
+  page,
+}) => {
+  const directory = "C:/OpenCode/ComposerPairScope"
+  const configPath = "/home/test/.config/opencode/opencode.jsonc"
+  const patches: unknown[] = []
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/experimental/config" && request.method() === "PATCH")
+      patches.push(request.postDataJSON())
+  })
+
+  await mockWorkspace(page, {
+    name: "ComposerPairScope",
+    directory,
+    sessions: [
+      { id: "ses_pair_left", title: "Left", agent: "build", model: { id: "alpha", providerID: "opencode" } },
+      { id: "ses_pair_right", title: "Right", agent: "build", model: { id: "gamma", providerID: "opencode" } },
+    ],
+    provider: provider(
+      { id: "alpha", name: "Alpha", cost: { input: 3, output: 15 }, variants: { high: {}, low: {} } },
+      { id: "beta", name: "Beta", cost: { input: 3, output: 15 }, variants: { high: {}, low: {} } },
+      { id: "gamma", name: "Gamma", cost: { input: 3, output: 15 }, variants: { high: {}, low: {} } },
+    ),
+    // One fallback for the whole server, so every composer here names the same model in its fallback slot.
+    configEntries: [{ type: "document", path: configPath, info: { fallback: "opencode/beta#high" } }],
+    seed: {
+      // A paid catalog, so both pickers offer these models as ordinary rows (the pattern the primary-picker keepers
+      // use), and all three are visible in the list.
+      storage: {
+        "opencode.global.dat:model": {
+          user: [
+            { providerID: "opencode", modelID: "alpha", visibility: "show" },
+            { providerID: "opencode", modelID: "beta", visibility: "show" },
+            { providerID: "opencode", modelID: "gamma", visibility: "show" },
+          ],
+          recent: [],
+          variant: {},
+        },
+      },
+      settings: { appearance: { tabLayout: "vertical" } },
+      tabs: [
+        { session: "ses_pair_left" },
+        { session: "ses_pair_right" },
+        { draft: "draft_pair_scope", directory },
+      ],
+    },
+  })
+
+  const primary = page.locator('[data-action="composer-model"]')
+  const chip = page.locator('[data-action="composer-fallback-model"]')
+  const dialog = page.getByRole("dialog", { name: "Select model" })
+  // This workspace's per-Session record document, as the app writes it (`runtime/persistence/storage.ts`). Reading it
+  // is what shows another Session's own selection never moved, rather than only its display.
+  const selectionKey = workspaceKey(directory, "model-selection")
+
+  const stored = () => page.evaluate((key) => JSON.parse(localStorage.getItem(key) ?? "null"), selectionKey)
+
+  await page.goto(sessionHref("ses_pair_left"))
+  await expect(primary).toHaveText("Alpha")
+  await expect(chip).toHaveText("Beta")
+
+  // 1. The exchange, driven through the real primary picker: the row naming the other slot's model promotes it.
+  const written = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/experimental/config")
+  await primary.click()
+  await expect(dialog).toBeVisible()
+  await dialog.locator('[data-option-key="opencode:beta"]').click()
+  await written
+  await expect(primary).toHaveText("Beta")
+  await expect(chip).toHaveText("Alpha")
+
+  // Both owners now hold the exchanged pair: this Session's record entry names the promoted model, and the config
+  // field the server answers holds the model the exchange displaced.
+  await expect.poll(stored).toMatchObject({ session: { ses_pair_left: { choice: { modelID: "beta" } } } })
+  expect(patches).toEqual([{ fallback: { providerID: "opencode", model: "alpha" } }])
+  const afterExchange = await stored()
+
+  // 2. The other Session's composer, switched to through its tab: its OWN primary model, which the action above
+  // never touched, and the same recorded fallback every composer in this workspace shows.
+  await page.locator(`[data-slot="vertical-tabs"] a[href="${sessionHref("ses_pair_right", SERVER)}"]`).click()
+  await expect(primary).toHaveText("Gamma")
+  await expect(chip).toHaveText("Alpha")
+  // That Session owns no entry in the record document at all: its model comes from its own session record, and the
+  // exchange wrote nothing under its key.
+  expect((await stored())?.session?.ses_pair_right).toBeUndefined()
+
+  // 3. A draft in the same workspace. It carries its own prompt selection and shows the same recorded fallback every
+  // other composer in this workspace shows.
+  await page.goto(draftHref("draft_pair_scope"))
+  await expect(primary).toHaveText("Beta")
+  await expect(chip).toHaveText("Alpha")
+  await primary.click()
+  await expect(dialog).toBeVisible()
+  await dialog.locator('[data-option-key="opencode:gamma"]').click()
+  await expect(primary).toHaveText("Gamma")
+  // A model that is not the other slot's model is an ordinary selection: no exchange, and no config write.
+  await expect(dialog).toBeHidden()
+  expect(patches.length).toBe(1)
+
+  // The row naming the model in the other slot promotes it: an exchange owned by this draft.
+  await primary.click()
+  await expect(dialog).toBeVisible()
+  await dialog.locator('[data-option-key="opencode:alpha"]').click()
+  await expect(primary).toHaveText("Alpha")
+  await expect(chip).toHaveText("Gamma")
+  await expect.poll(() => patches.length).toBe(2)
+  expect(patches[1]).toEqual({ fallback: { providerID: "opencode", model: "gamma" } })
+  // The draft's exchange wrote its own selection and the shared config field, and zero values in either Session's
+  // record: that document is byte-identical to what it held before this draft was opened.
+  expect(await stored()).toEqual(afterExchange)
+
+  // And the Session this draft does not belong to still owns its own primary model: switching back to its tab shows
+  // the pair the draft never touched, with only the shared fallback field moved (FR-014).
+  await page.locator(`[data-slot="vertical-tabs"] a[href="${sessionHref("ses_pair_left", SERVER)}"]`).click()
+  await expect(primary).toHaveText("Beta")
+  await expect(chip).toHaveText("Gamma")
+})
+
+// FR-025/FR-035 at the app's boundary: the fallback a composer NAMES, the variant control beside it, and the value
+// `GET /api/config` answers are ONE value in every state — the recorded value request recovery acts on. What this
+// case cannot claim is core's inference: the mocked server runs no recovery, so the comparison is between the
+// display and the source both the composer and Settings > Models read (SC-013).
+test("the fallback chip names the value the config endpoint answers, in a configured, a repeated, and a saved none", async ({
+  page,
+}) => {
+  const directory = "C:/OpenCode/FallbackValueAgreement"
+  const configPath = "/home/test/.config/opencode/opencode.jsonc"
+  const patches: unknown[] = []
+  page.on("request", (request) => {
+    if (new URL(request.url()).pathname === "/api/experimental/config" && request.method() === "PATCH")
+      patches.push(request.postDataJSON())
+  })
+
+  const workspace = await mockWorkspace(page, {
+    name: "FallbackValueAgreement",
+    directory,
+    sessions: [{ id: "ses_value_agreement", agent: "build", model: { id: "alpha", providerID: "opencode", variant: "low" } }],
+    provider: provider(
+      { id: "alpha", name: "Alpha", variants: { high: {}, low: {} } },
+      { id: "beta", name: "Beta", variants: { high: {}, low: {} } },
+    ),
+    configEntries: [{ type: "document", path: configPath, info: { fallback: "opencode/beta#high" } }],
+  })
+
+  // The same endpoint the app's own sync reads (`GET /api/config`), read back from the browser. The mock answers its
+  // documents in precedence order, so the last document is the effective value.
+  const effective = () =>
+    page.evaluate(async () => {
+      // SAFETY: the mock's documents are the fixtures this case wrote, and `info.fallback` is the field under test.
+      const entries = (await fetch("/api/config").then((response) => response.json())) as {
+        info?: { fallback?: unknown }
+      }[]
+
+      return entries.at(-1)?.info?.fallback
+    })
+
+  await page.goto(sessionHref("ses_value_agreement"))
+  const controls = page.locator('[data-slot="composer-controls"]')
+  const chip = controls.locator('[data-action="composer-fallback-model"]')
+  const fallbackVariant = controls.getByRole("button", { name: "Choose fallback model variant", exact: true })
+  await expect(controls).toBeVisible()
+
+  // 1. A configured fallback other than the primary model: the chip names that recorded value's model, the control
+  // beside it names its variant, and the endpoint answers the value they came from.
+  await expect(chip).toHaveText("Beta")
+  await expect(fallbackVariant).toHaveText("high")
+  expect(await effective()).toBe("opencode/beta#high")
+
+  // 2. The config now names this composer's own primary model, with a variant of its own: the composer says WHY in
+  // its description, keeps showing that recorded variant, and the field is left exactly as it was (FR-029/FR-030).
+  workspace.config.entries.push({ type: "document", path: configPath, info: { fallback: "opencode/alpha#high" } })
+  await workspace.push([{ id: "evt_value_repeated", created: 1, type: "config.updated", data: {} }])
+  await expect(chip).toHaveText("Same model")
+  await expect(chip).toHaveAttribute("aria-description", "Fallback inactive: it would repeat the primary model")
+  await expect(fallbackVariant).toHaveText("high")
+  expect(await effective()).toBe("opencode/alpha#high")
+  expect(patches).toEqual([])
+
+  // 3. The picker that would write that value marks the provider-qualified row the same value names as the current
+  // choice, so a user cannot be shown one model and have another written (FR-036/FR-037 read with FR-025). Choosing
+  // its "None" row then writes the explicit no-fallback value, which reads back as `null`, and the composer shows an
+  // off state with no inactive description: never the collision state above (SC-013/FR-012).
+  await chip.click()
+  const dialog = page.getByRole("dialog", { name: "Select model" })
+  await expect(dialog).toBeVisible()
+  await expect(dialog.locator('[data-option-key="opencode:alpha"]')).toHaveAttribute("aria-current", "true")
+
+  const wrote = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/experimental/config")
+  await dialog.locator('[data-option-key="none"]').click()
+  await wrote
+  await expect(chip).toHaveText("None")
+  await expect(chip).not.toHaveAttribute("aria-description", "Fallback inactive: it would repeat the primary model")
+  await expect(fallbackVariant).toHaveCount(0)
+  expect(patches).toEqual([{ fallback: null }])
+  await expect.poll(effective).toBe(null)
 })
 
 test("a send pressed while the Location's plugins activate waits, Esc cancels it, and it sends once catalogs load", async ({

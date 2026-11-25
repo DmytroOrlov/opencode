@@ -1,4 +1,4 @@
-import type { Config, Project } from "@/runtime/server/types"
+import type { Project } from "@/runtime/server/types"
 import { getOwner, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLanguage } from "@/runtime/i18n/language"
@@ -12,10 +12,12 @@ import {
 } from "./global-sync/bootstrap"
 import { createChildStoreManager } from "./global-sync/child-store"
 import type { GlobalStore, ProjectMeta } from "./global-sync/types"
-import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/solid-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/solid-query"
 import { normalizeProjectInfo, updateProjectInfo } from "./global-sync/utils"
 import { persisted } from "@/runtime/persistence/storage"
 import { createConnectionSync } from "./server-sync/connection"
+import type { ConfigUpdateInput } from "@opencode/client/promise"
+import { ConfigConfirmationFailure } from "./config-outcome"
 import type { Data } from "@opencode/client/solid"
 import { createWorktreeInventory, withWorktreeInventory, worktreeInventoryViewKey } from "@/workspaces/inventory"
 
@@ -27,11 +29,20 @@ function createServerSyncContextInner(serverSDK: ServerSDK, data: Data) {
 
   const connected = () => serverSDK.connection.status() === "connected"
 
-  const [configQuery, pathQuery] = useQueries(() => ({
-    queries: [
-      { ...loadGlobalConfigQuery(serverSDK.scope), enabled: connected() },
-      { ...loadPathQuery(serverSDK.scope, null, serverSDK.api.location), enabled: connected() },
-    ],
+  // Each of these is its own `useQuery`, like `bootstrap` and `projectsQuery` below. `useQueries` hands its option
+  // objects to one `QueriesObserver` at creation and re-reads them only when the array's length changes, so an
+  // `enabled` that flips from false to true later — which is exactly what a page whose sync context is created
+  // before the connection resolves goes through — never re-enables either reader, and `config` below would stay
+  // empty forever. One `useQuery` per key re-evaluates its own options, and keeps each reader's own pending state
+  // instead of a combined result, which is what `path` and `config` read.
+  const configQuery = useQuery(() => ({
+    ...loadGlobalConfigQuery(serverSDK.scope, serverSDK.api.config),
+    enabled: connected(),
+  }))
+
+  const pathQuery = useQuery(() => ({
+    ...loadPathQuery(serverSDK.scope, null, serverSDK.api.location),
+    enabled: connected(),
   }))
 
   const [globalStore, setGlobalStore] = createStore<GlobalStore>({
@@ -175,17 +186,28 @@ function createServerSyncContextInner(serverSDK: ServerSDK, data: Data) {
   }
 
   const updateConfigMutation = useMutation(() => ({
-    mutationFn: async (config: Config) => {
-      // TODO: Restore config updates when the V2 client exposes a config API.
-      // await serverSDK.api.experimental.config.update({ config })
-      throw new Error(`Config updates are unavailable: ${Object.keys(config).length} fields were not saved`)
-    },
-    onSuccess: () => {
-      bootstrap.refetch()
+    mutationFn: async (config: ConfigUpdateInput) => serverSDK.api.config.update(config),
+    // Awaiting the refetch matters: it re-reads the server's config through the bootstrap before this mutation resolves,
+    // which is when the fallback UI drops its optimistic override, so the reader never falls back to a stale value.
+    // The bootstrap tolerates a failed individual GET, so the config read is awaited on its own: a successful PATCH
+    // whose confirming GET fails rejects updateConfig() rather than reporting a confirmation the client never saw.
+    // That is a confirmation failure, not evidence the server rolled the PATCH back, so it keeps its own identity: a
+    // caller must reconcile from the source instead of restoring the value written over.
+    onSuccess: async () => {
+      try {
+        await Promise.all([
+          bootstrap.refetch(),
+          queryClient.fetchQuery(loadGlobalConfigQuery(serverSDK.scope, serverSDK.api.config)),
+        ])
+      } catch (cause) {
+        throw new ConfigConfirmationFailure(cause)
+      }
+
       data.location.provider.invalidate()
       data.location.model.invalidate()
       void Promise.all([data.location.provider.sync(), data.location.model.sync()])
     },
+    onError: () => queryClient.invalidateQueries({ queryKey: [serverSDK.scope, "config"] }),
   }))
 
   return {
@@ -194,6 +216,18 @@ function createServerSyncContextInner(serverSDK: ServerSDK, data: Data) {
     child: children.child,
     // bootstrap,
     updateConfig: updateConfigMutation.mutateAsync,
+    // Re-reads the document through the query that feeds `data.config`. A caller whose write is durable, or whose only
+    // unknown is the confirmation, reconciles from the source through this instead of asserting the pre-write value.
+    refreshConfig: async () => {
+      const result = await configQuery.refetch()
+
+      // A query refetch may resolve with an error result instead of
+      // rejecting its Promise. Both forms are failed reconciliation,
+      // not successful confirmation of the committed document.
+      if (!result.isSuccess) {
+        throw result.error ?? new Error("Configuration reconciliation did not succeed")
+      }
+    },
     project: projectApi,
     worktrees,
   }

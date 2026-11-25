@@ -1,6 +1,28 @@
 import { GlobalRegistrator } from "@happy-dom/global-registrator"
+import { fileURLToPath } from "node:url"
+import { plugin } from "bun"
 
 GlobalRegistrator.register()
+
+// `test:unit` passes `--conditions=solid`, a condition `solid-js@1.9.17` no longer publishes, so its exports fall through
+// to the `node` entry: Solid's server build, whose `createEffect` is an empty function. A controller that drives its
+// machine from an effect therefore never starts one in this env, so no driver here is reachable. Serve the client
+// build the app ships (what `--conditions=browser` resolves) for the root specifier only: `solid-js/store` and
+// `solid-js/web` keep their previous build, since swapping those changes `createStore` identity and breaks unrelated
+// suites.
+const solidClientBuilds: Record<string, string> = {
+  "dist/server.js": fileURLToPath(import.meta.resolve("solid-js/dist/solid.js")),
+}
+
+plugin({
+  name: "solid-client-build",
+  setup(build) {
+    build.onLoad({ filter: /solid-js[/\\]dist[\\/]server\.js$/ }, async (args) => {
+      const client = solidClientBuilds[args.path.replace(/^.*solid-js[/\\]/, "")]
+      return client ? { contents: await Bun.file(client).text(), loader: "js" } : undefined
+    })
+  },
+})
 
 const originalGetContext = HTMLCanvasElement.prototype.getContext
 

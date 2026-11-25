@@ -119,6 +119,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "Bewerkingen uitvoeren",
   "ui.sessionTurn.status.runningCommands": "Opdrachten uitvoeren",
   "ui.sessionTurn.status.thinking": "Denken",
+  "ui.sessionTurn.status.fallback": "Terugvalmodel",
   "ui.sessionTurn.status.thinkingWithTopic": "Denken - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Gedachten verzamelen",
   "ui.sessionTurn.status.consideringNextSteps": "Nadenken over volgende stappen",

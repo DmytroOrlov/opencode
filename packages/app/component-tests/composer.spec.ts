@@ -1,4 +1,33 @@
+import type { Locator, Page } from "@playwright/test"
 import { expect, story } from "../../stories/playwright/story"
+
+/**
+ * Which control of the composer's row holds focus, as an identity a test can compare: `data-action` for the two
+ * model controls, and the accessible name for the two variant controls. Those two names differ, which is what keeps
+ * one Tab walk or locator from confusing the pair (FR-003).
+ */
+const focusedControl = () => {
+  const element = document.activeElement
+
+  return element?.getAttribute("data-action") ?? element?.getAttribute("aria-label") ?? element?.tagName ?? ""
+}
+
+/**
+ * Steps off the draft and on to one control with real Tab presses, so the keyboard user's order is what the
+ * assertions read instead of a Tab count guessed from unrelated toolbar controls (FR-022). Fails loudly if the
+ * control is never reached.
+ */
+async function reachByTab(page: Page, input: Locator, key: string) {
+  await input.click()
+
+  for (let presses = 0; presses < 8; presses++) {
+    await page.keyboard.press("Tab")
+
+    if ((await page.evaluate(focusedControl)) === key) return
+  }
+
+  throw new Error(`Tab never reached "${key}" from the draft`)
+}
 
 story("cycles full prompts with plain arrows without opening the picker", async ({ mount, page }) => {
   const component = await mount("opencode-composer-flow--prompt-history")
@@ -343,6 +372,7 @@ for (const direction of ["ltr", "rtl"]) {
       const add = component.locator('[data-action="composer-attach"]')
       const agent = controls.getByRole("button", { name: "Choose agent" })
       const variant = controls.getByRole("button", { name: "Choose model variant" })
+      const fallbackChip = controls.locator('[data-action="composer-fallback-model"]')
       await expect(controls).toHaveCSS("overflow-x", "auto")
       await expect(controls).toHaveCSS("overscroll-behavior-x", "contain")
       await expect(controls).toHaveCSS("direction", direction)
@@ -416,9 +446,14 @@ for (const direction of ["ltr", "rtl"]) {
         })
         await expect(controls).toHaveAttribute("data-overflow-start", "true")
         await expect(controls).toHaveAttribute("data-overflow-end", "false")
-        const last = await variant.boundingBox()
+        // The fallback chip ends the row now that the fallback pair follows this composer's own controls
+        // (`composer/editor/editor.tsx`: model, its variant, fallback model, fallback variant), so these endpoint
+        // measurements are read on it - the same end edge and the same 12px gap as before, on the control that now
+        // stands at the end. Its chevron span uses one logical inline margin (`-ms-0.5` in
+        // `composer/composer.tsx`), so it still lands within the 1px tolerance.
+        const last = await fallbackChip.boundingBox()
 
-        if (!last) throw new Error("Missing variant control")
+        if (!last) throw new Error("Missing fallback chip")
         expect(
           Math.abs(direction === "ltr" ? viewport.x + viewport.width - last.x - last.width : last.x - viewport.x),
         ).toBeLessThan(1)
@@ -725,6 +760,19 @@ story("renders a draft once and supports editing, caret restoration, and failure
   await expect(input).toBeFocused()
   await input.pressSequentially("!")
   await expect(input).toHaveText("XY!reserve this draft on failure")
+
+  // FR-022's pointer rule holds for the added control too: opening the FALLBACK picker with the pointer and closing
+  // it leaves the same text-entry caret where it was, so the fourth control did not add a second, weaker handoff.
+  // The caret sat after `!`, so the next typed character lands there and nowhere else.
+  await component.locator('[data-action="composer-fallback-model"]').click()
+  const fallbackDialog = page.getByRole("dialog", { name: "Select model", exact: true })
+  await expect(fallbackDialog).toBeVisible()
+  await fallbackDialog.getByRole("combobox", { name: "Search models", exact: true }).press("Escape")
+  await expect(fallbackDialog).toBeHidden()
+  await expect(input).toBeFocused()
+  await input.pressSequentially("?")
+  await expect(input).toHaveText("XY!?reserve this draft on failure")
+
   await component.getByRole("button", { name: "Send", exact: true }).click()
   await expect(component.getByRole("status")).toHaveText("Submission failed; draft restored")
   await expect(input).toHaveText("Preserve this draft on failure")
@@ -870,4 +918,440 @@ story.describe("mobile variant drawer", () => {
       await expect(high).toBeInViewport()
     })
   }
+})
+
+story("shows model, its variant, the fallback model and its variant as four controls in one row", async ({ mount, page }) => {
+  const component = await mount("opencode-composer-flow--model-and-variant", {
+    args: { fallbackVariant: true },
+  })
+
+  const controls = component.locator('[data-slot="composer-controls"]')
+  await page.evaluate(() => document.fonts.ready.then(() => undefined))
+
+  const primaryModel = controls.locator('[data-action="composer-model"]')
+  const fallbackModel = controls.locator('[data-action="composer-fallback-model"]')
+  const primaryVariant = controls.getByRole("button", { name: "Choose model variant", exact: true })
+  const fallbackVariant = controls.getByRole("button", { name: "Choose fallback model variant", exact: true })
+
+  // FR-001/FR-002: exactly four controls, and the two variant controls resolve under distinct names so a locator
+  // never gets both of them (FR-034's naming rule).
+  for (const control of [primaryModel, fallbackModel, primaryVariant, fallbackVariant]) {
+    await expect(control).toHaveCount(1)
+  }
+
+  await expect(controls.getByRole("button", { name: "Choose model variant" })).toHaveCount(1)
+  await expect(controls.getByRole("button", { name: "Choose fallback model variant" })).toHaveCount(1)
+
+  // FR-004/FR-015: no swap and no clear affordance exists anywhere, so nothing else can promote a model.
+  await expect(component.locator('[data-action="composer-fallback-swap"]')).toHaveCount(0)
+  await expect(component.locator('[data-action="composer-fallback-clear"]')).toHaveCount(0)
+
+  for (const direction of ["ltr", "rtl"] as const) {
+    await component.evaluate((element, value) => element.setAttribute("dir", value), direction)
+
+    const boxes = await Promise.all(
+      [primaryModel, primaryVariant, fallbackModel, fallbackVariant].map((control) => control.boundingBox()),
+    )
+
+    const [model, variant, pairModel, pairVariant] = boxes
+
+    if (!model || !variant || !pairModel || !pairVariant) throw new Error("Missing a control in the row")
+
+    // One row, so all four share a vertical center (FR-019).
+    const centers = [model, variant, pairModel, pairVariant].map((box) => box.y + box.height / 2)
+    expect(Math.max(...centers) - Math.min(...centers)).toBeLessThan(2)
+
+    const [modelLeft, variantLeft, pairLeft, pairVariantLeft] = [model.x, variant.x, pairModel.x, pairVariant.x]
+    // Each variant sits beside the model it belongs to, in both directions (FR-001/FR-002 adjacency), with nothing
+    // overlapping: in that direction's own inline axis each control starts at or past the previous control's end, and
+    // all four stay inside the row they scroll in (nothing clipped).
+    const row = await controls.boundingBox()
+
+    if (!row) throw new Error("Missing the control row")
+
+    for (const [from, to] of [
+      [model, variant],
+      [variant, pairModel],
+      [pairModel, pairVariant],
+    ]) {
+      const ahead =
+        direction === "ltr" ? to.x - (from.x + from.width) : from.x - (to.x + to.width)
+
+      expect(ahead, `${direction}: controls overlap`).toBeGreaterThanOrEqual(0)
+    }
+
+    if (direction === "ltr") {
+      expect(modelLeft).toBeGreaterThanOrEqual(row.x)
+      expect(pairVariant.x + pairVariant.width).toBeLessThanOrEqual(row.x + row.width + 1)
+    } else {
+      expect(pairVariantLeft).toBeGreaterThanOrEqual(row.x)
+      expect(model.x + model.width).toBeLessThanOrEqual(row.x + row.width + 1)
+    }
+
+    if (direction === "ltr") {
+      expect(modelLeft).toBeLessThan(variantLeft)
+      expect(variantLeft).toBeLessThan(pairLeft)
+      expect(pairLeft).toBeLessThan(pairVariantLeft)
+    } else {
+      expect(modelLeft).toBeGreaterThan(variantLeft)
+      expect(variantLeft).toBeGreaterThan(pairLeft)
+      expect(pairLeft).toBeGreaterThan(pairVariantLeft)
+    }
+  }
+
+  // FR-032's quiet-at-rest parity: the `composer-variant-default` class parks a `default` entry per control
+  // (`composer/editor/editor.css`), so the row never highlights one variant control while its partner sits plain. Both
+  // slots show a named variant in this scenario, so neither carries it yet.
+  await expect(primaryVariant).not.toHaveClass(/composer-variant-default/)
+  await expect(fallbackVariant).not.toHaveClass(/composer-variant-default/)
+
+  // Parking is read per control, not shared by the row: choosing `default` for this composer's model marks only that
+  // control, and the fallback's own variant control stays plain until the fallback itself parks `default`.
+  await primaryVariant.click()
+  await page.getByRole("menuitemradio", { name: "default", exact: true }).click()
+  await expect(primaryVariant).toHaveClass(/composer-variant-default/)
+  await expect(fallbackVariant).not.toHaveClass(/composer-variant-default/)
+
+  // FR-003's asymmetry: a variant control exists only where its own model offers a choice. The same scenario without
+  // a variant-bearing fallback shows the model's own variant control and no fallback variant control, so a pair half
+  // with one variant never presents a control that would write a variant nobody can choose (the production gate is
+  // `control.options().length > 1` in `composer/editor/editor.tsx`).
+  const plain = await mount("opencode-composer-flow--model-and-variant")
+  const plainControls = plain.locator('[data-slot="composer-controls"]')
+  await expect(plainControls.getByRole("button", { name: "Choose model variant", exact: true })).toHaveCount(1)
+  await expect(plainControls.getByRole("button", { name: "Choose fallback model variant", exact: true })).toHaveCount(0)
+  await expect(plainControls.locator('[data-action="composer-model"]')).toHaveCount(1)
+  await expect(plainControls.locator('[data-action="composer-fallback-model"]')).toHaveCount(1)
+})
+
+// FR-022 read with FR-001/FR-003 at this boundary: the four controls receive keyboard focus in the order the row
+// carries them in the document, and `dir=rtl` mirrors the row's inline axis without mirroring the Tab order. The
+// per-control picker handoff is the case below, where each control is the only picker on its page.
+story("reaches the four controls by keyboard in row order, in both directions", async ({ mount, page }) => {
+  const component = await mount("opencode-composer-flow--model-and-variant", { args: { fallbackVariant: true } })
+  await page.evaluate(() => document.fonts.ready.then(() => undefined))
+
+  const controls = component.locator('[data-slot="composer-controls"]')
+  const input = component.getByRole("textbox", { name: "Prompt", exact: true })
+
+  const row = [
+    controls.locator('[data-action="composer-model"]'),
+    controls.getByRole("button", { name: "Choose model variant", exact: true }),
+    controls.locator('[data-action="composer-fallback-model"]'),
+    controls.getByRole("button", { name: "Choose fallback model variant", exact: true }),
+  ]
+
+  const keys = ["composer-model", "Choose model variant", "composer-fallback-model", "Choose fallback model variant"]
+
+  // Tab order equals document order, so no CSS `order:` or absolute positioning can quietly mirror the row while
+  // leaving the keys in the old sequence.
+  for (let index = 0; index < row.length - 1; index++) {
+    const next = await row[index + 1]!.elementHandle()
+
+    if (!next) throw new Error(`Missing control ${index + 1} in the row`)
+
+    const following = await row[index]!.evaluate(
+      (node, nextNode) => (node.compareDocumentPosition(nextNode) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+      next,
+    )
+
+    expect(following, `DOM order: control ${index} must precede control ${index + 1}`).toBe(true)
+  }
+
+  // The visual row mirrors with `dir`; the keyboard sequence above does not, which is the half an `order:`-based
+  // direction hack would get wrong.
+  for (const direction of ["ltr", "rtl"] as const) {
+    await component.evaluate((element, value) => element.setAttribute("dir", value), direction)
+
+    // Walking the row with Tab, filtered to the row's own controls, gives exactly the required sequence.
+    await input.click()
+    const walked: string[] = []
+
+    for (let presses = 0; presses < 12 && walked.length < keys.length; presses++) {
+      await page.keyboard.press("Tab")
+      const focused = await page.evaluate(focusedControl)
+
+      if (keys.includes(focused)) walked.push(focused)
+    }
+
+    expect(walked, `${direction}: Tab order through the row`).toEqual(keys)
+
+    const boxes = await Promise.all(row.map((control) => control.boundingBox()))
+
+    if (boxes.some((box) => !box)) throw new Error(`Missing a control box in ${direction}`)
+    const starts = boxes.map((box) => box!.x)
+    const ordered = [...starts].sort((a, b) => (direction === "ltr" ? a - b : b - a))
+    expect(starts, `${direction}: visual order of the row`).toEqual(ordered)
+  }
+})
+
+// FR-022's focus handoff, one control per case: a picker the keyboard opened closes back onto that control, keyboard
+// ring included, so the added fourth control adds no new focus trap. Each case mounts its own composer because the
+// shared dialog stack deliberately chains the focus origin when a second picker opens inside the previous one's
+// exit window (`focus: replace && first ? first.focus : event.focus` at `packages/ui/src/context/dialog-machine.ts:176`,
+// which predates this feature): a second dismissal in the same page would measure that chain, not this control's
+// handoff. That chain is recorded as a limitation of this slice rather than asserted here as wanted behavior.
+story("returns focus to the control that opened its picker, for each of the four controls", async ({ mount, page }) => {
+  const modelControls = [
+    ["composer-model", '[data-action="composer-model"]'],
+    ["composer-fallback-model", '[data-action="composer-fallback-model"]'],
+  ] as const
+
+  for (const [key, selector] of modelControls) {
+    const component = await mount("opencode-composer-flow--model-and-variant", { args: { fallbackVariant: true } })
+    await page.evaluate(() => document.fonts.ready.then(() => undefined))
+
+    const controls = component.locator('[data-slot="composer-controls"]')
+    const input = component.getByRole("textbox", { name: "Prompt", exact: true })
+    const control = controls.locator(selector)
+
+    await reachByTab(page, input, key)
+    await page.keyboard.press("Enter")
+
+    const dialog = page.getByRole("dialog", { name: "Select model", exact: true })
+    await expect(dialog).toBeVisible()
+    const search = dialog.getByRole("combobox", { name: "Search models", exact: true })
+    // The dialog takes its search focus a task after opening, so the dismissal key goes to the control holding focus
+    // there, which is what a user pressing Escape in the open picker does.
+    await expect(search).toBeFocused()
+    await search.press("Escape")
+    await expect(dialog).toBeHidden()
+    await expect(control).toBeFocused()
+    await expect(control).toHaveCSS("outline-style", "solid")
+  }
+
+  const variantControls = ["Choose model variant", "Choose fallback model variant"] as const
+
+  for (const key of variantControls) {
+    const component = await mount("opencode-composer-flow--model-and-variant", { args: { fallbackVariant: true } })
+    await page.evaluate(() => document.fonts.ready.then(() => undefined))
+
+    const controls = component.locator('[data-slot="composer-controls"]')
+    const input = component.getByRole("textbox", { name: "Prompt", exact: true })
+    const control = controls.getByRole("button", { name: key, exact: true })
+
+    await reachByTab(page, input, key)
+    await expect(control).toHaveAttribute("aria-expanded", "false")
+    await page.keyboard.press("Enter")
+    await expect(control).toHaveAttribute("aria-expanded", "true")
+    // One menu is open, and it is this control's own: its distinct accessible name is what addresses it, and the
+    // option list belongs to the model beside it (FR-003/FR-002).
+    await expect(page.getByRole("menu")).toHaveCount(1)
+    await expect(page.getByRole("menuitemradio", { name: "high", exact: true })).toBeVisible()
+    await page.keyboard.press("Escape")
+    await expect(control).toHaveAttribute("aria-expanded", "false")
+    await expect(control).toBeFocused()
+    await expect(control).toHaveCSS("outline-style", "solid")
+  }
+})
+
+// FR-003 read with FR-022: parking a variant control on its `default` entry makes it visually quiet, and that quiet
+// style (`composer-variant-default` in `composer/editor/editor.css`) is per control and never leaves the keyboard
+// path: opacity and `pointer-events` are what change, not focusability.
+story("keeps both default variant controls in the keyboard path while they are quiet at rest", async ({ mount, page }) => {
+  const component = await mount("opencode-composer-flow--model-and-variant", { args: { fallbackVariant: true } })
+  await page.evaluate(() => document.fonts.ready.then(() => undefined))
+
+  const controls = component.locator('[data-slot="composer-controls"]')
+  const input = component.getByRole("textbox", { name: "Prompt", exact: true })
+  const primaryVariant = controls.getByRole("button", { name: "Choose model variant", exact: true })
+  const fallbackChip = controls.locator('[data-action="composer-fallback-model"]')
+  const fallbackVariant = controls.getByRole("button", { name: "Choose fallback model variant", exact: true })
+
+  // Park both slots on `default`, then leave the composer unhovered with focus in the draft: neither control shows.
+  for (const control of [primaryVariant, fallbackVariant]) {
+    await control.click()
+    await page.getByRole("menuitemradio", { name: "default", exact: true }).click()
+  }
+
+  await input.click()
+  await page.mouse.move(0, 0)
+
+  for (const control of [primaryVariant, fallbackVariant]) {
+    await expect(control).toHaveClass(/composer-variant-default/)
+    await expect(control).toHaveCSS("opacity", "0")
+    await expect(control).toHaveCSS("pointer-events", "none")
+  }
+
+  // Neither quiet control is out of the tab order: Tab reaches the primary one, focus alone brings it back to
+  // full opacity, and it opens its menu from the keyboard.
+  await reachByTab(page, input, "Choose model variant")
+  await expect(primaryVariant).toHaveCSS("opacity", "1")
+  await page.keyboard.press("Enter")
+  await expect(page.getByRole("menuitemradio", { name: "default", exact: true })).toBeFocused()
+  await page.keyboard.press("Escape")
+  await expect(primaryVariant).toBeFocused()
+
+  // Two more Tab steps cross the fallback chip and land on the fallback slot's own variant control. Traversing the
+  // row by key opens no picker on the way: the chip only answers the keyboard once it is the control being opened.
+  await page.keyboard.press("Tab")
+  await expect(fallbackChip).toBeFocused()
+  await expect(page.getByRole("dialog")).toHaveCount(0)
+  await page.keyboard.press("Tab")
+  await expect(fallbackVariant).toBeFocused()
+  await expect(fallbackVariant).toHaveClass(/composer-variant-default/)
+  await expect(fallbackVariant).toHaveCSS("opacity", "1")
+  await page.keyboard.press("Enter")
+  await expect(fallbackVariant).toHaveAttribute("aria-expanded", "true")
+  await page.keyboard.press("Escape")
+  await expect(fallbackVariant).toBeFocused()
+  await expect(fallbackVariant).toHaveCSS("opacity", "1")
+})
+
+// FR-023/SC-011 at this boundary: the fourth control steals no control height, a long model label clips inside its
+// own chip instead of pushing the row's controls apart, and where the row cannot fit it stays scrollable and brings
+// the control the keyboard reaches into view (`onFocusIn` in `composer/editor/editor.tsx`).
+story("keeps the four controls 28px and their long labels clipped at ordinary and compact widths", async ({ mount, page }) => {
+  const component = await mount("opencode-composer-flow--model-and-variant", {
+    args: { fallbackVariant: true, longLabels: true },
+  })
+
+  await page.evaluate(() => document.fonts.ready.then(() => undefined))
+
+  const controls = component.locator('[data-slot="composer-controls"]')
+  const input = component.getByRole("textbox", { name: "Prompt", exact: true })
+  const primaryModel = controls.locator('[data-action="composer-model"]')
+  const primaryVariant = controls.getByRole("button", { name: "Choose model variant", exact: true })
+  const fallbackModel = controls.locator('[data-action="composer-fallback-model"]')
+  const fallbackVariant = controls.getByRole("button", { name: "Choose fallback model variant", exact: true })
+  const row = [primaryModel, primaryVariant, fallbackModel, fallbackVariant]
+
+  for (const width of [1280, 390] as const) {
+    await page.setViewportSize({ width, height: 720 })
+
+    // The shared control height survives at both widths, for all four controls.
+    for (const control of row) await expect(control).toHaveCSS("height", "28px")
+
+    // The established chip caps hold, so a long name is clipped inside the control: `max-w-[170px]` for the fallback
+    // chip at every width, and `max-w-[60cqw]` for the primary chip once the row is compact.
+    const primaryBox = await primaryModel.boundingBox()
+    const fallbackBox = await fallbackModel.boundingBox()
+
+    if (!primaryBox || !fallbackBox) throw new Error(`Missing a chip box at ${width}`)
+    expect(fallbackBox.width, `${width}: the fallback chip cap`).toBeLessThanOrEqual(171)
+    expect(primaryBox.width, `${width}: the primary chip cap`).toBeLessThanOrEqual(width * 0.6 + 1)
+    expect(
+      await fallbackModel.locator("bdi").evaluate((element) => element.scrollWidth > element.clientWidth),
+      `${width}: the fallback label must clip inside the chip`,
+    ).toBe(true)
+
+    if (width < 768) {
+      expect(
+        await primaryModel.locator("bdi").evaluate((element) => element.scrollWidth > element.clientWidth),
+        `${width}: the primary label must clip inside the chip`,
+      ).toBe(true)
+    }
+
+    // Long labels change nothing about the logical order: in this LTR row each control still starts at or past the
+    // previous control's end, in the same sequence.
+    const boxes = await Promise.all(row.map((control) => control.boundingBox()))
+
+    if (boxes.some((box) => !box)) throw new Error(`Missing a control box at ${width}`)
+
+    for (let index = 0; index < row.length - 1; index++) {
+      const from = boxes[index]!
+      const to = boxes[index + 1]!
+      expect(to.x - (from.x + from.width), `${width}: controls ${index} and ${index + 1} overlap`).toBeGreaterThanOrEqual(0)
+    }
+
+    // The row overflows and is scrollable, rather than shrinking controls or wrapping them into a second row (the
+    // one-row and endpoint arithmetic contract stays owned by the toolbar-overflow story above).
+    const overflow = await controls.evaluate((element) => element.scrollWidth - element.clientWidth)
+    expect(overflow, `${width}: the row must overflow, not squeeze`).toBeGreaterThan(0)
+  }
+
+  // Reaching the control parked past the inline end with the keyboard scrolls it whole into the row's viewport, ring
+  // included: no control can be focused while sitting under the edge.
+  await reachByTab(page, input, "Choose fallback model variant")
+  await expect(fallbackVariant).toBeFocused()
+  const revealed = await fallbackVariant.boundingBox()
+  const viewport = await controls.boundingBox()
+
+  if (!revealed || !viewport) throw new Error("Missing the focused control or the row viewport")
+  expect(revealed.x, "the focused control must not sit under the start edge").toBeGreaterThanOrEqual(viewport.x - 0.5)
+  expect(
+    revealed.x + revealed.width,
+    "the focused control must not sit under the end edge",
+  ).toBeLessThanOrEqual(viewport.x + viewport.width + 0.5)
+})
+
+// FR-029/FR-030/FR-020: the chip states what recovery would use, or why it would not, without opening a picker, and
+// a fallback the workspace catalog cannot name keeps the picker's existing unavailable affordance instead of going
+// blank. One table, one state per case, since the copy differs per state.
+for (const [state, text, described] of [
+  ["model", "Claude Sonnet 4", false],
+  ["off", "None", false],
+  ["inactive", "Same model", true],
+  ["unavailable", "legacy-model (unavailable)", false],
+] as const) {
+  story(`states the fallback chip as ${state}`, async ({ mount }) => {
+    const component = await mount("opencode-composer-flow--model-and-variant", {
+      args: { fallbackState: state },
+    })
+
+    const chip = component.locator('[data-action="composer-fallback-model"]')
+    await expect(chip).toHaveText(text)
+
+    // The two-word label is never the only carrier of its meaning: an inactive fallback also says why.
+    if (described) await expect(chip).toHaveAttribute("aria-description", "Fallback inactive: it would repeat the primary model")
+    else await expect(chip).not.toHaveAttribute("aria-description", /.*/)
+  })
+}
+
+// FR-024/FR-033 read with FR-016/FR-034: the model sitting in the other slot is offered as an ordinary row even though
+// this composer's user hid it, its flyout names the variant this dialog's own slot records for THAT model, and the
+// keyboard path reaches the same row a pointer click would.
+story("offers the other slot's hidden model as a row with its own flyout and keyboard path", async ({ mount, page }) => {
+  const component = await mount("opencode-composer-flow--model-and-variant", {
+    args: { fallbackHidden: true },
+  })
+
+  await page.evaluate(() => document.fonts.ready.then(() => undefined))
+
+  const controls = component.locator('[data-slot="composer-controls"]')
+  const primary = controls.locator('[data-action="composer-model"]')
+  const fallbackChip = controls.locator('[data-action="composer-fallback-model"]')
+  // The chip states the pair's other half by name, hidden or not (FR-029).
+  await expect(fallbackChip).toHaveText("Hidden Model")
+
+  await primary.click()
+  const dialog = page.getByRole("dialog", { name: "Select model" })
+  await expect(dialog).toBeVisible()
+
+  // This scenario hides that model in the catalog (`visible()` says no), so a row for it exists only because the pair
+  // offered it (FR-024). The composer's own model is still listed as usual.
+  const offered = dialog.locator('[data-option-key="anthropic:hidden-model"]')
+  await expect(offered).toBeVisible()
+  await expect(dialog.locator('[data-option-key="anthropic:claude-sonnet-4"]')).toBeVisible()
+
+  // Hovering that row opens its flyout, and the check mark is the variant recorded for the model under the row (`high`),
+  // not the one this composer's own model wears (`balanced`): naming a variant is per model, which is what the pair
+  // rule carries when this row is clicked (FR-034 read with FR-036).
+  await offered.hover()
+  const flyout = dialog.locator('[data-slot="model-dialog-flyout"]')
+  await expect(flyout).toBeVisible()
+  await expect(flyout.getByRole("menuitemradio", { name: "high", exact: true })).toHaveAttribute("aria-checked", "true")
+  await expect(flyout.getByRole("menuitemradio", { name: "balanced", exact: true })).toHaveAttribute("aria-checked", "false")
+
+  // Keyboard parity: the search box's arrows move the marker there themselves (they wrap, per
+  // `packages/ui/src/forms/search-list/search-list.tsx:54`), so stepping off the hovered row and back onto it proves the
+  // marker travelled by key, and Enter selects the row under it.
+  const search = dialog.getByRole("combobox", { name: "Search models", exact: true })
+  await search.click()
+  await search.press("ArrowUp")
+  await expect(dialog.locator('[data-option-key="anthropic:claude-sonnet-4"]')).toHaveAttribute("data-active", "")
+  await expect(dialog.locator('[data-option-key="anthropic:hidden-model"]')).not.toHaveAttribute("data-active", "")
+  await search.press("ArrowDown")
+  await expect(dialog.locator('[data-option-key="anthropic:hidden-model"]')).toHaveAttribute("data-active", "")
+  await search.press("Enter")
+  await expect(component.getByRole("status")).toHaveText("Selected hidden-model")
+  // The selection closes the dialog, exactly as a row click does, so the list a user sees afterwards is read from a
+  // picker reopened on the pair: the composer's own model is still listed and the other slot's model is still offered,
+  // which is FR-033's "the ordinary list is what it was" at this boundary.
+  await expect(dialog).toBeHidden()
+  await primary.click()
+  const reopened = page.getByRole("dialog", { name: "Select model" })
+  await expect(reopened).toBeVisible()
+  await expect(reopened.locator('[data-option-key="anthropic:claude-sonnet-4"]')).toBeVisible()
+  await expect(reopened.locator('[data-option-key="anthropic:hidden-model"]')).toBeVisible()
 })

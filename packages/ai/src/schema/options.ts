@@ -74,6 +74,10 @@ export interface HttpOptions {
   readonly encoding?: RequestEncoding
   /** Client certificate presented to HTTPS endpoints that request one (mutual TLS). */
   readonly tls?: ClientTls
+  /** Enables request-local Splash idle-time calibration for eligible loopback endpoints. */
+  readonly splashAdaptiveSseTimeout?: boolean
+  /** Effective configured endpoint used to constrain adaptive calibration to the same origin. */
+  readonly splashAdaptiveEndpoint?: string
 }
 
 /** PEM client certificate and private key, with the passphrase of an encrypted key. */
@@ -137,6 +141,8 @@ export const mergeTransport = (...items: ReadonlyArray<TransportOptions | undefi
       body: mergeJsonRecords(...http.map((item) => item?.body)),
       encoding: last(http.map((item) => item?.encoding)),
       tls: last(http.map((item) => item?.tls)),
+      splashAdaptiveSseTimeout: last(http.map((item) => item?.splashAdaptiveSseTimeout)),
+      splashAdaptiveEndpoint: last(http.map((item) => item?.splashAdaptiveEndpoint)),
     }),
   }
 }

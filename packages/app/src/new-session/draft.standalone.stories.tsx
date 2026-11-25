@@ -172,7 +172,17 @@ function DraftLanding(props: DraftArgs & { directory: string; setDirectory: (dir
     },
   })
 
-  const composer = { ...editor, model: { selection: local.model, paid: true, loading: false } }
+  const composer = {
+    ...editor,
+    model: {
+      selection: local.model,
+      fallback: { ...local.model, enabled: () => true },
+      fallbackStatus: "model" as const,
+      exchange: () => false,
+      paid: true,
+      loading: false,
+    },
+  }
 
   const openLocation = useNewSessionLocationDialog({ project, workspace, onDone: editor.restoreFocus })
 

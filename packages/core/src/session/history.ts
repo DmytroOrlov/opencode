@@ -67,6 +67,13 @@ const latestCompaction = Effect.fnUntraced(function* (
         eq(SessionMessageTable.type, "compaction"),
         sql`json_extract(${SessionMessageTable.data}, '$.status') = 'completed'`,
         before === undefined ? undefined : lt(SessionMessageTable.seq, before),
+        or(
+          and(
+            sql`json_extract(${SessionMessageTable.data}, '$.candidateID') is null`,
+            sql`json_extract(${SessionMessageTable.data}, '$.summaryID') is null`,
+          ),
+          sql`json_extract(${SessionMessageTable.data}, '$.published') = 1`,
+        ),
         boundary === "latest"
           ? undefined
           : or(
@@ -234,7 +241,13 @@ const messageEntries = Effect.fnUntraced(function* (
     (entry) =>
       !(entry.message.type === "system" && native && entry.seq < native.seq) &&
       !(entry.message.type === "system" && entry.message.metadata?.notice === "instructions" && entry.seq < epoch) &&
-      replayable(entry.message, boundary),
+      replayable(entry.message, boundary) &&
+      !(
+        entry.message.type === "compaction" &&
+        entry.message.status !== "failed" &&
+        (entry.message.candidateID !== undefined || entry.message.summaryID !== undefined) &&
+        entry.message.published !== true
+      ),
   )
 })
 

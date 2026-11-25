@@ -10,6 +10,7 @@ const persist: typeof persisted = (_target, _schema, initial) => [
   ...createStore(initial),
   null,
   Object.assign(() => true, { promise: undefined }),
+  () => undefined,
 ]
 
 const path = { state: "", config: "", worktree: "", directory: "", home: "" }

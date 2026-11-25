@@ -158,6 +158,7 @@ describe("public event manifest", () => {
         "session.retry.scheduled.1",
         "session.compaction.started.1",
         "session.compaction.ended.1",
+        "session.compaction.published.1",
         "session.compaction.failed.1",
         "session.revert.staged.1",
         "session.revert.cleared.1",

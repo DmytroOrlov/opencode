@@ -18,7 +18,7 @@ import type { StreamOptions } from "@opencode/ai/route"
 import type { SessionCompactionResult } from "@opencode/plugin/effect/session"
 import type { SessionError } from "@opencode/schema/session-error"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
-import { Clock, Context, DateTime, Effect, Exit, Fiber, Layer, Result, Scope, Stream } from "effect"
+import { Clock, Context, DateTime, Effect, Exit, Fiber, Layer, Option, Result, Scope, Schema, Stream } from "effect"
 import { Agent } from "../agent.js"
 import { Bus } from "../bus.js"
 import { Database } from "../database/database.js"
@@ -29,7 +29,7 @@ import { Token } from "../util/token.js"
 import type { SessionContext } from "./context.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
-import type { SessionMessage } from "./message.js"
+import { SessionMessage } from "./message.js"
 import { SessionModelRequest } from "./model-request.js"
 import { SessionRunnerModel } from "./runner/model.js"
 import { SessionRunnerRetry } from "./runner/retry.js"
@@ -37,6 +37,9 @@ import { toLLMMessages } from "./runner/to-llm-message.js"
 import { SessionRecentText } from "./recent-text.js"
 import { contentFilterError, toSessionError } from "./to-session-error.js"
 import { SessionUsage } from "./usage.js"
+
+/** A native window must decode before it can be replayed; a stored transcript that does not would reappear in history. */
+const decodeNativeWindow = Schema.decodeUnknownOption(SessionHistory.NativeWindow)
 
 export type Settings = {
   auto: boolean
@@ -57,9 +60,23 @@ export type Estimate = { readonly measured: number; readonly estimated: number }
 
 export type Trigger =
   /** `overflow`: the provider just rejected this context as too long. `estimate` is `estimatePrompt(context)`. */
-  | { readonly reason: "auto" | "overflow"; readonly context: SessionContext.Loaded; readonly estimate?: Estimate }
+  | {
+      readonly reason: "auto" | "overflow"
+      readonly context: SessionContext.Loaded
+      readonly estimate?: Estimate
+      /** Set when the caller already published Started for this candidate. */
+      readonly candidateID?: SessionMessage.ID
+      readonly started?: boolean
+    }
   /** `inputID` is the `/compact` inbox item, whose message shows the outcome. */
-  | { readonly reason: "manual"; readonly context: SessionContext.Loaded; readonly inputID: SessionMessage.ID }
+  | {
+      readonly reason: "manual"
+      readonly context: SessionContext.Loaded
+      readonly inputID: SessionMessage.ID
+      readonly candidateID?: SessionMessage.ID
+      /** The runner atomically publishes InboxDelivered and Started before invoking compaction. */
+      readonly started?: boolean
+    }
 
 export type Outcome =
   /** Only `auto` skips: the context fits, or automatic compaction is off. */
@@ -80,6 +97,9 @@ export interface Interface extends State.Transformable<Editor> {
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionCompaction") {}
+
+/** A manual candidate reuses the delivered `/compact` inbox item's ID, which opens its message row. */
+export const manualCandidateID = (inputID: SessionMessage.ID) => inputID
 
 /**
  * A summary fills `text`, and references the messages it keeps verbatim with `metadata.keepID`; history
@@ -308,29 +328,62 @@ export const layer = Layer.effect(
         return { status: "skipped" }
       const held = precomputed.get(context.session.id)
       precomputed.delete(context.session.id)
-      const native = context.model.compaction?.type === "native"
-      const model = yield* selectModel(context, settings.buffer, native)
-      // The provider just rejected this context, so the estimate ran low; the first attempt already aims below it.
-      const budget =
-        trigger.reason === "overflow"
-          ? Math.min(model.cap, Math.floor(total(trigger.estimate ?? estimatePrompt(context)) * SHRINK_STEPS[0]))
-          : model.cap
+      // One candidate identity per compaction: manual reuses the inbox item, automatic allocates a fresh one, and
+      // every later event names that same candidate.
+      const candidateID =
+        trigger.candidateID ??
+        (trigger.reason === "manual" ? manualCandidateID(trigger.inputID) : SessionMessage.ID.create())
+      const owned: Trigger = { ...trigger, candidateID }
+      // Opening the candidate's row and installing the interruption handler below are one uninterruptible step, so an
+      // interrupt cannot land between them and leave a running row nothing settles. A skipped candidate never gets
+      // here, so it never gets a failure of its own.
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          // The runner opened the manual compaction's message when it delivered the `/compact` item. An automatic
+          // one opens here, before any wait, so a background summary still being written shows as a running compaction.
+          if (trigger.started !== true)
+            yield* bus.publish(SessionEvent.Compaction.Started, {
+              sessionID: context.session.id,
+              reason: trigger.reason === "manual" ? "manual" : "auto",
+              ...(trigger.reason === "manual" ? { inputID: trigger.inputID } : {}),
+              candidateID,
+            })
+          // Model selection, waiting for a background summary and streaming stay interruptible; the handler names the
+          // candidate this call started, so it can only ever settle that row. The manual candidate's outcome is the
+          // runner's to publish, so no duplicate failure comes from here.
+          return yield* restore(
+            Effect.gen(function* () {
+              const native = context.model.compaction?.type === "native"
+              const model = yield* selectModel(context, settings.buffer, native)
+              // The provider just rejected this context, so the estimate ran low; the first attempt already aims below it.
+              const budget =
+                trigger.reason === "overflow"
+                  ? Math.min(model.cap, Math.floor(total(trigger.estimate ?? estimatePrompt(context)) * SHRINK_STEPS[0]))
+                  : model.cap
 
-      const selected = model.context === context ? trigger : { ...trigger, context: model.context }
-      // The runner opened the manual compaction's message when it delivered the `/compact` item. An automatic one
-      // opens here, before any wait, so a background summary still being written shows as a running compaction.
-      if (trigger.reason !== "manual")
-        yield* bus.publish(SessionEvent.Compaction.Started, { sessionID: context.session.id, reason: "auto" })
-      const swapped = held ? yield* usePrecomputed(selected, held, budget, native) : undefined
-      const compaction = swapped
-        ? Effect.succeed(swapped)
-        : native
-          ? compactNatively(selected, budget, settings.keep)
-          : summarize(selected, budget, settings.keep)
-      return yield* compaction.pipe(
-        Effect.matchEffect({
-          onSuccess: (result) => publish(selected, result),
-          onFailure: (failure) => publish(selected, failure),
+              const selected: Trigger = model.context === context ? owned : { ...owned, context: model.context }
+              const swapped = held ? yield* usePrecomputed(selected, held, budget, native) : undefined
+              const compaction = swapped
+                ? Effect.succeed(swapped)
+                : native
+                  ? compactNatively(selected, budget, settings.keep)
+                  : summarize(selected, budget, settings.keep)
+              return yield* compaction.pipe(
+                Effect.matchEffect({
+                  onSuccess: (result) => publish(selected, result),
+                  onFailure: (failure) => publish(selected, failure),
+                }),
+              )
+            }),
+          ).pipe(
+            Effect.onInterrupt(() =>
+              trigger.reason === "manual"
+                ? Effect.void
+                : publish(owned, {
+                    error: { type: "compaction.interrupted", message: "Compaction was interrupted" },
+                  }),
+            ),
+          )
         }),
       )
     })
@@ -909,11 +962,36 @@ export const layer = Layer.effect(
           sessionID,
           reason,
           inputID: trigger.reason === "manual" ? trigger.inputID : undefined,
+          candidateID: trigger.candidateID,
           error: outcome.error,
           ...usage,
         })
         return { status: "failed", error: outcome.error }
       }
+
+      // A summary must say something, and a native window must replay; otherwise history would fall back to
+      // the transcript this compaction was meant to replace, so the candidate is failed instead of stored.
+      const window = outcome.native?.messages
+      const usable =
+        window === undefined
+          ? outcome.text.trim() !== ""
+          : Option.isSome(decodeNativeWindow(window))
+      if (!usable) {
+        const error = { type: "compaction.failed", message: "Compaction produced no usable summary" } as const
+        yield* bus.publish(SessionEvent.Compaction.Failed, {
+          sessionID,
+          reason,
+          inputID: trigger.reason === "manual" ? trigger.inputID : undefined,
+          candidateID: trigger.candidateID,
+          error,
+          ...usage,
+        })
+        return { status: "failed", error }
+      }
+
+      const candidateID = trigger.candidateID
+      if (!candidateID) return yield* Effect.die(new Error("Compaction candidate identity was not established"))
+      const summaryID = SessionMessage.ID.create()
 
       yield* bus.publish(
         SessionEvent.Compaction.Ended,
@@ -923,26 +1001,24 @@ export const layer = Layer.effect(
           model: context.model.ref,
           native: outcome.native,
           text: outcome.text,
+          candidateID,
+          summaryID,
           ...usage,
         },
         { metadata: outcome.metadata },
       )
+      // Ended completes the row; only Published makes it the active checkpoint history reads.
+      yield* bus.publish(SessionEvent.Compaction.Published, { sessionID, candidateID, summaryID })
       return { status: "completed" }
     })
 
     return Service.of({
       transform: state.transform,
       reload: state.reload,
-      // A manual compaction settles through its `/compact` inbox item, which the runner owns.
+      // A manual compaction settles through its `/compact` inbox item, which the runner owns. An automatic one
+      // settles through the candidate its own interrupt handler names.
       compact: (trigger) =>
-        compact(trigger).pipe(
-          Effect.onInterrupt(() =>
-            trigger.reason === "manual"
-              ? Effect.void
-              : publish(trigger, { error: { type: "compaction.interrupted", message: "Compaction was interrupted" } }),
-          ),
-          Effect.ensuring(Effect.sync(() => spent.delete(trigger.context.session.id))),
-        ),
+        compact(trigger).pipe(Effect.ensuring(Effect.sync(() => spent.delete(trigger.context.session.id)))),
       precompute,
     })
   }),

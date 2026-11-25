@@ -14,7 +14,7 @@ export interface TransportExecution<Frame> {
   readonly http?: HttpContext
   body?(frame: Frame): string | undefined
   raw?(frame: Frame): unknown
-  /** Optional successful-consumption acknowledgement. HTTP leaves this absent. */
+  /** Acknowledges successful protocol consumption, including completion before byte EOF. */
   readonly complete?: Effect.Effect<void>
 }
 

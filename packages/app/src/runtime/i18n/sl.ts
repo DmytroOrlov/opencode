@@ -730,6 +730,7 @@ export const dict = {
   "server.action.authenticate": "Overi",
   "server.status.connecting": "Povezovanje preko SSH…",
   "server.status.authentication": "Zahtevano overjanje",
+  "ui.sessionTurn.status.fallback": "Rezervni model",
   "common.color.orange": "oranžna",
   "common.color.yellow": "rumena",
   "common.color.cyan": "cijan",

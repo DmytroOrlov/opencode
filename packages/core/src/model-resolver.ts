@@ -140,6 +140,7 @@ export interface Resolved {
   /** Explicit opt-ins for provider telemetry observers; never forwarded to providers. */
   readonly mlxTelemetry?: boolean
   readonly splashTelemetry?: boolean
+  readonly splashAdaptiveSseTimeout?: boolean
 }
 
 export type MediaError =
@@ -266,8 +267,17 @@ const resolveCatalogModel = Effect.fn("ModelResolver.resolveCatalogModel")(funct
         options: {
           ...runtime.options,
           ...mergeTransport(runtime.options, {
-            timeout: { total: timeouts.timeout, headers: timeouts.headerTimeout, chunk: timeouts.chunkTimeout },
-            http: { encoding: Provider.encoding(configured), tls: Provider.tls(configured) },
+            timeout: {
+              total: timeouts.timeout,
+              headers: timeouts.headerTimeout,
+              // Adaptive SSE calibration owns the chunk phase when explicitly enabled without an explicit chunk
+              // limit; an explicit `chunkTimeout` still lands here untouched and suppresses calibration.
+              chunk: timeouts.splashAdaptiveSseTimeout ? undefined : timeouts.chunkTimeout,
+            },
+            http: {
+              encoding: Provider.encoding(configured),
+              tls: Provider.tls(configured),
+            },
           }),
         },
       })
@@ -523,6 +533,11 @@ export const layer = Layer.effect(
         chunkTimeout: Provider.timeout(provider?.settings?.chunkTimeout),
         mlxTelemetry: runtimeInfo.settings?.mlxTelemetry,
         splashTelemetry: runtimeInfo.settings?.splashTelemetry,
+        // Effective provider+model policy; an explicit chunk timeout already suppresses calibration here.
+        // Kept absent when disabled so the record stays tri-state like the settings above it.
+        splashAdaptiveSseTimeout: Provider.timeouts(runtimeInfo.settings ?? {}).splashAdaptiveSseTimeout
+          ? true
+          : undefined,
       }
     })
     const loadMedia = Effect.fnUntraced(function* <Runtime>(

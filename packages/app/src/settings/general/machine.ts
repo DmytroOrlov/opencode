@@ -1,7 +1,9 @@
 export const SETTING_WRITE_TIMEOUT_MS = 15_000
 
-/** `message` is empty when the error carried none. */
-export type SettingWriteFailure = { readonly kind: "failed"; readonly message: string } | { readonly kind: "timeout" }
+/** `message` is empty when the error carried none. `committed` says the wire named a durable commit for this write. */
+export type SettingWriteFailure =
+  | { readonly kind: "failed"; readonly message: string; readonly committed: boolean }
+  | { readonly kind: "timeout" }
 
 /** The read in flight for the current source. Once a write is accepted its value is stale, so it only fills `meta`. */
 type SettingLoad = { readonly attempt: number; readonly metaOnly: boolean }
@@ -42,7 +44,13 @@ export type OptimisticSettingEvent<T, M, S> =
   | { readonly type: "load.failed"; readonly attempt: number }
   | { readonly type: "write.requested"; readonly value: T }
   | { readonly type: "write.succeeded"; readonly attempt: number }
-  | { readonly type: "write.failed"; readonly attempt: number; readonly message: string }
+  | {
+      readonly type: "write.failed"
+      readonly attempt: number
+      readonly message: string
+      /** True when the wire carried a committed-state code: the source already holds the written value. */
+      readonly committed?: boolean
+    }
   | { readonly type: "write.timed-out"; readonly attempt: number }
 
 export type OptimisticSettingEffect<T, S> =
@@ -75,7 +83,7 @@ export function transitionOptimisticSetting<T, M, S>(
 
   if (event.type === "write.succeeded") return succeeded(state)
 
-  return failed(state, event.type === "write.failed" ? { kind: "failed", message: event.message } : { kind: "timeout" })
+  return failed(state, event.type === "write.failed" ? { kind: "failed", message: event.message, committed: event.committed === true } : { kind: "timeout" })
 }
 
 /** What the control shows: the newest choice while writes are in flight. */
@@ -178,11 +186,16 @@ function succeeded<T, M, S>(state: Writing<T, M, S>): OptimisticSettingTransitio
 function failed<T, M, S>(state: Writing<T, M, S>, failure: SettingWriteFailure): OptimisticSettingTransition<T, M, S> {
   // A write that timed out may still land after the next one, so the source is read again once the queue settles.
   const reread = state.reread || failure.kind === "timeout"
+  // A committed-state rejection names a durable commit of THIS write: `confirmed` is the value that was written OVER,
+  // so rolling back to it would display a document the source no longer holds. Settle on what was written and read the
+  // source again, which leaves the control showing the value the source actually recorded.
+  const committed = failure.kind === "failed" && failure.committed
+  const authority = committed ? state.active : state.confirmed
 
-  if (state.queued && !Object.is(state.queued.value, state.confirmed)) return next(state, state.queued.value, reread)
+  if (state.queued && !Object.is(state.queued.value, authority)) return next(state, state.queued.value, reread || committed)
 
-  // The user already chose the confirmed value again, so nothing they see is lost.
-  return settled(state, state.confirmed, reread, state.queued ? [] : [{ type: "notify.error", failure }])
+  // The user already chose the value the source agrees with again, so nothing they see is lost.
+  return settled(state, authority, reread || committed, state.queued ? [] : [{ type: "notify.error", failure }])
 }
 
 // Back to idle on `value`, reading the source again when a timed-out write may still land and show what it kept.

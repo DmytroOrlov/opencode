@@ -82,6 +82,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "انجام ویرایش ها",
   "ui.sessionTurn.status.runningCommands": "اجرای دستورات",
   "ui.sessionTurn.status.thinking": "فکر کردن",
+  "ui.sessionTurn.status.fallback": "مدل جایگزین",
   "ui.sessionTurn.status.thinkingWithTopic": "تفکر - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "جمع آوری افکار",
   "ui.sessionTurn.status.consideringNextSteps": "در نظر گرفتن مراحل بعدی",

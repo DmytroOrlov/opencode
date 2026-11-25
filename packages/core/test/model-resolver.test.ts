@@ -63,6 +63,47 @@ function withConfigEnv<A, E, R>(env: Record<string, string>, effect: () => Effec
 }
 
 describe("ModelResolver", () => {
+  it.effect("applies the shared chunk timeout default to every provider and honors explicit overrides", () =>
+    Effect.gen(function* () {
+      const resolve = (providerID: Provider.ID, settings: RequestOptions["settings"] = {}) =>
+        ModelResolver.fromCatalogModel(
+          model("@opencode/ai/providers/openai-compatible", {
+            providerID,
+            settings: { baseURL: "https://provider.example/v1", ...settings },
+          }),
+          undefined,
+          {
+            loadPackage: () =>
+              Effect.succeed({
+                model: () => LanguageModel.make({ id: "test-model", provider: "test", route: OpenAIChat.route }),
+              }),
+          },
+        )
+      // Transport policy lands on the model's request timeout phases, never on provider-specific model defaults.
+      const chunk = (resolved: LanguageModel) =>
+        typeof resolved.options?.timeout === "object" ? resolved.options.timeout.chunk : resolved.options?.timeout
+
+      const opencodeGo = yield* resolve(Provider.ID.make("opencode-go"))
+      const generic = yield* resolve(Provider.ID.make("other-provider"))
+      const explicit = yield* resolve(Provider.ID.make("opencode-go"), { chunkTimeout: 12_345 })
+      const disabled = yield* resolve(Provider.ID.make("opencode-go"), { chunkTimeout: false })
+      const adaptive = yield* resolve(Provider.ID.make("opencode-go"), { splashAdaptiveSseTimeout: true })
+      const calibrated = yield* resolve(Provider.ID.make("opencode-go"), {
+        splashAdaptiveSseTimeout: true,
+        chunkTimeout: 12_345,
+      })
+
+      // Provider identity earns no timeout exception; unset settings take the one documented default.
+      expect(chunk(opencodeGo)).toBe(900_000)
+      expect(chunk(generic)).toBe(900_000)
+      expect(chunk(explicit)).toBe(12_345)
+      expect(chunk(disabled)).toBe(false)
+      // Adaptive SSE calibration owns the chunk phase instead of installing a fixed limit; an explicit limit wins.
+      expect(chunk(adaptive)).toBeUndefined()
+      expect(chunk(calibrated)).toBe(12_345)
+    }),
+  )
+
   it.effect("constructs native Azure requests with deployment IDs and projected resource URLs", () =>
     Effect.gen(function* () {
       const responses = yield* ModelResolver.fromCatalogModel(

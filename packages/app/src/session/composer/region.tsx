@@ -308,7 +308,9 @@ export function createActiveSessionRegion(input: {
       server.api.session.inbox.cancel({ sessionID, inboxID: messageID }).then(() => undefined, notifyFailed),
   }
 
-  useComposerCommands()
+  // The `/model`, `shift+mod+d`, connect and usage commands act on this composer's wrapped slots, so they obey the pair
+  // rule the same way the chips do; `local.model` here would be the bypass that lets one path write one slot only.
+  useComposerCommands({ model: controls().model.selection })
   useSessionCommands({
     session: input.session,
     region: input.region,

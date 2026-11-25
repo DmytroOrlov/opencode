@@ -32,6 +32,13 @@ export const dict = {
   "server.status.connecting": "Connecting over SSH…",
   "server.thisComputer": "This computer",
   "server.status.authentication": "Authentication required",
+  "ui.sessionTurn.status.fallback": "Fallback",
+  // The composer's fallback chip states its state: an explicit no-fallback value, and a fallback that repeats the
+  // primary model, which needs more than the two-word label to say why it is inactive.
+  "ui.sessionTurn.status.fallback.none": "None",
+  "ui.sessionTurn.status.fallback.sameModel": "Same model",
+  "ui.sessionTurn.status.fallback.inactiveDescription": "Fallback inactive: it would repeat the primary model",
+  "ui.sessionTurn.action.swapFallback": "Swap primary and fallback models",
   "server.tlsCa.mode.bundled": "CA:BUNDLED",
   "server.tlsCa.mode.system": "CA:SYSTEM",
   "server.tlsCa.mode.unknown": "CA:UNKNOWN",

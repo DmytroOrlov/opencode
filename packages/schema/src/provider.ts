@@ -96,6 +96,7 @@ export const Settings = Schema.StructWithRest(
     /** When true, generation telemetry for this provider is gathered natively instead of estimated. */
     mlxTelemetry: Schema.Boolean.pipe(optional),
     splashTelemetry: Schema.Boolean.pipe(optional),
+    splashAdaptiveSseTimeout: Schema.Boolean.pipe(optional),
     compaction: Compaction.pipe(optional),
     cache: Cache.pipe(optional),
     transport: Transport.pipe(optional),

@@ -83,6 +83,8 @@ const modelSelection = {
   },
 } satisfies ModelSelection
 
+const fallbackSelection = { ...modelSelection, enabled: () => true }
+
 export type SessionPreviewProps = {
   title: string
   description: string
@@ -180,7 +182,15 @@ export function createPromptController(input: {
   return {
     controller: {
       ...interaction,
-      model: { selection: modelSelection, providerName: storyComposerModel.provider.name, paid: true, loading: false },
+      model: {
+        selection: modelSelection,
+        providerName: storyComposerModel.provider.name,
+        fallback: fallbackSelection,
+        fallbackStatus: "model",
+        exchange: () => false,
+        paid: true,
+        loading: false,
+      },
     } satisfies ComposerModel,
     setValue(value: string) {
       draft[1]("prompt", [{ type: "text", content: value, start: 0, end: value.length }])

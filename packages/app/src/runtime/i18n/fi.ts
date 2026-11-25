@@ -16,6 +16,7 @@ export const dict = {
   "server.action.authenticate": "Todentaa",
   "server.status.connecting": "Yhdistetään SSH:n kautta…",
   "server.status.authentication": "Todennus vaaditaan",
+  "ui.sessionTurn.status.fallback": "Varamalli",
   "mcp.auth.interactiveForm": "MCP-palvelin {{name}} vaatii interaktiivisen todennuslomakkeen",
   "server.connect.title": "Yhdistä palvelimeen",
   "server.connect.description": "Aloita kirjoittamalla palvelimesi osoite ja salasana.",

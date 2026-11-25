@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test"
 import {
   AIError,
+  AuthenticationError,
   CompactionPart,
   CompactionCheckpointResponse,
   HttpContext,
+  LLMClient,
   LLMEvent,
   type LLMRequest,
   Message,
@@ -13,6 +15,7 @@ import {
   TransportError,
   InvalidProviderOutputError,
   InvalidRequestError,
+  ContentPolicyError,
   RateLimitError,
   UnknownProviderError,
   type UserMessage,
@@ -20,7 +23,7 @@ import {
 import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
 import { AnthropicMessages, OpenAIResponses } from "@opencode/ai/protocols"
 import { TestLLM, compileRequest } from "@opencode/ai/testing"
-import { RequestExecutor } from "@opencode/ai/route"
+import { RequestExecutor, Auth } from "@opencode/ai/route"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { Database } from "@opencode/core/database/database"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
@@ -61,6 +64,8 @@ import { IdentityPlugin } from "@opencode/core/plugin/identity"
 import { QuestionTool } from "@opencode/core/tool/plugin/question"
 import { Agent } from "@opencode/core/agent"
 import { Config } from "@opencode/core/config"
+import { FallbackRuntimeIntent } from "@opencode/core/config/fallback-runtime-intent"
+import { SessionGenerationAdmission } from "@opencode/core/session/generation-admission"
 import { Document, Info } from "@opencode/schema/config"
 import { ConfigCompaction } from "@opencode/schema/config/compaction"
 import { Tool } from "@opencode/core/tool"
@@ -94,6 +99,7 @@ import {
   Tracer,
 } from "effect"
 import { TestClock } from "effect/testing"
+import { Headers } from "effect/http"
 import { and, asc, desc, eq, sql } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 import { promptLocationNode } from "./fixture/prompt-location"
@@ -112,10 +118,19 @@ type ToolBarrier = {
   maxActive: number
 }
 class LLMRequests extends Context.Service<LLMRequests, LLMRequest[]>()("test/LLMRequests") {}
+const slowExecutor = Layer.succeed(
+  RequestExecutor.Service,
+  RequestExecutor.Service.of({
+    execute: (request) =>
+      Effect.sync(() => slowDispatch.executions.push(request.url)).pipe(
+        Effect.andThen(Effect.die("slow executor must not run")),
+      ),
+  }),
+)
 const testLLM = Layer.unwrap(
   Effect.sync(() => {
     const requests: LLMRequest[] = []
-    return TestLLM.testLayer({
+    const scripted = TestLLM.testLayer({
       fallback: [],
       transformRequest: (request) => {
         const transformed = {
@@ -130,6 +145,28 @@ const testLLM = Layer.unwrap(
         return transformed
       },
     }).pipe(Layer.merge(Layer.succeed(LLMRequests, requests)))
+    // TestLLM is the scripted client for ordinary turns. The slow model alone uses the REAL LLMClient through a
+    // route whose auth suspends, which is what lets a B1 test park inside lazy compile/prepareTransport.
+    return Layer.effectContext(
+      Effect.gen(function* () {
+        const test = yield* TestLLM.Test
+        const real = Context.get(yield* Layer.build(LLMClient.layer.pipe(Layer.provide(slowExecutor))), LLMClient.Service)
+        const usesReal = (request: LLMRequest) =>
+          request.model.id === "slow-model" || request.model.id === "prepare-fail-model"
+        const client = LLMClient.Service.of({
+          stream: (request, options) =>
+            usesReal(request) ? real.stream(request, options) : test.stream(request, options),
+          generate: (request, options) =>
+            usesReal(request) ? real.generate(request, options) : test.generate(request, options),
+          compact: test.compact,
+        })
+        return Context.empty().pipe(
+          Context.add(LLMClient.Service, client),
+          Context.add(TestLLM.Test, test),
+          Context.add(LLMRequests, requests),
+        )
+      }),
+    ).pipe(Layer.provide(scripted))
   }),
 )
 type ModelLimit = { readonly context: number; readonly input?: number; readonly output: number }
@@ -147,6 +184,69 @@ const fakeIdentity = identity("fake", "fake-model")
 const replacementIdentity = identity("fake", "replacement")
 const gptIdentity = identity("openai", "gpt-5")
 const replacementModel = testModel("replacement")
+const fallbackModel = testModel("fallback-model")
+const slowDispatch = {
+  started: Deferred.makeUnsafe<void>(),
+  release: Deferred.makeUnsafe<void>(),
+  executions: [] as string[],
+}
+// A model whose transport preparation really suspends in async auth, so the test can hold a prepared B inside
+// lazy compile/prepareTransport after Core's last in-step freshness check.
+const slowModel = LanguageModel.make({
+  id: "slow-model",
+  provider: "fake",
+  route: OpenAIChat.route.with({
+    endpoint: { baseURL: "https://slow.test/v1" },
+    auth: Auth.custom(() =>
+      Deferred.succeed(slowDispatch.started, undefined).pipe(
+        Effect.andThen(Deferred.await(slowDispatch.release)),
+        Effect.as(Headers.fromInput({ authorization: "Bearer slow" })),
+      ),
+    ),
+  }),
+})
+const prepareFailAuth = {
+  preparations: 0,
+  failures: [] as AIError[],
+  entered: Deferred.makeUnsafe<void>(),
+  release: Deferred.makeUnsafe<void>(),
+}
+const resetPrepareFailAuth = () => {
+  prepareFailAuth.preparations = 0
+  prepareFailAuth.failures.length = 0
+  prepareFailAuth.entered = Deferred.makeUnsafe<void>()
+  prepareFailAuth.release = Deferred.makeUnsafe<void>()
+  slowDispatch.executions.length = 0
+}
+// A real route whose transport preparation fails with a typed Authentication error BEFORE `beforeDispatch`, so it
+// exercises the lazy compile/prepareTransport boundary without a TestLLM stream that already passed dispatch.
+const prepareFailModel = LanguageModel.make({
+  id: "prepare-fail-model",
+  provider: "fake",
+  route: OpenAIChat.route.with({
+    endpoint: { baseURL: "https://prepare-fail.test/v1" },
+    auth: Auth.custom(() =>
+      Effect.suspend(() => {
+        prepareFailAuth.preparations++
+        const failure = new AIError({
+          reason: new AuthenticationError({ message: "Preparation authentication failed" }),
+        })
+        prepareFailAuth.failures.push(failure)
+        if (prepareFailAuth.preparations !== 1) return Effect.fail(failure)
+        return Deferred.succeed(prepareFailAuth.entered, undefined).pipe(
+          Effect.andThen(Deferred.await(prepareFailAuth.release)),
+          Effect.andThen(Effect.fail(failure)),
+        )
+      }),
+    ),
+  }),
+})
+const selection = (id: string) => ({ providerID: Provider.ID.make("fake"), model: ID.make(id) })
+const fallbackSelection = (id: string, variant: string) => ({
+  providerID: Provider.ID.make("fake"),
+  model: ID.make(id),
+  variant: Model.VariantID.make(variant),
+})
 const compactModel = testModel("compact", { context: 4_000, output: 50 })
 const fullOutputModel = testModel("full-output", { context: 262_144, output: 262_144 })
 const unknownContextModel = testModel("unknown-context", { context: 0, output: 32_000 })
@@ -154,7 +254,24 @@ const undersizedContextModel = testModel("undersized-context", { context: 1, out
 const recoveryModel = testModel("recovery", { context: 200_000, output: 1_000 })
 const fittedOutputModel = testModel("fitted-output", { context: 100_000, output: 64_000 })
 const smallWindowModel = testModel("small-window", { context: 64_000, output: 16_000 })
+// Smaller than the window the primary leaves behind, so its history compacts before an attempt goes out.
+const fallbackSmallModel = testModel("fallback-small", { context: 30_000, output: 4_000 })
 const largeOutputModel = testModel("large-output", { context: 1_000_000, output: 1_000_000 })
+// Recovery identity is provider + model, with the variant ignored (FR-031). For the recorded fallback's VARIANT to be
+// observable at all in `s.requests`, these models resolve differently per variant, the way the real resolver applies
+// variant settings to the model (`model-resolver.ts:172-194`), which is what distinguishes an attempt made as
+// `variant-model#high` from one made as `variant-model#low`.
+const variantModel = testModel("variant-model")
+const variantModelHigh = LanguageModel.update(variantModel, { options: { providerOptions: { effort: "high" } } })
+// The same model ID under two providers is two models: the fallback resolves under provider "other" while the
+// Session's primary of that ID sits under "fake".
+const crossModel = testModel("shared-model")
+const otherCrossModel = LanguageModel.make({ id: "shared-model", provider: "other", route: OpenAIChat.route })
+// The legacy value `ConfigFallback.LEGACY_MODEL_FALLBACK` names `mlx/qwen3.8-27b#xhigh`. By default this fixture
+// resolves any model it does not list to the Session's current model, so the legacy value is indistinguishable from
+// "no fallback". `resolvesLegacyFallback` (below) arms its own resolution for ONE scenario, which is what makes a
+// recorded `null` provably different from an absent key without changing what every other scenario sees.
+const legacyFallbackModel = LanguageModel.make({ id: "qwen3.8-27b", provider: "mlx", route: OpenAIChat.route })
 
 test("calculates step cost using the matching context tier", () => {
   expect(
@@ -227,8 +344,77 @@ test("does not apply an ineligible tier without base pricing", () => {
 
 const resolvesModel: Effect.Effect<void, SessionRunnerModel.Error> = Effect.void
 
+/**
+ * Protected-config-read instrumentation for the fallback read-window regressions. `calls` counts every `entries()`
+ * read the runner's own Config fixture serves, `gated` counts the reads parked at `gate` (the read has returned and
+ * the runner fiber is held at the boundary before it decides, so an intent accepted inside that window is newer
+ * than the value the read observed), and `fail` turns a read into a defect so a recovery that still asked the
+ * committed document for an answer cannot complete. `instrumentConfig` wraps the SAME service instance the runner
+ * receives: `Config.node.replace(config)` and the scenario-context merge both get the wrapper, and the wrapper
+ * delegates every other operation to the underlying `Config.testLayer` service. That is what makes "no committed
+ * read was required" and "the intended boundary was reached" assertions about the runner's code path rather than
+ * about a stand-in mock.
+ */
+/**
+ * Protected-config-read instrumentation for the fallback read-window regressions. `reads` records, in order, the
+ * committed `fallback` value each `entries()` read observed; `parked` counts the reads that actually suspended at
+ * `hold` (the document read has returned and the runner fiber is held at the boundary before it decides, so an
+ * intent accepted inside that window is newer than the value the read observed). `instrumentConfig` wraps the SAME
+ * service instance the runner receives: `Config.node.replace(config)` and the scenario-context merge both get the
+ * wrapper, and it delegates every other operation to the underlying `Config.testLayer` service. That is what makes
+ * "the intended boundary was reached" and "this path needed no committed read" assertions about the runner's own
+ * code path rather than about a stand-in mock. Attribution comes from position in `reads` plus the attempt/span
+ * counters: reads recorded while NO recovery attempt has been dispatched can only come from `chooseFallback`,
+ * because every other fixture reader of the committed document (`SessionProjector`, for the `experimental.part_rows`
+ * setting) runs inside `SessionStep.attempt`, after the recovery has already been chosen.
+ */
+type ConfigReadHold = {
+  gate: Deferred.Deferred<void>
+  opened: boolean
+}
+type ConfigReadBarrier = {
+  reads: Array<string>
+  parked: number
+  hold: ConfigReadHold | undefined
+}
+const instrumentConfig = (
+  base: Layer.Layer<Config.Service | Config.Test>,
+  barrier: ConfigReadBarrier,
+) =>
+  Layer.effectContext(
+    Effect.gen(function* () {
+      const inner = yield* Config.Test
+      const service = Config.Test.of({
+        ...inner,
+        entries: () =>
+          Effect.suspend(() =>
+            Effect.gen(function* () {
+              const entries = yield* inner.entries()
+              const recorded = Config.latest(entries, "fallback")
+              barrier.reads.push(
+                recorded === undefined || recorded === null
+                  ? "<none>"
+                  : `${String(recorded.providerID)}/${String(recorded.model)}`,
+              )
+              const hold = barrier.hold
+              if (hold !== undefined && hold.opened === false) {
+                barrier.parked++
+                yield* Deferred.await(hold.gate)
+              }
+              return entries
+            }),
+          ),
+      })
+      return Context.empty().pipe(
+        Context.add(Config.Service, service),
+        Context.add(Config.Test, service),
+      )
+    }),
+  ).pipe(Layer.provide(base))
+
 const makeRunnerState = (compaction?: SessionRunnerModel.Resolved["compaction"]) => {
   let toolBarrier: ToolBarrier | undefined
+  const configBarrier: ConfigReadBarrier = { reads: [], parked: 0, hold: undefined }
   const releaseTools = (barrier: ToolBarrier) =>
     Effect.sync(() => {
       if (toolBarrier === barrier) toolBarrier = undefined
@@ -237,6 +423,7 @@ const makeRunnerState = (compaction?: SessionRunnerModel.Resolved["compaction"])
     currentModel: model,
     compaction,
     modelResolveHook: resolvesModel,
+    resolvesLegacyFallback: false,
     systemBaseline: "Initial context",
     systemRemoved: false,
     systemUnavailable: false,
@@ -247,6 +434,7 @@ const makeRunnerState = (compaction?: SessionRunnerModel.Resolved["compaction"])
     executions: new Array<string>(),
     closedTransports: new Array<Session.ID>(),
     spans: new Array<Tracer.NativeSpan>(),
+    configBarrier,
     blockTools: (count = 1) =>
       Effect.acquireRelease(
         Effect.all({ started: Deferred.make<void>(), release: Deferred.make<void>() }).pipe(
@@ -351,7 +539,28 @@ const layer = Layer.unwrap(
       resolve: (session) =>
         state.modelResolveHook.pipe(
           Effect.map(() => {
-            const selected = session.model?.id === "replacement" ? replacementModel : state.currentModel
+            const selected =
+              session.model?.id === "replacement"
+                ? replacementModel
+                : session.model?.id === "fallback-model"
+                  ? fallbackModel
+                  : session.model?.id === "slow-model"
+                    ? slowModel
+                    : session.model?.id === "prepare-fail-model"
+                      ? prepareFailModel
+                    : session.model?.id === "fallback-small"
+                    ? fallbackSmallModel
+                    : session.model?.id === "variant-model"
+                      ? session.model?.variant === "high"
+                        ? variantModelHigh
+                        : variantModel
+                    : session.model?.id === "shared-model"
+                      ? session.model?.providerID === "other"
+                        ? otherCrossModel
+                        : crossModel
+                    : state.resolvesLegacyFallback && session.model?.id === "qwen3.8-27b"
+                      ? legacyFallbackModel
+                    : state.currentModel
             return SessionRunnerModel.resolved(selected, {
               capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
               cost: [],
@@ -422,17 +631,20 @@ const layer = Layer.unwrap(
       load: () => Effect.succeed(Instructions.empty),
     })
     const mcpInstructions = Layer.mock(McpInstructions.Service, { load: () => Effect.succeed(Instructions.empty) })
-    const config = Config.testLayer([
-      new Document({
-        type: "document",
-        info: new Info({
-          compaction: new ConfigCompaction.Info({
-            buffer: 3_000,
-            keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
+    const config = instrumentConfig(
+      Config.testLayer([
+        new Document({
+          type: "document",
+          info: new Info({
+            compaction: new ConfigCompaction.Info({
+              buffer: 3_000,
+              keep: new ConfigCompaction.Keep({ tokens: 1_000 }),
+            }),
           }),
         }),
-      }),
-    ])
+      ]),
+      state.configBarrier,
+    )
     const promptModels = Layer.mock(Model.Service, {
       get: () => Effect.undefined,
       all: () => Effect.succeed([]),
@@ -504,6 +716,11 @@ const layer = Layer.unwrap(
       ),
       Layer.orDie,
     )
+    // Merged as well as substituted, the way `testLLM` is at the end of this layer: `Config.node.replace(config)` is
+    // how the runner gets the fixture, and merging the SAME layer object is what puts its test tag (`setEntries`) in
+    // the scenario's context instead of leaving a second, unread config state behind. `config` is the instrumented
+    // wrapper, and it is used in BOTH positions, so the recorded/parked `entries()` boundary and the scenario's
+    // `setEntries` sit on the one service instance the runner's recovery reads.
     return AppNodeBuilder.build(
       LayerNode.group([
         Database.node,
@@ -530,6 +747,8 @@ const layer = Layer.unwrap(
         LayerNodePlatform.llmClient,
         SessionRunnerLLM.node,
         SessionExecution.node,
+        SessionGenerationAdmission.node,
+        FallbackRuntimeIntent.node,
         Session.node,
       ]),
       [
@@ -539,7 +758,7 @@ const layer = Layer.unwrap(
         Model.node.replace(promptModels),
         SessionExecution.node.replace(execution),
       ],
-    )
+    ).pipe(Layer.provideMerge(config))
   }),
 ).pipe(Layer.provideMerge(Layer.sync(RunnerState, makeRunnerState)), Layer.provideMerge(testLLM))
 const it = testEffect(layer)
@@ -1818,7 +2037,13 @@ describe("SessionRunnerLLM", () => {
     yield* stream.release
     const moved = yield* Fiber.join(run)
 
-    expect(moved).toEqual(SessionRunner.DrainResult.Moved({ continuation: { step: 2 } }))
+    // The handoff carries the step AND the provider/model identities this turn already dispatched: the primary
+    // this step served, so the next Location cannot treat a fallback naming it as a distinct recovery.
+    expect(moved).toEqual(
+      SessionRunner.DrainResult.Moved({
+        continuation: { step: 2, attempted: new Set(["fake/fake-model"]) },
+      }),
+    )
     expect(s.requests).toHaveLength(1)
     expect(yield* SessionInbox.find(s.db, compaction.id)).toMatchObject({ id: compaction.id })
     if (moved._tag !== "Moved") throw new Error("Expected a Location handoff")
@@ -1829,6 +2054,77 @@ describe("SessionRunnerLLM", () => {
     expect(s.requests).toHaveLength(3)
     expect(userTexts(s.requests[2])[0]).toContain("<summary>\n## Objective\n- Entry summary\n</summary>")
     expect(yield* s.inbox).toEqual([])
+  })
+
+  scenario("carries attempted identity across a Location handoff so a used fallback is rejected in that turn", function* (s) {
+    // FR-008's already-attempted guard through the REAL handoff, not a unit comparison of continuation fields: the
+    // turn physically dispatches the configured fallback X, then moves to a new Location mid-turn. The next Location
+    // re-reads the SAME committed fallback value, and must NOT serve X again in that turn; a genuinely new turn
+    // makes X eligible again.
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("fallback-model") }) }),
+    ])
+    const runner = yield* SessionRunner.Service
+    yield* s.admit("Dispatch the fallback, then move")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.toolCall("call-carried-across-move", "echo", { text: "carried" }),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const tools = yield* s.blockTools()
+    const run = yield* runner.drain({ sessionID, force: false }).pipe(Effect.forkChild)
+    // X is dispatched physically: the primary fails, backoff ends, and the recorded fallback serves the step whose
+    // tool call is still blocked when the move lands.
+    yield* Queue.take(scheduled)
+    yield* TestClock.adjust(2_400)
+    yield* tools.started
+    yield* s.sessionInbox.admit({
+      id: SessionMessage.ID.create(),
+      sessionID,
+      item: {
+        type: "move",
+        payload: {
+          location: Location.Ref.make({ directory: AbsolutePath.make("/project") }),
+          projectID: Project.ID.global,
+        },
+        delivery: "steer",
+      },
+    })
+    yield* tools.release
+    const moved = yield* Fiber.join(run)
+    if (moved._tag !== "Moved") throw new Error("Expected a Location handoff")
+    const handed = moved.continuation
+    if (handed === undefined) throw new Error("Expected the handoff to carry its continuation")
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel])
+    // The handoff carries BOTH identities this turn already put on the wire.
+    expect(handed.attempted).toEqual(new Set(["fake/fake-model", "fake/fallback-model"]))
+
+    // Same active turn, new Location: the SAME committed value names X, and X was already dispatched here, so
+    // this step's non-retryable failure has NO eligible distinct identity and ends with the SAME error instance its
+    // attempt carried. X is requested exactly once across the whole turn, and the drain never asks for it again.
+    const rejected = authenticationFailure()
+    yield* s.llm.push(Stream.fail(rejected))
+    expect(yield* runner.drain({ sessionID, force: false, continuation: moved.continuation }).pipe(Effect.flip)).toBe(
+      rejected,
+    )
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel, model])
+    const types = yield* recordedEventTypes(sessionID)
+    expect(types.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(1)
+
+    // A genuinely new turn starts with an empty attempted set, so X is eligible again and serves the recovery.
+    yield* s.llm.push(Stream.fail(authenticationFailure()), TestLLM.text("Recovered on X again", "new-turn-fallback"))
+    yield* s.admit("New input starts a new turn")
+    yield* s.resume
+    expect(s.requests.map((request) => request.model)).toEqual([
+      model,
+      fallbackModel,
+      model,
+      model,
+      fallbackModel,
+    ])
   })
 
   scenario(
@@ -3947,6 +4243,95 @@ describe("SessionRunnerLLM", () => {
     expect(yield* recordedEventTypes(sessionID)).not.toContain(
       Bus.versionedType(SessionEvent.Compaction.Started.type, 1),
     )
+  })
+
+  scenario("bars an eligible fallback when automatic overflow recovery is disabled", function* (s) {
+    yield* setupOverflowRecovery(s)
+    const compaction = yield* SessionCompaction.Service
+    yield* compaction.transform((editor) => editor.configure({ auto: false }))
+
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(selection("fallback-model"))
+
+    const failure = providerRejected({
+      message: "prompt too long",
+      classification: "context-overflow",
+    })
+
+    const beforeEvents = (yield* recordedEventTypes(sessionID)).length
+    const beforeAttempts = s.spans.filter((span) => span.name === "SessionStep.attempt").length
+
+    yield* s.llm.push(
+      Stream.fail(failure),
+      TestLLM.text("Must not dispatch fallback", "unexpected-overflow-fallback"),
+    )
+    yield* s.admit("Continue")
+
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(failure)
+    expect(s.requests.map((request) => request.model)).toEqual([recoveryModel])
+
+    const added = (yield* recordedEventTypes(sessionID)).slice(beforeEvents)
+    expect(added.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    expect(added.filter((type) => type === Bus.versionedType(SessionEvent.Compaction.Started.type, 1))).toHaveLength(0)
+    expect(added.filter((type) => type === "session.step.failed.1")).toHaveLength(1)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(beforeAttempts + 1)
+    expect(yield* s.context).toContainEqual(
+      expect.objectContaining({
+        type: "assistant",
+        finish: "error",
+        error: expect.objectContaining({ message: "prompt too long" }),
+      }),
+    )
+    expect(yield* s.context).not.toContainEqual(expect.objectContaining({ type: "compaction" }))
+  })
+
+  scenario("bars an eligible fallback when overflow recovery budget is exhausted", function* (s) {
+    yield* setupOverflowRecovery(s)
+
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(selection("fallback-model"))
+
+    const first = providerRejected({
+      message: "prompt too long",
+      classification: "context-overflow",
+    })
+    const terminal = providerRejected({
+      message: "prompt too long after recovery",
+      classification: "context-overflow",
+    })
+
+    const beforeEvents = (yield* recordedEventTypes(sessionID)).length
+    const beforeAttempts = s.spans.filter((span) => span.name === "SessionStep.attempt").length
+
+    yield* s.llm.push(
+      Stream.fail(first),
+      TestLLM.text("## Objective\n- Recover once", "overflow-fallback-summary"),
+      Stream.fail(terminal),
+      TestLLM.text("Must not dispatch fallback", "unexpected-overflow-fallback"),
+    )
+    yield* s.admit("Continue")
+
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(terminal)
+    expect(s.requests).toHaveLength(3)
+    expect(s.requests[0]?.model).toBe(recoveryModel)
+    expect(s.requests[1]?.model).toBe(recoveryModel)
+    expect(s.requests[2]?.model).toBe(recoveryModel)
+    expect(s.requests.some((request) => request.model === fallbackModel)).toBe(false)
+    expect(userTexts(s.requests[1]!).at(-1)).toContain("## Objective")
+    expect(userTexts(s.requests[2]!)[0]).toContain("<summary>\n## Objective\n- Recover once\n</summary>")
+
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(beforeAttempts + 2)
+    const added = (yield* recordedEventTypes(sessionID)).slice(beforeEvents)
+    expect(added.filter((type) => type === Bus.versionedType(SessionEvent.Compaction.Started.type, 1))).toHaveLength(1)
+    expect(added.filter((type) => type === Bus.versionedType(SessionEvent.Compaction.Ended.type, 1))).toHaveLength(1)
+    expect(added.filter((type) => type === Bus.versionedType(SessionEvent.Compaction.Published.type, 1))).toHaveLength(1)
+    expect(added.filter((type) => type === Bus.versionedType(SessionEvent.Compaction.Failed.type, 1))).toHaveLength(0)
+    expect(added.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    expect(added.filter((type) => type === "session.step.failed.1")).toHaveLength(1)
+    expect(yield* s.context).toMatchObject([
+      { type: "compaction", summary: "## Objective\n- Recover once" },
+      { type: "assistant", finish: "error", error: { message: "prompt too long after recovery" } },
+    ])
   })
 
   scenario("recovers from provider context overflow without a configured context limit", function* (s) {
@@ -6344,6 +6729,1490 @@ describe("SessionRunnerLLM", () => {
     })
   }
 
+  scenario("reads fallback intent after backoff and snapshots the dispatched model", function* (s) {
+    yield* s.admit("Retry with a fallback")
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered on fallback", "fallback-recovery"))
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("fallback-model"))
+    const dispatched = yield* s.llm.gate()
+    yield* TestClock.adjust("10 seconds")
+    yield* dispatched.started
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel])
+
+    // A later accepted update cannot retarget the already-created request.
+    yield* intent.stage(selection("replacement"))
+    yield* dispatched.release
+    yield* Fiber.join(run)
+
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel])
+    expect(yield* s.context).toMatchObject([
+      { type: "user" },
+      Expected.assistant({ finish: "stop" }, [Expected.text("Recovered on fallback")]),
+    ])
+  })
+
+  scenario("keeps the selected fallback when compaction runs before its attempt", function* (s) {
+    // The fallback's ceiling sits below the history the primary leaves behind, so this automatic compaction happens
+    // after the fallback is selected and before that attempt is dispatched.
+    yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-fallback-history", 40_000))
+    yield* s.runPrompt("Earlier question")
+
+    s.requests.length = 0
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("## Objective\n- Fallback summary", "text-fallback-summary"),
+      TestLLM.text("Recovered on fallback", "text-fallback-answer"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("fallback-small"))
+    yield* TestClock.adjust("10 seconds")
+    yield* Fiber.join(run)
+
+    // One attempt on the primary, the summary that fits the fallback, then the generation the fallback was picked
+    // for; the pre-attempt compaction dispatches no attempt of its own.
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackSmallModel, fallbackSmallModel])
+    // One physical attempt per generation: the first turn, the failed attempt, the fallback attempt.
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(3)
+    const types = yield* recordedEventTypes(sessionID)
+    expect(types.filter((type) => type === Bus.versionedType(SessionEvent.Compaction.Started.type, 1))).toHaveLength(1)
+    expect(types.filter((type) => type === Bus.versionedType(SessionEvent.Compaction.Published.type, 1))).toHaveLength(1)
+    // The fallback is attempted, never adopted: the Session keeps its primary model.
+    expect(types).not.toContain(Bus.versionedType(SessionEvent.ModelSelected.type, 1))
+    expect(yield* s.context).toMatchObject([
+      { type: "compaction", status: "completed", summary: "## Objective\n- Fallback summary" },
+      Expected.assistant({ finish: "stop" }, [Expected.text("Recovered on fallback")]),
+    ])
+  })
+
+  scenario("does not treat a variant of the active model as a distinct fallback model", function* (s) {
+    // FR-031: recovery identity is provider + model, and the variant is ignored. A fallback that repeats the
+    // Session's own model under another variant is NOT a second model, so the retry continues on the model the
+    // Session uses instead of dispatching a variant-swapped attempt. The second attempt's served model names that
+    // exactly: an identity rule that also read the variant would have served `variant-model#high`, a different
+    // resolved model instance, which is why the assertion below compares served models rather than request counts.
+    yield* s.bus.publish(SessionEvent.ModelSelected, {
+      sessionID,
+      model: {
+        id: ID.make("variant-model"),
+        providerID: Provider.ID.make("fake"),
+        variant: Model.VariantID.make("low"),
+      },
+    })
+    yield* s.admit("Retry on the same model")
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered on the primary", "variant-identity-recovery"))
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(fallbackSelection("variant-model", "high"))
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(run)
+
+    expect(s.requests.map((request) => request.model)).toEqual([variantModel, variantModel])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+  })
+
+  scenario("attempts one fallback identity at most once, its variants aside", function* (s) {
+    // FR-031 read with the attempted-fallback guard: `attemptedFallbacks` uses the SAME identity rule, so re-staging
+    // the already-attempted fallback model under another variant credits nothing to it and recovery continues on
+    // the Session's model. Only a guard that read variants as identity would dispatch the `low` spelling as a
+    // fresh attempt.
+    yield* s.admit("Attempt each fallback identity once")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      Stream.fail(providerUnavailable()),
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the Session model", "attempted-identity-recovery"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+
+    // Backoff 1 stages the fallback at `high`; the attempt after it serves the fallback model and fails.
+    yield* Queue.take(scheduled)
+    yield* intent.stage(fallbackSelection("fallback-model", "high"))
+    yield* TestClock.adjust(2_400)
+
+    // Backoff 2: that same intent still repeats the model just attempted, so nothing new is credited and the
+    // retry simply continues on the Session's model, which fails again.
+    yield* Queue.take(scheduled)
+    yield* TestClock.adjust(4_800)
+
+    // Backoff 3 re-stages the same fallback model at `low`: variant-agnostically already attempted, so recovery
+    // issues no attempt for it, and the retry succeeds on the Session's model.
+    yield* Queue.take(scheduled)
+    yield* intent.stage(fallbackSelection("fallback-model", "low"))
+    yield* TestClock.adjust(10_000)
+    yield* Fiber.join(run)
+
+    // One physical attempt per column: primary, fallback once, primary, primary — never the fallback a second
+    // time under its other variant.
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel, model, model])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(4)
+  })
+
+  scenario("serves the recorded fallback value with its variant as the attempt it dispatches", function* (s) {
+    // The core half of the value-agreement contract (FR-035): provider, model AND variant travel into the dispatched
+    // attempt, which serves the model the recorded value `fake/variant-model#high` resolves to — not the same
+    // model with the variant dropped. The paired app table reads that same recorded value as an active fallback.
+    yield* s.admit("Serve the recorded fallback")
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered on the recorded fallback", "recorded-fallback"))
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(fallbackSelection("variant-model", "high"))
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(run)
+
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModelHigh])
+  })
+
+  scenario("keeps the same model ID under another provider as a distinct fallback model", function* (s) {
+    // The other half of FR-031: identity is provider + model, so `other/shared-model` is never deduplicated against
+    // the Session's `fake/shared-model`. Different providers keep the same model ID distinct, and recovery attempts
+    // it like any other model.
+    yield* s.bus.publish(SessionEvent.ModelSelected, {
+      sessionID,
+      model: { id: ID.make("shared-model"), providerID: Provider.ID.make("fake") },
+    })
+    yield* s.admit("Another provider's model")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the other provider", "other-provider-fallback"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage({ providerID: Provider.ID.make("other"), model: ID.make("shared-model") })
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(run)
+
+    expect(s.requests.map((request) => request.model)).toEqual([crossModel, otherCrossModel])
+  })
+
+  // S2 / FR-007 and FR-008 (Story 2): a safe turn whose ordinary retry is refused or exhausted may still continue,
+  // but ONLY as a generation on a different provider/model identity, never as another primary attempt, and never
+  // while any call's external effect is unknown. Every count below is a physical count: what actually reached the
+  // provider, what actually settled durably, and what actually executed.
+  const authenticationFailure = () =>
+    RequestExecutor.httpFailure({
+      message: "Invalid Authorization header",
+      url: "https://fake.test/v1/chat/completions",
+      status: 401,
+    })
+
+  scenario("dispatches one distinct fallback with zero primary retries for a non-retryable 401", function* (s) {
+    // Story 2 scenario 1 through the production classifier: HTTP 401 classifies as Authentication, which the
+    // runner's retry policy refuses, so no backoff may be scheduled and no second primary request may leave the
+    // runner. The turn still continues, and only as a fresh assistant served by a DIFFERENT model identity whose
+    // attribution the dispatched request carries — here the recorded fallback's model AND its variant.
+    const failure = authenticationFailure()
+    // The classifier's own answer, asserted before the runner reads it: this failure is Authentication, so the
+    // distinct-only branch is what must run, not a shortened same-model schedule.
+    expect(failure.reason._tag).toBe("Authentication")
+    yield* s.admit("Authenticate then recover")
+    yield* s.llm.push(Stream.fail(failure), TestLLM.text("Recovered on the distinct model", "distinct-401"))
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(fallbackSelection("variant-model", "high"))
+    yield* s.resume
+
+    // Exactly one primary request and one fallback request, so no primary retry happened, and the recovery
+    // physically served the fallback's model under its recorded variant.
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModelHigh])
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    // Two physical attempts, each credited once, and neither one waited: no RetryScheduled event sits between them.
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    expect(events.filter((type) => type === "session.step.started.1")).toHaveLength(2)
+    // The original failure stays terminal on its own assistant message, and the recovery is a fresh assistant.
+    expect(yield* s.context).toMatchObject([
+      Expected.user("Authenticate then recover"),
+      Expected.assistant(
+        { finish: "error", error: { type: "provider.auth", message: "Invalid Authorization header" } },
+        [],
+      ),
+      Expected.assistant({ finish: "stop" }, [Expected.text("Recovered on the distinct model")]),
+    ])
+    // Recovery is attempted, never adopted: the Session keeps its own primary model.
+    expect(events).not.toContain(Bus.versionedType(SessionEvent.ModelSelected.type, 1))
+    void scheduled
+  })
+
+  scenario("reproduces the original failure when a distinct-only recovery has no eligible model", function* (s) {
+    // A distinct-only recovery is not another retry in disguise. With no eligible DIFFERENT identity — here an
+    // explicitly staged null, which disables recovery and leaves the committed document alone — the turn ends with
+    // the SAME AIError instance its attempt carried, with its durable settlement written once.
+    const failure = authenticationFailure()
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(null)
+    yield* s.admit("No distinct model to try")
+    yield* s.llm.push(Stream.fail(failure))
+    const scheduled = yield* subscribeRetries(s)
+
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(failure)
+    expect(s.requests).toHaveLength(1)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    const assistant = requireAssistant(yield* s.context)
+    expect(yield* recordedStepSettlementEvents(sessionID, assistant.id)).toMatchObject([
+      { type: "session.step.started.1" },
+      {
+        type: "session.step.failed.1",
+        data: { error: { type: "provider.auth", message: "Invalid Authorization header" } },
+      },
+    ])
+    void scheduled
+  })
+
+  scenario("continues on a distinct fallback once the ordinary schedule is exhausted", function* (s) {
+    // Story 2 scenario 2 (FR-007): the primary spends its WHOLE same-model schedule, and only after that schedule
+    // is spent does an eligible distinct fallback continue the turn. The fallback intent lands while the LAST
+    // budgeted primary request is in flight, so it can neither retarget that dispatched attempt nor add a primary
+    // request of its own: the turn ends with 11 primary requests (the cap) plus exactly one fallback request.
+    const failure = providerUnavailable()
+    yield* s.admit("Exhaust the ordinary schedule")
+    yield* s.llm.push(
+      ...Array.from({ length: RETRY_GAPS.length + 1 }, () => Stream.fail(failure)),
+      TestLLM.text("Recovered after the budget", "distinct-exhaustion"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    // Every request is parked at its own gate, so each backoff advances exactly one attempt: the physical count
+    // below is driven by what actually reached the provider, not by how the jittered gaps happened to fall.
+    const first = yield* s.llm.gate()
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* first.started
+    yield* first.release
+
+    for (const [index, gap] of RETRY_GAPS_MAX.entries()) {
+      yield* Queue.take(scheduled)
+      const parked = yield* s.llm.gate()
+      yield* TestClock.adjust(gap)
+      yield* parked.started
+      // Only the last budgeted retry's request is still in flight when the fallback intent lands.
+      if (index === RETRY_GAPS_MAX.length - 1) yield* intent.stage(selection("fallback-model"))
+      yield* parked.release
+    }
+    yield* Fiber.join(run)
+
+    // 11 primary requests = the first attempt plus the 10 budgeted retries, then one fallback: no excess primary.
+    expect(s.requests).toHaveLength(RETRY_GAPS.length + 2)
+    expect(s.requests.slice(0, RETRY_GAPS.length + 1).map((request) => request.model)).toEqual(
+      Array.from({ length: RETRY_GAPS.length + 1 }, () => model),
+    )
+    expect(s.requests.at(-1)?.model).toBe(fallbackModel)
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(RETRY_GAPS.length)
+    // The recovery's attempt is the only one beyond the cap, and no 11th retry event exists to fund another.
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(RETRY_GAPS.length + 2)
+    // The spent schedule settles its primary as a durable error, and the recovery continues on a fresh assistant
+    // served by the fallback model: no synthetic message, and the primary attribution stays the primary's own.
+    expect(yield* s.context).toMatchObject([
+      Expected.user("Exhaust the ordinary schedule"),
+      Expected.assistant({ finish: "error", error: { type: "provider.transport", message: "Provider unavailable" } }, []),
+      Expected.assistant({ finish: "stop" }, [Expected.text("Recovered after the budget")]),
+    ])
+    expect(s.requests.at(-2)?.model).toBe(model)
+  })
+
+  scenario("carries a settled local tool result into the distinct generation without re-executing it", function* (s) {
+    // FR-008's settled-tool half read against a distinct-only recovery: the call reached its own durable result
+    // event, so the recovery replays that recorded result through history, executes the tool exactly once, and
+    // publishes no retry event because it never asked for a same-model attempt.
+    const failure = authenticationFailure()
+    yield* s.admit("Echo, then a 401")
+    yield* s.llm.push(
+      TestLLM.failAfter(
+        failure,
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-settled-before-401", name: "echo", input: { text: "settled" } }),
+      ),
+      TestLLM.text("Recovered with the recorded result", "distinct-settled-tool"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(selection("fallback-model"))
+    yield* s.resume
+
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel])
+    // One physical execution, and the recorded result travels into the recovery request as durable history.
+    expect(s.executions).toEqual(["settled"])
+    expect(s.requests[1]?.messages.slice(-2)).toMatchObject([
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", id: "call-settled-before-401", name: "echo", input: { text: "settled" } }],
+      },
+      { role: "tool", content: [{ type: "tool-result", id: "call-settled-before-401" }] },
+    ])
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    expect(events.filter((type) => type === "session.tool.success.2")).toHaveLength(1)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    void scheduled
+  })
+
+  scenario("bars replay and distinct recovery while a hosted call's effect is unknown", function* (s) {
+    // The provider started a call on its own servers and never answered it. Even though something settles that call
+    // afterwards during cleanup, that settlement is not evidence about its external effect, so NEITHER an ordinary
+    // retry (the failure is retryable on its own) NOR a distinct-model generation may replay it: one request, one
+    // attempt, and the original failure stays terminal.
+    const failure = incompleteStream()
+    yield* s.admit("Call the provider never answered")
+    yield* s.llm.push(
+      TestLLM.failAfter(
+        failure,
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "hosted-open-before-close", name: "web_search", input: { query: "Effect" }, providerExecuted: true }),
+      ),
+      TestLLM.text("Must not be requested", "hosted-unknown-recovery"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(selection("fallback-model"))
+
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(failure)
+    expect(s.requests).toHaveLength(1)
+    expect(s.executions).toEqual([])
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    // Cleanup settles the abandoned hosted call exactly once, and it is never re-issued.
+    expect(events.filter((type) => type === "session.tool.failed.2")).toHaveLength(1)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+    void scheduled
+  })
+
+  scenario("bars retry and distinct recovery after a local call settled only by its own failure", function* (s) {
+    // Settlement of the RECORD is not evidence about the external effect: the model called a tool this request
+    // never advertised, so the tool layer published that call's OWN failure event BEFORE any cleanup ran, and
+    // the call may already have acted. A next request — an ordinary retry, or a distinct generation on another
+    // model — would let the model issue that call again, so BOTH are barred and one request stays terminal.
+    const failure = providerUnavailable()
+    yield* s.admit("Call a tool this request cannot serve")
+    yield* s.llm.push(
+      TestLLM.failAfter(
+        failure,
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-unavailable", name: "missing", input: {} }),
+      ),
+      TestLLM.text("Must not be requested", "own-failure-replay"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(selection("fallback-model"))
+
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(failure)
+    expect(s.requests).toHaveLength(1)
+    expect(s.executions).toEqual([])
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    // Exactly one terminal settlement for that call, published by the attempt itself rather than by cleanup, and
+    // one attempt overall: no retry, and no distinct generation.
+    expect(events.filter((type) => type === "session.tool.failed.2")).toHaveLength(1)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+    const assistant = requireAssistant(yield* s.context)
+    expect(yield* recordedStepSettlementEvents(sessionID, assistant.id)).toMatchObject([
+      { type: "session.step.started.1" },
+      { type: "session.tool.called.1", data: { id: "call-unavailable" } },
+      {
+        type: "session.tool.failed.2",
+        data: { id: "call-unavailable", error: { type: "tool.execution" } },
+      },
+      {
+        type: "session.step.failed.1",
+        data: { error: { type: "provider.transport", message: "Provider unavailable" } },
+      },
+    ])
+    void scheduled
+  })
+
+  scenario("bars retry and distinct recovery when a local tool's result cannot be persisted", function* (s) {
+    // The tool performed its external effect — visible in `s.executions` — and the publisher began its success
+    // event, but writing that event failed, so NO durable result record exists and the call's own fiber ended in
+    // a defect. Neither the settlement facts nor the fiber's exit may be read as "safe to re-ask": an ordinary
+    // retry would re-ask this same identity, and a distinct generation on another model could re-issue the call.
+    yield* s.bus.project(SessionEvent.Tool.Success, (event) =>
+      event.data.id !== "call-persist-defect"
+        ? Effect.void
+        : Effect.die(new Error("tool output persistence failed")),
+    )
+    const failure = providerUnavailable()
+    yield* s.admit("Run a tool whose output cannot be persisted")
+    yield* s.llm.push(
+      TestLLM.failAfter(
+        failure,
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-persist-defect", name: "echo", input: { text: "already wrote" } }),
+      ),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(selection("fallback-model"))
+
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(failure)
+    // One physical provider request, no retry event and one attempt span: the retry branch and the distinct branch
+    // are both closed, so no fallback identity is ever asked for.
+    expect(s.requests).toHaveLength(1)
+    // The tool ran once and was never re-executed.
+    expect(s.executions).toEqual(["already wrote"])
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    expect(events.filter((type) => type === "session.tool.success.2")).toHaveLength(0)
+    // The result event never became durable, so the attempt's own repair publishes the terminal failure before
+    // the assistant completes. History can no longer reconstruct a running call without a result.
+    expect(events.filter((type) => type === "session.tool.failed.2")).toHaveLength(1)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+    // The provider failure still terminates the turn with its own settlement, and the repair precedes it.
+    const assistant = requireAssistant(yield* s.context)
+    expect(yield* recordedStepSettlementEvents(sessionID, assistant.id)).toMatchObject([
+      { type: "session.step.started.1" },
+      { type: "session.tool.called.1", data: { id: "call-persist-defect" } },
+      {
+        type: "session.tool.failed.2",
+        data: {
+          id: "call-persist-defect",
+          error: { type: "tool.result-missing", message: "Tool result could not be durably recorded" },
+        },
+      },
+      {
+        type: "session.step.failed.1",
+        data: { error: { type: "provider.transport", message: "Provider unavailable" } },
+      },
+    ])
+    void scheduled
+
+    // A genuinely new turn must load the repaired history without replaying the historical call.
+    yield* s.llm.push(TestLLM.text("After repair", "after-repair"))
+    yield* s.admit("Next turn after the failed publication")
+    yield* s.resume
+    expect(s.requests).toHaveLength(2)
+    expect(s.executions).toEqual(["already wrote"])
+    const next = s.requests[1]!
+    const callIndex = next.messages.findIndex(
+      (message) =>
+        message.role === "assistant" &&
+        message.content.some((part) => part.type === "tool-call" && part.id === "call-persist-defect"),
+    )
+    expect(callIndex).toBeGreaterThanOrEqual(0)
+    const result = next.messages[callIndex + 1]
+    expect(result?.role).toBe("tool")
+    expect(result?.content).toMatchObject([
+      {
+        type: "tool-result",
+        id: "call-persist-defect",
+        result: {
+          type: "error",
+          value: { error: { type: "tool.result-missing", message: "Tool result could not be durably recorded" } },
+        },
+      },
+    ])
+    // Every assistant tool call in the next request has its required result.
+    for (const [index, message] of next.messages.entries()) {
+      if (message.role !== "assistant") continue
+      for (const part of message.content) {
+        if (part.type !== "tool-call") continue
+        expect(next.messages[index + 1]?.role).toBe("tool")
+        expect(next.messages[index + 1]?.content).toContainEqual(
+          expect.objectContaining({ type: "tool-result", id: part.id }),
+        )
+      }
+    }
+    expect((yield* recordedEventTypes(sessionID)).filter((type) => type === "session.tool.failed.2")).toHaveLength(1)
+  })
+
+  scenario("bars distinct recovery after provider failure and an explicitly declined tool", function* (s) {
+    const registry = yield* Tool.Service
+    let calls = 0
+
+    yield* transformTools(
+      registry,
+      {
+        declined: {
+          name: "declined",
+          description: "Fail because the user declined approval",
+          input: Schema.Struct({}),
+          output: Schema.Struct({}),
+          execute: () =>
+            Effect.sync(() => {
+              calls++
+            }).pipe(Effect.andThen(Effect.die(new Permission.DeclinedError()))),
+        },
+      },
+      { codemode: false },
+    )
+
+    const failure = authenticationFailure()
+    expect(failure.reason._tag).toBe("Authentication")
+
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(selection("fallback-model"))
+    yield* s.admit("Decline before the provider fails")
+
+    yield* s.llm.push(
+      TestLLM.failAfter(
+        failure,
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-declined-before-401", name: "declined", input: {} }),
+      ),
+      TestLLM.text("Must not recover", "unexpected-declined-fallback"),
+    )
+
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(failure)
+    expect(s.requests.map((request) => request.model)).toEqual([model])
+    expect(calls).toBe(1)
+    expect(s.executions).toEqual([])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    expect(events.filter((type) => type === "session.tool.failed.2")).toHaveLength(1)
+    expect(events.filter((type) => type === "session.tool.success.2")).toHaveLength(0)
+    expect(events.filter((type) => type === "session.step.failed.1")).toHaveLength(1)
+
+    expect(yield* s.context).toMatchObject([
+      Expected.user("Decline before the provider fails"),
+      Expected.assistant({}, [
+        Expected.failedTool(
+          { id: "call-declined-before-401" },
+          { error: { type: "aborted", message: "The user declined this tool call" } },
+        ),
+      ]),
+    ])
+  })
+
+  scenario("discards a prepared fallback whose compaction summary is still running", function* (s) {
+    // FR-008's freshness half one window later: the fallback's own ceiling forces a summary BEFORE its attempt, and
+    // a NEWER accepted intent lands while that summary request is in flight. The summary already reached the
+    // provider, so it keeps the fallback's attribution, but the generation it prepared must not go out, and a
+    // discarded generation owes no attempt span, no telemetry and no attempt credit.
+    yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-fallback-history-fresh", 40_000))
+    yield* s.runPrompt("Earlier question")
+
+    s.requests.length = 0
+    s.spans.length = 0
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("## Objective\n- Summary for the staged fallback", "summary-for-staged-fallback"),
+      TestLLM.text("Recovered on the newer fallback", "newer-fallback-generation"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const telemetry = yield* subscribeTelemetry(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("fallback-small"))
+    // The summary request parks at the provider boundary: this is B's request, prepared and in flight.
+    const summary = yield* s.llm.gate()
+    yield* TestClock.adjust("10 seconds")
+    yield* summary.started
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackSmallModel])
+    // A newer accepted intent lands inside that window, then the summary completes.
+    yield* intent.stage(selection("variant-model"))
+    yield* summary.release
+    yield* Fiber.join(run)
+
+    // Two physical attempts only: A and C. The discarded B generation owns no attempt span.
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    // A's failed attempt, B's summary (which keeps B's attribution) and C's generation: B's prepared generation
+    // never went out, so B appears exactly once below, as the summary.
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackSmallModel, variantModel])
+    // The discarded generation also published no telemetry and consumed no attempt sequence number. The earlier
+    // turn's attempt publishes its terminal event on its own promise chain, which lands after this subscription,
+    // so drain five boundaries and group by attempt.
+    const published: Array<Event.Payload<typeof SessionEvent.Telemetry>> = []
+    for (let index = 0; index < 5; index++) published.push(yield* Queue.take(telemetry))
+    expect(published.map((event) => event.data.phase)).toEqual(["complete", "start", "discard", "start", "complete"])
+    // Three attempts published telemetry: the earlier turn's, A's and C's, with ADJACENT sequence numbers. A
+    // discarded generation that had consumed attempt credit would leave a gap here, and one that had published
+    // anything would add a fourth identity.
+    const sequences = Array.from(new Set(published.map((event) => event.data.attemptSequence)))
+    expect(sequences.length).toBe(3)
+    expect(sequences).toEqual([sequences[0]!, sequences[0]! + 1, sequences[0]! + 2])
+    // C's generation is REBUILT, not replayed from B's prepared request: C's own model identity is in its system
+    // parts, B's is absent, and the summary B produced travels as durable history.
+    const served = s.requests.at(-1)!
+    expect(served.model).toBe(variantModel)
+    expect(served.system.map((part) => part.text)).toContain(identity("fake", "variant-model"))
+    expect(served.system.map((part) => part.text).join("\n")).not.toContain("fallback-small")
+    expect(userTexts(served).join("\n")).toContain("## Objective\n- Summary for the staged fallback")
+    const types = yield* recordedEventTypes(sessionID)
+    expect(types.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(1)
+  })
+
+  scenario("discards a fully prepared generation at the provider-consumption boundary", function* (s) {
+    // The last window before a request is consumed: `model.request` fires inside request preparation, so at this
+    // point the generation's transcript, options and plugin-visible request all EXIST and nothing has reached the
+    // provider. A newer accepted intent landing here must discard that generation entirely — zero requests, zero
+    // telemetry, zero attempt credit — and rebuild the next generation with the newer model's identity and history.
+    yield* s.admit("Land an intent during request preparation")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the newer prepared model", "prepared-boundary-generation"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const telemetry = yield* subscribeTelemetry(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const hooks = yield* PluginHooks.Service
+    const hold = yield* Deferred.make<void>()
+    const prepared: Array<string> = []
+    yield* hooks.register("session", "model.request", (event) =>
+      Effect.suspend(() => {
+        prepared.push(`${event.model.providerID}/${event.model.id}`)
+        // Only the fallback's prepared generation is held: every other request goes out unheld, so the hold proves
+        // THIS generation reached the last preparation step without being consumed.
+        if (prepared.at(-1) !== "fake/fallback-model") return Effect.void
+        return Deferred.await(hold)
+      }),
+    )
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("fallback-model"))
+    yield* TestClock.adjust("10 seconds")
+    // The runner is parked at the final preparation step of B's generation: its request was prepared...
+    expect(prepared).toEqual(["fake/fake-model", "fake/fallback-model"])
+    expect(s.requests.map((request) => request.model)).toEqual([model])
+    // ...and a NEWER accepted intent lands before that request can be consumed.
+    yield* intent.stage(selection("variant-model"))
+    yield* Deferred.succeed(hold, undefined)
+    yield* Fiber.join(run)
+
+    // B's prepared request NEVER reached the provider: three preparations, two physical requests.
+    expect(prepared).toEqual(["fake/fake-model", "fake/fallback-model", "fake/variant-model"])
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModel])
+    // Two attempts, and the discarded generation consumed no attempt sequence number and published no telemetry.
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    const firstStart = yield* Queue.take(telemetry)
+    const firstTerminal = yield* Queue.take(telemetry)
+    const secondStart = yield* Queue.take(telemetry)
+    const secondTerminal = yield* Queue.take(telemetry)
+    expect([firstStart, firstTerminal, secondStart, secondTerminal].map((event) => event.data.phase)).toEqual([
+      "start",
+      "discard",
+      "start",
+      "complete",
+    ])
+    expect(secondStart.data.attemptSequence).toBe(firstStart.data.attemptSequence + 1)
+    // C is rebuilt on its own options and identity, not on B's prepared request.
+    const served = s.requests.at(-1)!
+    expect(served.model).toBe(variantModel)
+    expect(served.system.map((part) => part.text)).toContain(identity("fake", "variant-model"))
+  })
+
+  scenario("dispatches the newer variant of a superseded undispatched fallback", function* (s) {
+    yield* s.admit("Replace the prepared fallback variant")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered with the newer variant", "newer-variant"),
+    )
+
+    const scheduled = yield* subscribeRetries(s)
+    const telemetry = yield* subscribeTelemetry(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const hooks = yield* PluginHooks.Service
+    const entered = yield* Deferred.make<void>()
+    const hold = yield* Deferred.make<void>()
+    let preparations = 0
+
+    yield* hooks.register("session", "model.request", (event) =>
+      Effect.suspend(() => {
+        if (event.model.id !== "variant-model") return Effect.void
+        preparations++
+        if (preparations !== 1) return Effect.void
+        return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(hold)))
+      }),
+    )
+
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(fallbackSelection("variant-model", "high"))
+    yield* TestClock.adjust("10 seconds")
+    yield* Deferred.await(entered)
+
+    expect(s.requests.map((request) => request.model)).toEqual([model])
+
+    // Same provider/model identity, newer revision, different variant.
+    yield* intent.stage(selection("variant-model"))
+    yield* Deferred.succeed(hold, undefined)
+    yield* Fiber.join(run)
+
+    expect(preparations).toBe(2)
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModel])
+    expect(s.requests.some((request) => request.model === variantModelHigh)).toBe(false)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(1)
+
+    const published: Array<Event.Payload<typeof SessionEvent.Telemetry>> = []
+    for (let index = 0; index < 4; index++) published.push(yield* Queue.take(telemetry))
+
+    expect(published.map((event) => event.data.phase)).toEqual(["start", "discard", "start", "complete"])
+    expect(published[2]!.data.attemptSequence).toBe(published[0]!.data.attemptSequence + 1)
+  })
+
+  scenario("retains eligibility of a superseded undispatched identity in the same turn", function* (s) {
+    yield* s.admit("Recover through a superseded fallback")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      Stream.fail(authenticationFailure()),
+      TestLLM.text("Recovered on the previously undispatched model", "uncredited-fallback"),
+    )
+
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const hooks = yield* PluginHooks.Service
+    const entered = yield* Deferred.make<void>()
+    const hold = yield* Deferred.make<void>()
+    let preparations = 0
+
+    yield* hooks.register("session", "model.request", (event) =>
+      Effect.suspend(() => {
+        if (event.model.id !== "fallback-model") return Effect.void
+        preparations++
+        if (preparations !== 1) return Effect.void
+        return Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(hold)))
+      }),
+    )
+
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("fallback-model"))
+    yield* TestClock.adjust("10 seconds")
+    yield* Deferred.await(entered)
+
+    expect(s.requests.map((request) => request.model)).toEqual([model])
+
+    // Discard prepared B in favor of C.
+    yield* intent.stage(selection("variant-model"))
+    const dispatched = yield* s.llm.gate()
+    yield* Deferred.succeed(hold, undefined)
+    yield* dispatched.started
+
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModel])
+
+    // C is already physically dispatched but its 401 has not arrived.
+    // B becomes the newest fallback before C fails.
+    yield* intent.stage(selection("fallback-model"))
+    yield* dispatched.release
+    yield* Fiber.join(run)
+
+    // There has been no new user input and no turn reset.
+    expect(preparations).toBe(2)
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModel, fallbackModel])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(3)
+
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(1)
+  })
+
+  scenario("discards a generation superseded inside lazy compile and async auth", function* (s) {
+    // B1: B is already past Core's last in-step freshness check and parked inside the real LLM client's lazy
+    // `prepareTransport` auth. C is accepted there. The final dispatch seam must reject B before the transport
+    // executor runs, and B must own no span, attempt sequence or telemetry; C then rebuilds and dispatches.
+    const failure = providerUnavailable()
+    yield* s.admit("Hold the fallback in async auth")
+    yield* s.llm.push(Stream.fail(failure), TestLLM.text("Recovered on C", "b1-auth-c"))
+    const scheduled = yield* subscribeRetries(s)
+    const telemetry = yield* subscribeTelemetry(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("slow-model"))
+    yield* TestClock.adjust(2_400)
+    // The real client is now suspended in async authentication for B, after checkpoint 5 accepted the candidate.
+    yield* Deferred.await(slowDispatch.started)
+    yield* intent.stage(fallbackSelection("variant-model", "high"))
+    yield* Deferred.succeed(slowDispatch.release, undefined)
+    yield* Fiber.join(run)
+
+    // B never reached the transport executor; the only physical requests are the primary failure and C.
+    expect(slowDispatch.executions).toEqual([])
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModelHigh])
+    const c = s.requests.at(-1)!
+    expect(c.system.map((part) => part.text)).toContain(identity("fake", "variant-model"))
+    expect(c.model.options).toMatchObject({ providerOptions: { effort: "high" } })
+    expect(userTexts(c).join("\n")).toContain("Hold the fallback in async auth")
+    // Two attempts only: B owns no span and no attempt sequence.
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    // B also owns no provider-stream span; only A and C opened one, and no recorded span names the slow model.
+    expect(s.spans.filter((span) => span.name === "LLM.stream")).toHaveLength(2)
+    expect(s.spans.some((span) => span.attributes.get("gen_ai.request.model") === "slow-model")).toBe(false)
+    const published: Array<Event.Payload<typeof SessionEvent.Telemetry>> = []
+    for (let index = 0; index < 4; index++) published.push(yield* Queue.take(telemetry))
+    expect(published.map((event) => event.data.phase)).toEqual(["start", "discard", "start", "complete"])
+    expect(yield* Queue.size(telemetry)).toBe(0)
+    const sequences = [...new Set(published.map((event) => event.data.attemptSequence))].sort((a, b) => a - b)
+    expect(sequences).toHaveLength(2)
+    expect(sequences[1]).toBe(sequences[0]! + 1)
+  })
+
+  scenario("credits attempted identity only after the transport preparation accepts dispatch", function* (s) {
+    // H4: B's real preparation fails with a typed Authentication error BEFORE `beforeDispatch`, so no executor,
+    // span, attempt sequence or telemetry may be credited to it. C physically dispatches and fails, after which B
+    // becomes the newest fallback again: the earlier undispatched preparation must not have consumed its identity.
+    // B fails preparation a second time, and with no other eligible recovery the turn must terminate instead of
+    // looping on the unchanged failing preparation.
+    resetPrepareFailAuth()
+    yield* s.admit("Fail fallback preparation before dispatch")
+    yield* s.llm.push(Stream.fail(providerUnavailable()), Stream.fail(authenticationFailure()))
+    const scheduled = yield* subscribeRetries(s)
+    const telemetry = yield* subscribeTelemetry(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("prepare-fail-model"))
+    yield* TestClock.adjust("10 seconds")
+    yield* Deferred.await(prepareFailAuth.entered)
+    expect(s.requests.map((request) => request.model)).toEqual([model])
+
+    // The newer distinct C is accepted while B is parked at preparation, then B's preparation fails.
+    yield* intent.stage(selection("variant-model"))
+    const dispatched = yield* s.llm.gate()
+    yield* Deferred.succeed(prepareFailAuth.release, undefined)
+    yield* dispatched.started
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModel])
+
+    // C has physically dispatched; B becomes the newest fallback before C's 401 arrives.
+    yield* intent.stage(selection("prepare-fail-model"))
+    yield* dispatched.release
+    const terminal = yield* Fiber.join(run).pipe(Effect.flip)
+
+    // B was eligible again after C's dispatch, failed preparation a second time, and the turn ended on that cause.
+    expect(prepareFailAuth.preparations).toBe(2)
+    expect(terminal).toBe(prepareFailAuth.failures[1])
+    expect(slowDispatch.executions).toEqual([])
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModel])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    expect(s.spans.filter((span) => span.name === "LLM.stream")).toHaveLength(2)
+    expect(
+      s.spans.some(
+        (span) =>
+          span.name === "SessionStep.attempt" && span.attributes.get("gen_ai.request.model") === "prepare-fail-model",
+      ),
+    ).toBe(false)
+    expect(
+      s.spans.some(
+        (span) => span.name === "LLM.stream" && span.attributes.get("gen_ai.request.model") === "prepare-fail-model",
+      ),
+    ).toBe(false)
+    const published: Array<Event.Payload<typeof SessionEvent.Telemetry>> = []
+    for (let index = 0; index < 4; index++) published.push(yield* Queue.take(telemetry))
+    expect(published.map((event) => event.data.phase)).toEqual(["start", "discard", "start", "discard"])
+    expect(yield* Queue.size(telemetry)).toBe(0)
+    const sequences = [...new Set(published.map((event) => event.data.attemptSequence))].sort((a, b) => a - b)
+    expect(sequences).toHaveLength(2)
+    expect(sequences[1]).toBe(sequences[0]! + 1)
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.step.started.1")).toHaveLength(4)
+    expect(events.filter((type) => type === "session.step.failed.1")).toHaveLength(3)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(1)
+  })
+
+  for (const replacement of ["newer variant", "identical selection"] as const) {
+    scenario(`reconsiders a failed undispatched preparation with ${replacement}`, function* (s) {
+      resetPrepareFailAuth()
+
+      yield* s.admit("Reconsider the newest fallback intent")
+      yield* s.llm.push(Stream.fail(providerUnavailable()))
+
+      const scheduled = yield* subscribeRetries(s)
+      const telemetry = yield* subscribeTelemetry(s)
+      const intent = yield* FallbackRuntimeIntent.Service
+
+      const run = yield* s.resume.pipe(Effect.forkChild)
+      yield* Queue.take(scheduled)
+
+      const firstRevision = yield* intent.stage(fallbackSelection("prepare-fail-model", "high"))
+
+      yield* TestClock.adjust("10 seconds")
+      yield* Deferred.await(prepareFailAuth.entered)
+
+      expect(prepareFailAuth.preparations).toBe(1)
+      expect(s.requests.map((request) => request.model)).toEqual([model])
+      expect(slowDispatch.executions).toEqual([])
+
+      const nextRevision = yield* intent.stage(
+        replacement === "newer variant"
+          ? selection("prepare-fail-model")
+          : fallbackSelection("prepare-fail-model", "high"),
+      )
+
+      expect(nextRevision).toBeGreaterThan(firstRevision)
+
+      yield* Deferred.succeed(prepareFailAuth.release, undefined)
+      const terminal = yield* Fiber.join(run).pipe(Effect.flip)
+
+      expect(prepareFailAuth.preparations).toBe(2)
+      expect(prepareFailAuth.failures).toHaveLength(2)
+      expect(terminal).toBe(prepareFailAuth.failures[1])
+
+      expect(s.requests.map((request) => request.model)).toEqual([model])
+      expect(slowDispatch.executions).toEqual([])
+
+      expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+      expect(s.spans.filter((span) => span.name === "LLM.stream")).toHaveLength(1)
+
+      const published: Array<Event.Payload<typeof SessionEvent.Telemetry>> = []
+      for (let index = 0; index < 2; index++) published.push(yield* Queue.take(telemetry))
+
+      expect(published.map((event) => event.data.phase)).toEqual(["start", "discard"])
+      expect(yield* Queue.size(telemetry)).toBe(0)
+      expect(published[1]!.data.attemptSequence).toBe(published[0]!.data.attemptSequence)
+
+      const events = yield* recordedEventTypes(sessionID)
+      expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(1)
+      expect(events.filter((type) => type === "session.step.started.1")).toHaveLength(3)
+      expect(events.filter((type) => type === "session.step.failed.1")).toHaveLength(2)
+    })
+  }
+
+  scenario("bars a distinct generation after a content-policy refusal", function* (s) {
+    // A content-policy refusal is the provider's completed judgement about this work, not a transient fault, so
+    // re-asking the same work on another model is not a recovery. The branch must stay closed even with an
+    // eligible fallback staged: one request, no backoff, and the refusal settles the attempt that made it.
+    const failure = new AIError({ reason: new ContentPolicyError({ message: "Content blocked by the provider" }) })
+    yield* s.admit("Refused by content policy")
+    yield* s.llm.push(Stream.fail(failure))
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(selection("fallback-model"))
+
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(failure)
+    expect(s.requests).toHaveLength(1)
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+    const assistant = requireAssistant(yield* s.context)
+    expect(yield* recordedStepSettlementEvents(sessionID, assistant.id)).toMatchObject([
+      { type: "session.step.started.1" },
+      { type: "session.step.failed.1", data: { error: { type: "provider.content-filter" } } },
+    ])
+    void scheduled
+  })
+
+  scenario("bars a distinct generation for a step the user stopped", function* (s) {
+    // FR-008's cancellation guard read against the new branch: the provider stream really failed, and the user then
+    // stopped the step while its tool work was finishing. A cancelled turn may not be continued on another model,
+    // so nothing beyond the one request is dispatched and the aborted settlement wins.
+    const failure = providerUnavailable()
+    yield* s.admit("Stop while the tools finish")
+    yield* s.llm.push(
+      TestLLM.failAfter(
+        failure,
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.toolCall({ id: "call-stop-echo", name: "echo", input: { text: "running" } }),
+      ),
+      TestLLM.text("Must not be requested", "cancelled-recovery"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    yield* intent.stage(selection("fallback-model"))
+    const tools = yield* s.blockTools()
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* tools.started
+    yield* s.session.interrupt(sessionID)
+    yield* tools.release
+    yield* Fiber.join(run).pipe(Effect.exit)
+
+    expect(s.requests).toHaveLength(1)
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    // No second physical attempt, so the stopped turn was not continued on another model.
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+    expect(s.executions).toEqual(["running"])
+    void scheduled
+  })
+
+  scenario("keeps the pair an in-flight request started with as its own served-model attribution", function* (s) {
+    // Constitution IV: a request already underway keeps the model and fallback attribution it started with — primary
+    // A, fallback B. Moving the Session to primary C and staging fallback D while that request's recovery outcome
+    // is still pending cannot relabel the in-flight attempt or its served model, and only work started after the
+    // change observes C/D. Every attempt's served model is asserted directly.
+    yield* s.admit("Change the pair mid-recovery")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the original fallback", "in-flight-fallback"),
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the later fallback", "later-fallback"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("fallback-model"))
+    const dispatched = yield* s.llm.gate()
+    yield* TestClock.adjust("10 seconds")
+    yield* dispatched.started
+
+    // The pair changes while the fallback attempt is still streaming: primary model C, and a newly staged fallback D.
+    yield* s.bus.publish(SessionEvent.ModelSelected, {
+      sessionID,
+      model: { id: ID.make("replacement"), providerID: Provider.ID.make("fake") },
+    })
+    yield* intent.stage(selection("fallback-small"))
+
+    yield* dispatched.release
+    yield* Fiber.join(run)
+
+    // The in-flight recovery served the fallback it was dispatched with: A, then B. Neither C nor D appears among
+    // this request's attempts.
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel])
+
+    // The next request is the only one that sees the new pair: primary C, and its recovery uses D.
+    yield* s.admit("Second question")
+    const later = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* TestClock.adjust("10 seconds")
+    yield* Fiber.join(later)
+    expect(s.requests.slice(2).map((request) => request.model)).toEqual([replacementModel, fallbackSmallModel])
+  })
+
+  scenario("resolves the latest recorded fallback after backoff for a request already waiting in backoff", function* (s) {
+    // FR-008 (S2) supersedes the request-start snapshot for the FALLBACK half of this boundary: the spec
+    // clarifications and Story 2 scenario 10 require a pending retry to resolve the LATEST eligible effective
+    // fallback after backoff — current validated intent first, then the latest committed value — never an older
+    // recorded value. This is an intentional contract evolution of the accepted scenario that asserted B: the
+    // PRIMARY half of FR-025 still stands (a retry with no fallback continues on the request's own model, below),
+    // and this request is still never relabeled onto the new primary C.
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    // B: the recorded fallback in force when this request starts.
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("fallback-model") }) }),
+    ])
+    yield* s.admit("Change the recorded pair during backoff")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the latest recorded fallback", "backoff-recorded-recovery"),
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the later fallback", "later-recorded-recovery"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    // Backoff is scheduled and this request's attempt has not gone out yet: nothing is staged as retry intent.
+    yield* Queue.take(scheduled)
+
+    // Mid-backoff, the recorded pair moves: fallback B becomes D, and the Session's primary A becomes C.
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("variant-model") }) }),
+    ])
+    yield* s.bus.publish(SessionEvent.ModelSelected, {
+      sessionID,
+      model: { id: ID.make("replacement"), providerID: Provider.ID.make("fake") },
+    })
+
+    // Backoff ends, so the pending attempt of the request that was already underway goes out. Under FR-008 the
+    // fallback is resolved at this boundary — D, the latest recorded value — not the request-start snapshot B.
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(run)
+
+    // A, then D. The primary half is untouched: no attempt of this request is served by the new primary C,
+    // and the older recorded B never appears either.
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModel])
+    expect(s.requests.map((request) => request.model)).not.toContain(replacementModel)
+    expect(s.requests.map((request) => request.model)).not.toContain(fallbackModel)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+
+    // Work started after the change is the only work that sees the new primary: C, recovery on D.
+    yield* s.admit("Second question")
+    const later = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(later)
+    expect(s.requests.slice(2).map((request) => request.model)).toEqual([replacementModel, variantModel])
+  })
+
+  scenario("uses the latest committed fallback when a staged intent clears during backoff", function* (s) {
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    // The request starts with fallback explicitly off: a request-start snapshot would leave the pending
+    // retry with nothing to promote, so only FR-008's committed-value tier can produce a fallback attempt.
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: null }) }),
+    ])
+    yield* s.admit("Recover from the committed fallback after the intent cleared")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the committed fallback", "committed-after-clear"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+
+    // Mid-backoff the update commits: the document now records fallback B and the staged intent it published
+    // clears, exactly as a committed update's exit cleanup does.
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("fallback-model") }) }),
+    ])
+    const revision = yield* intent.stage(selection("fallback-model"))
+    yield* intent.clearIfCurrent(revision)
+
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(run)
+
+    // A, then B: the cleared intent neither leaks into recovery nor blocks it; the committed document read
+    // after backoff decides. A request-start snapshot (null) would have dispatched no fallback attempt.
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackModel])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+  })
+
+  scenario("disables recovery when the committed fallback turns off during backoff", function* (s) {
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("fallback-model") }) }),
+    ])
+    yield* s.admit("Fallback turns off mid-backoff")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Continued without a fallback attempt", "off-mid-backoff"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+
+    // Mid-backoff the committed value moves to explicit off (a config update clearing fallback).
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: null }) }),
+    ])
+
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(run)
+
+    // A, then A again: explicit null suppresses the promotion at the resolution boundary. A recorded
+    // request-start snapshot (B) would wrongly dispatch a fallback attempt here.
+    expect(s.requests.map((request) => request.model)).toEqual([model, model])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+  })
+
+  scenario("prefers the staged runtime intent over the committed document when both change during backoff", function* (s) {
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("fallback-model") }) }),
+    ])
+    yield* s.admit("Intent outranks committed during backoff")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the staged intent", "intent-over-committed"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+
+    // Mid-backoff, three candidate values coexist: the recorded snapshot (B, fallbackModel), the newly
+    // committed document (D, variantModel) and the newest staged intent (F, fallbackSmallModel). Each would
+    // produce a different served model, so the trace identifies exactly which rule fired.
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("variant-model") }) }),
+    ])
+    yield* intent.stage(selection("fallback-small"))
+
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(run)
+
+    // A, then F: the staged intent outranks the committed document, which outranks the stale snapshot.
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackSmallModel])
+    expect(s.requests.map((request) => request.model)).not.toContain(variantModel)
+    expect(s.requests.map((request) => request.model)).not.toContain(fallbackModel)
+  })
+
+  scenario("dispatches a staged fallback without any committed config read", function* (s) {
+    // FR-008's read-window half: a validated staged override IS the decision, so this `chooseFallback` makes no
+    // protected committed read at all. Attribution is exact without guessing call sites: every other fixture owner
+    // of the committed document (`SessionProjector`, for the `experimental.part_rows` setting) reads it inside
+    // `SessionStep.attempt`, i.e. after the recovery has been chosen, so running the SAME window twice — once with
+    // a staged intent (D) and once with nothing staged — differs by exactly the one read the resolution stopped
+    // making. The committed document deliberately names the OTHER model (B), which is what a read would have chosen.
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("fallback-model") }) }),
+    ])
+
+    // Phase 1: the staged intent D outranks the committed B.
+    yield* s.admit("Recover from staged intent alone")
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered on the staged intent", "no-committed-read"))
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* intent.stage(selection("variant-model"))
+    const readsAtIntentArm = s.configBarrier.reads.length
+
+    // Backoff ends: the fallback is resolved, then the attempt goes out and stays streaming while a later
+    // accepted intent arrives, which cannot retarget that dispatched attempt.
+    const dispatched = yield* s.llm.gate()
+    yield* TestClock.adjust(2_400)
+    yield* dispatched.started
+    const retargeted = yield* intent.stage(selection("fallback-small"))
+    yield* dispatched.release
+    yield* Fiber.join(run)
+
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModel])
+    expect(s.requests.map((request) => request.model)).not.toContain(fallbackModel)
+    expect(s.requests.map((request) => request.model)).not.toContain(fallbackSmallModel)
+    // One failed primary plus exactly one recovery attempt: no committed-model or stale-model attempt appears.
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    const readsWithIntent = s.configBarrier.reads.length - readsAtIntentArm
+    // The recorder is live during a recovery window that performs no resolution read, so a zero there is
+    // meaningful rather than blind.
+    expect(readsWithIntent).toBeGreaterThan(0)
+
+    // Phase 2: same fixture, same committed document, same code path, nothing staged (the newer revision retires
+    // exactly as a committed update's cleanup does). This recovery MUST read the committed document, and serves B.
+    yield* intent.clearIfCurrent(retargeted)
+    yield* s.admit("Second question")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the committed fallback", "read-recorder-live"),
+    )
+    const later = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    const readsAtClearArm = s.configBarrier.reads.length
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(later)
+
+    expect(s.requests.slice(2).map((request) => request.model)).toEqual([model, fallbackModel])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(4)
+    const readsWithoutIntent = s.configBarrier.reads.length - readsAtClearArm
+    // Exactly one committed read more when no intent is active, over otherwise identical windows: that is the read
+    // the staged path skipped. The committed tier still resolves on its own (B is served), so the recorder is not
+    // blind and the zero-resolution-read phase is not vacuous.
+    expect(readsWithoutIntent - readsWithIntent).toBe(1)
+  })
+
+  scenario("re-resolves when a newer intent is staged while the committed read is suspended", function* (s) {
+    // The suspended-read race at the real boundary: the retry's fallback resolution holds the value the protected
+    // read observed while a NEWER accepted intent lands inside that window. Dispatching the read value would be
+    // FR-008's stale-snapshot defect at a new interleaving, so the recovery must re-resolve and serve F.
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("fallback-model") }) }),
+    ])
+    yield* s.admit("Intent lands during the protected read")
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered on the newer intent", "intent-during-read"))
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+
+    const gate = yield* Deferred.make<void>()
+    const hold: ConfigReadHold = { gate, opened: false }
+    s.configBarrier.hold = hold
+    const readsAtArm = s.configBarrier.reads.length
+
+    yield* TestClock.adjust(2_400)
+    // The gate was reached by THIS fallback resolution: exactly one committed read is parked, it saw the committed
+    // B, and no recovery attempt has gone out yet — so the only reader that could be holding this window is
+    // `chooseFallback` (every other owner reads inside `SessionStep.attempt`, after a recovery decision exists).
+    expect(s.configBarrier.parked).toBe(1)
+    expect(s.configBarrier.reads.slice(readsAtArm)).toEqual(["fake/fallback-model"])
+    expect(s.requests.map((request) => request.model)).toEqual([model])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+
+    // A newer validated intent is accepted while that read is still in flight, then the read is released.
+    yield* intent.stage(selection("fallback-small"))
+    hold.opened = true
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.join(run)
+
+    // F, never the B the suspended read had observed: the obsolete value is discarded and the newer intent decides
+    // the physical dispatch. The obsolete model is absent from every attempt made in this request.
+    expect(s.requests.map((request) => request.model)).toEqual([model, fallbackSmallModel])
+    expect(s.requests.map((request) => request.model)).not.toContain(fallbackModel)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    // Exactly one read was parked for the whole window; the re-resolution takes the intent without a second
+    // protected read inside that window.
+    expect(s.configBarrier.parked).toBe(1)
+  })
+
+  scenario("resolves the committed document current after a staged revision clears during the read", function* (s) {
+    // Same window, the other transition: a newer staged revision (which would name F) is retired with
+    // `clearIfCurrent` before the delayed read finishes, exactly as a committed update's exit cleanup does. The
+    // recovery must resolve the committed document current AFTER that transition (D), not the value the suspended
+    // read actually observed (B) and not the retired intent (F).
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("fallback-model") }) }),
+    ])
+    yield* s.admit("Intent clears during the protected read")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the later committed fallback", "committed-after-read-window"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const intent = yield* FallbackRuntimeIntent.Service
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+
+    const gate = yield* Deferred.make<void>()
+    const hold: ConfigReadHold = { gate, opened: false }
+    s.configBarrier.hold = hold
+    const readsAtArm = s.configBarrier.reads.length
+
+    yield* TestClock.adjust(2_400)
+    expect(s.configBarrier.parked).toBe(1)
+    expect(s.configBarrier.reads.slice(readsAtArm)).toEqual(["fake/fallback-model"])
+    expect(s.requests.map((request) => request.model)).toEqual([model])
+
+    // Inside the window: the committed document moves B -> D, then a newer revision staging F is retired.
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: selection("variant-model") }) }),
+    ])
+    const revision = yield* intent.stage(selection("fallback-small"))
+    yield* intent.clearIfCurrent(revision)
+    hold.opened = true
+    yield* Deferred.succeed(gate, undefined)
+    yield* Fiber.join(run)
+
+    // D only: the obsolete read value B never becomes an attempt, and the retired intent neither blocks nor leaks.
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModel])
+    expect(s.requests.map((request) => request.model)).not.toContain(fallbackModel)
+    expect(s.requests.map((request) => request.model)).not.toContain(fallbackSmallModel)
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    // The re-resolution is observable: the parked read recorded B, the immediately following re-read recorded the
+    // document that is current after the transition, D.
+    expect(s.configBarrier.reads.slice(readsAtArm, readsAtArm + 2)).toEqual([
+      "fake/fallback-model",
+      "fake/variant-model",
+    ])
+    expect(s.configBarrier.parked).toBe(1)
+  })
+
+  scenario("keeps the primary model a request started with for its retry when fallback is off, and applies a later primary change to the next request", function* (s) {
+    // FR-025's other half, at the same time boundary. Recorded fallback is explicitly `null`, so the retry has
+    // nothing to promote: `chooseFallback` returns `undefined`, and the retry then continues on whatever model the
+    // freshly prepared selection names. If that selection is read AFTER the user moved the Session to another primary
+    // during this request's backoff, the in-flight request is relabeled — the same violation the recorded-fallback
+    // capture closed, now on the primary side. Only the model ATTRIBUTION is pinned; plugins, agents, tools,
+    // instructions and the history window are still re-read by `prepareContext` exactly as the accepted reload tests
+    // require.
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: null }) }),
+    ])
+    yield* s.admit("Retry with fallback off after a primary change")
+    yield* s.llm.push(
+      Stream.fail(providerUnavailable()),
+      TestLLM.text("Recovered on the model it started with", "no-fallback-backoff"),
+      TestLLM.text("Recovered on the later primary", "later-primary"),
+    )
+    const scheduled = yield* subscribeRetries(s)
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    // In backoff, attempt 2 of THIS request has not gone out yet.
+    yield* Queue.take(scheduled)
+
+    // The user moves the Session to C while this request is still waiting.
+    yield* s.bus.publish(SessionEvent.ModelSelected, {
+      sessionID,
+      model: { id: ID.make("replacement"), providerID: Provider.ID.make("fake") },
+    })
+
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(run)
+
+    // A, then A again: the request that was underway keeps its own attribution, and no fallback attempt appears.
+    expect(s.requests.map((request) => request.model)).toEqual([model, model])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+    const types = yield* recordedEventTypes(sessionID)
+    expect(types.filter((type) => type.startsWith("session.retry.scheduled"))).toHaveLength(1)
+
+    // The next request is the only work that sees C, and it needs no retry to do so.
+    yield* s.admit("Second question")
+    const later = yield* s.resume.pipe(Effect.forkChild)
+    yield* Fiber.join(later)
+    expect(s.requests.slice(2).map((request) => request.model)).toEqual([replacementModel])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(3)
+  })
+
+  scenario("serves the fallback the Config service records, with its variant, and keeps an explicit off apart from the legacy value", function* (s) {
+    // The core half of the value-agreement contract (FR-035) that the runtime-intent scenario cannot prove: NO
+    // `FallbackRuntimeIntent` is staged in any phase below, so every fallback here arrives through the real
+    // Config service — `ConfigFallback.resolve(Config.latest(config.entries(), "fallback"))` — exactly the value
+    // the composer writes and the display names. Phase 1 shows provider, model AND variant reach the served
+    // attempt; phases 2 and 3 separate a recorded `null` from an absent key.
+    const config = yield* Config.Test
+    const baseline = yield* config.entries()
+    // B#high as a recorded config document. The resolver applies variant settings, so only the `high` spelling
+    // resolves to `variantModelHigh`; the `model` answer below would be a variant-dropping bug.
+    yield* config.setEntries([
+      ...baseline,
+      new Document({ type: "document", info: new Info({ fallback: fallbackSelection("variant-model", "high") }) }),
+    ])
+    // Read back through the tag the runner itself uses, so what is recorded here provably IS the value its recovery
+    // reads — one config instance, not a fixture the scenario wrote to and the runner never sees.
+    const served = yield* Config.Service
+    expect(Config.latest(yield* served.entries(), "fallback")).toMatchObject({
+      providerID: "fake",
+      model: "variant-model",
+      variant: "high",
+    })
+    yield* s.admit("Serve the recorded fallback")
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered on the recorded value", "config-fallback"))
+    const scheduled = yield* subscribeRetries(s)
+    const run = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(run)
+
+    expect(s.requests.map((request) => request.model)).toEqual([model, variantModelHigh])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(2)
+
+    // Phase 2 — the config records `null`: fallback is disabled, so the retry issues NO fallback attempt and simply
+    // continues on the Session's own model.
+    yield* config.setEntries([...baseline, new Document({ type: "document", info: new Info({ fallback: null }) })])
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered with no fallback", "off-fallback"))
+    yield* s.admit("Explicit off")
+    const off = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(off)
+    expect(s.requests.slice(2).map((request) => request.model)).toEqual([model, model])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(4)
+
+    // Phase 3 — the key absent is a DIFFERENT state: `resolve(undefined)` is the legacy value, so the same request
+    // shape now does dispatch a fallback attempt, which is what makes phase 2's silence provable rather than
+    // incidental. This fixture only resolves that legacy model when this scenario arms it (see `resolvesLegacyFallback`).
+    s.resolvesLegacyFallback = true
+    yield* config.setEntries(baseline)
+    yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Recovered on the legacy value", "legacy-fallback"))
+    yield* s.admit("Absent key")
+    const legacy = yield* s.resume.pipe(Effect.forkChild)
+    yield* Queue.take(scheduled)
+    yield* TestClock.adjust(2_400)
+    yield* Fiber.join(legacy)
+    expect(s.requests.slice(4).map((request) => request.model)).toEqual([model, legacyFallbackModel])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(6)
+  })
+
   scenario("does not start another physical attempt after interruption during retry backoff", function* (s) {
     yield* s.admit("Interrupt retry backoff")
     yield* s.llm.push(Stream.fail(providerUnavailable()), TestLLM.text("Must not run", "unused-retry"))
@@ -6841,34 +8710,48 @@ describe("SessionRunnerLLM", () => {
     ])
   })
 
-  scenario("retries an incomplete stream from a settled local tool defect", function* (s) {
+  scenario("bars replay after an incomplete stream whose local tool defected", function* (s) {
+    // S2 migration of the accepted `retries an incomplete stream from a settled local tool defect` scenario.
+    // Before/after correspondence: that scenario asserted a SECOND physical request (a replay) plus the settled
+    // tool history carried into it. The `defect` tool dies mid-call, so the only terminal event for its call is the
+    // one cleanup writes afterwards, which is not evidence that its external effect settled. FR-008 requires that
+    // unknown-effect work bars replay: the assertions below are strictly stronger (one request instead of two, the
+    // original AIError terminal, exactly one durable tool failure, and no retry event at all). The settled-tool
+    // half of the old coverage is unchanged and still retries with its recorded result, in the scenario above.
+    const failure = incompleteStream()
     yield* s.admit("Continue after tool defect")
     yield* s.llm.push(
       TestLLM.failAfter(
-        incompleteStream(),
+        failure,
         LLMEvent.stepStart({ index: 0 }),
         LLMEvent.toolCall({ id: "call-defect-before-close", name: "defect", input: {} }),
       ),
     )
     yield* s.llm.push(TestLLM.text("Recovered", "tool-defect-recovery"))
-
     const scheduled = yield* subscribeRetries(s)
-    const run = yield* s.resume.pipe(Effect.forkChild)
-    yield* Queue.take(scheduled)
-    yield* TestClock.adjust("2400 millis")
-    yield* Fiber.join(run)
 
-    expect(messageRoles(s.requests[1])).toEqual(["user", "assistant", "tool"])
+    expect(yield* s.resume.pipe(Effect.flip)).toBe(failure)
+    // Nothing replayed: no second primary request, and no fallback generation either.
+    expect(s.requests).toHaveLength(1)
+    const events = yield* recordedEventTypes(sessionID)
+    expect(events.filter((type) => type === "session.retry.scheduled.1")).toHaveLength(0)
+    // The call settles durably exactly once, from cleanup, and is never executed again.
+    expect(events.filter((type) => type === "session.tool.failed.2")).toHaveLength(1)
+    expect(s.executions).toEqual([])
     expect(yield* s.context).toMatchObject([
-      { type: "user" },
-      Expected.assistant({}, [
-        Expected.failedTool(
-          { id: "call-defect-before-close" },
-          { error: { type: "unknown", message: "unexpected tool defect" } },
-        ),
-      ]),
-      Expected.assistant({ finish: "stop" }, [Expected.text("Recovered")]),
+      Expected.user("Continue after tool defect"),
+      Expected.assistant(
+        { finish: "error", error: { type: "provider.invalid-output" } },
+        [
+          Expected.failedTool(
+            { id: "call-defect-before-close" },
+            { error: { type: "unknown", message: "unexpected tool defect" } },
+          ),
+        ],
+      ),
     ])
+    expect(s.spans.filter((span) => span.name === "SessionStep.attempt")).toHaveLength(1)
+    void scheduled
   })
 
   scenario(

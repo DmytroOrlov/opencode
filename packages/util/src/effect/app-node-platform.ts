@@ -5,8 +5,15 @@ import * as NodePath from "@effect/platform-node/NodePath"
 import { Effect, FileSystem, Layer, Path } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/http"
 import { makeGlobalNode } from "./app-node.js"
+import { localBackingNamespace, withNamespace } from "../filesystem-provenance.js"
 
-export const filesystem = makeGlobalNode({ service: FileSystem.FileSystem, layer: NodeFileSystem.layer, deps: [] })
+/** The platform owner annotates the actual OS filesystem, not each wrapper. */
+export const localFilesystemLayer = Layer.effect(
+  FileSystem.FileSystem,
+  Effect.map(FileSystem.FileSystem, (fs) => withNamespace(fs, localBackingNamespace)),
+).pipe(Layer.provide(NodeFileSystem.layer))
+
+export const filesystem = makeGlobalNode({ service: FileSystem.FileSystem, layer: localFilesystemLayer, deps: [] })
 export const path = makeGlobalNode({ service: Path.Path, layer: NodePath.layer, deps: [] })
 // `RequestInfo | URL`, spelled out because not every runtime declares `RequestInfo` globally.
 export type Fetch = (input: Request | string | URL, init?: RequestInit) => Promise<Response>

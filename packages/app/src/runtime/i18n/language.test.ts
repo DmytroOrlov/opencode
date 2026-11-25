@@ -33,3 +33,14 @@ describe("dictionaries", () => {
     expect(nested).toEqual([])
   })
 })
+
+describe("fallback localization", () => {
+  test("includes the fallback status key in every supported app locale", async () => {
+    await Promise.all(
+      DESKTOP_NATIVE_LOCALES.map(async (locale) => {
+        const source = await Bun.file(new URL(`./${locale}.ts`, import.meta.url)).text()
+        expect(source, locale).toContain('"ui.sessionTurn.status.fallback"')
+      }),
+    )
+  })
+})

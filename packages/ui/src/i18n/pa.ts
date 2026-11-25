@@ -83,6 +83,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "ترمیماں ہو رہیاں نیں",
   "ui.sessionTurn.status.runningCommands": "کمانڈاں چل رہیاں نیں",
   "ui.sessionTurn.status.thinking": "سوچ رہیا اے",
+  "ui.sessionTurn.status.fallback": "فال بیک ماڈل",
   "ui.sessionTurn.status.thinkingWithTopic": "سوچ رہیا اے - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "خیال اکٹھے ہو رہے نیں",
   "ui.sessionTurn.status.consideringNextSteps": "اگلے قدماں بارے سوچیا جا رہیا اے",

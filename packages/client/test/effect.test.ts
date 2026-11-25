@@ -324,6 +324,80 @@ test("session.log retains the typed SessionNotFoundError", async () => {
   expect(error._tag).toBe("SessionNotFoundError")
 })
 
+const configPatch = (body: () => Response) => {
+  const httpClient = HttpClient.make((request) =>
+    Effect.succeed(HttpClientResponse.fromWeb(request, body())),
+  )
+  return Effect.gen(function* () {
+    const client = yield* OpenCode.make({ baseUrl: "http://localhost:3000" })
+    return yield* client.experimental.config.update({ fallback: null }).pipe(Effect.flip)
+  }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient), Effect.runPromise)
+}
+
+test("experimental.config.update resolves void on the empty 204", async () => {
+  const requests: Array<{ method: string; url: string }> = []
+  const httpClient = HttpClient.make((request) => {
+    requests.push({ method: request.method, url: request.url })
+    return Effect.succeed(HttpClientResponse.fromWeb(request, new Response(null, { status: 204 })))
+  })
+  const result = await Effect.gen(function* () {
+    const client = yield* OpenCode.make({ baseUrl: "http://localhost:3000" })
+    return yield* client.experimental.config.update({ fallback: null })
+  }).pipe(Effect.provideService(HttpClient.HttpClient, httpClient), Effect.runPromise)
+
+  expect(result).toBeUndefined()
+  expect(requests).toEqual([{ method: "PATCH", url: "http://localhost:3000/api/experimental/config" }])
+})
+
+test("a declared PATCH config 500 fails with the declared error and its optional code", async () => {
+  // Uncoded defect: a committed code is absent, and a code is never invented from the status.
+  const uncoded = await configPatch(() =>
+    Response.json(
+      { _tag: "UnknownError", message: "Server failed to handle the request. Check server logs for details.", ref: "err_2b8f1c3a" },
+      { status: 500 },
+    ),
+  )
+  expect(uncoded._tag).toBe("UnknownError")
+  expect(uncoded.message).toBe("Server failed to handle the request. Check server logs for details.")
+  expect(uncoded.ref).toBe("err_2b8f1c3a")
+  expect(uncoded.code).toBeUndefined()
+
+  for (const code of ["CONFIG_COMMITTED_BUT_UNPUBLISHED", "CONFIG_COMMITTED_WITH_POSTPUBLICATION_FAILURE"] as const) {
+    const failure = await configPatch(() =>
+      Response.json({ _tag: "UnknownError", message: `Committed with ${code}`, code }, { status: 500 })
+    )
+    expect(failure._tag).toBe("UnknownError")
+    expect(failure.code).toBe(code)
+  }
+})
+
+test("an unrecognized PATCH code is not decoded as a committed identity, and other endpoints keep the old shape", async () => {
+  // The declared schema pins `code` to the two committed literals, so an unrecognized code cannot decode into
+  // either committed identity: the response is reported as a client-side decode failure instead.
+  const bogus = await configPatch(() =>
+    Response.json(
+      { _tag: "UnknownError", message: "Committed but with a code that never exists", code: "CONFIG_COMMITTED_FOREVER" },
+      { status: 500 },
+    ),
+  )
+  expect(bogus._tag).toBe("ClientError")
+
+  // 500 stays undeclared on every other endpoint, so its fault stays a ClientError.
+  const otherHttpClient = HttpClient.make((request) =>
+    Effect.succeed(
+      HttpClientResponse.fromWeb(
+        request,
+        Response.json({ _tag: "UnknownError", message: "Committed but unpublished", code: "BOGUS" }, { status: 500 }),
+      ),
+    ),
+  )
+  const other = await Effect.gen(function* () {
+    const client = yield* OpenCode.make({ baseUrl: "http://localhost:3000" })
+    return yield* client.session.list().pipe(Effect.flip)
+  }).pipe(Effect.provideService(HttpClient.HttpClient, otherHttpClient), Effect.runPromise)
+  expect(other._tag).toBe("ClientError")
+})
+
 const session = {
   data: {
     id: "ses_test",

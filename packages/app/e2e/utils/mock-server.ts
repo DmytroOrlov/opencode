@@ -3,6 +3,7 @@ import type { OpenCodeEvent, SessionMessageInfo } from "@opencode/client/promise
 import { Permission } from "@opencode/schema/permission"
 import { artifactKind, artifactMime } from "@opencode/util/artifact"
 import { Model } from "@opencode/schema/model"
+import { Config } from "@opencode/schema/config"
 import { Worktree } from "@opencode/schema/worktree"
 import { Effect, Layer, Option, Predicate, Schema } from "effect"
 import { HttpRouter, HttpServer, HttpServerResponse } from "effect/http"
@@ -24,6 +25,14 @@ import { createPersistentPty, type MockPersistentPtyConfig, type MockServerEvent
 import { installSseTransport } from "./sse-transport"
 
 type Resolvable<T> = T | (() => T)
+
+// The mock's config surface, stateful like the server's: what `GET /api/config` answers (the scenario's entries plus
+// whatever the app patched), and the one-shot rejected patch a scenario arms so one half of a pair can fail and
+// the next one land.
+type MockConfigState = {
+  entries: unknown[]
+  failWrites: number
+}
 
 // A hook's replacement response.
 export type MockAnswer = { status: number; body: unknown }
@@ -71,6 +80,8 @@ export interface MockServerConfig {
   // Records `POST /api/experimental/fs/write` (attachment uploads), which answers the requested path.
   // Without it, writes answer 501 MockUnsupported.
   onFileWrite?: (input: { path: string; directory: string; body: string }) => void
+  // The config documents `GET /api/config` answers. The mock is stateful: a `PATCH /api/experimental/config` appends
+  // its fields as a last document, so a refetch or reload reads back what the app wrote (FR-012/FR-013/FR-021).
   configEntries?: unknown[]
   directory: string
   project: unknown
@@ -449,7 +460,7 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     (ws) => transport.persistentPty.connect(ws),
   )
 
-  return { server, persistentPty: transport.persistentPty, push }
+  return { server, persistentPty: transport.persistentPty, push, config: transport.config }
 }
 
 // Answers every Location-scoped request for `directory` as the server does once that folder is deleted.
@@ -508,9 +519,11 @@ export async function mockServers(page: Page, servers: Record<string, Omit<MockS
   )
 }
 
-// `emit` publishes the events a real server sends after a mutation (without a page, nothing is published).
-function createMockServerHandler(config: MockServerConfig, emit: (events: MockServerEvent[]) => void = () => {}) {
+// `emit` publishes the events a real server sends after a mutation (without a page, nothing is published). Exported
+// so the harness's own state can be tested without a browser: `handler` answers requests and `config` arms rejections.
+export function createMockServerHandler(config: MockServerConfig, emit: (events: MockServerEvent[]) => void = () => {}) {
   const persistentPty = createPersistentPty({ config: config.persistentPty, directory: config.directory }, emit)
+  const configState: MockConfigState = { entries: [...(config.configEntries ?? [])], failWrites: 0 }
 
   const web = HttpRouter.toWebHandler(
     HttpApiBuilder.layer(MockApi).pipe(
@@ -523,6 +536,7 @@ function createMockServerHandler(config: MockServerConfig, emit: (events: MockSe
           emit,
           mcp: new Map<string, MockMcpStatus>(),
           attempts: new Map<string, number>(),
+          config: configState,
         }),
       ),
       Layer.provide(HttpServer.layerServices),
@@ -530,7 +544,7 @@ function createMockServerHandler(config: MockServerConfig, emit: (events: MockSe
     { disableLogger: true },
   )
 
-  return { ...web, persistentPty }
+  return { ...web, persistentPty, config: configState }
 }
 
 const corsHeaders = {
@@ -622,10 +636,22 @@ function mockHandlers(
     // MCP status overrides by `<directory>\n<server>`, and OAuth attempt creation times by attempt ID.
     mcp: Map<string, MockMcpStatus>
     attempts: Map<string, number>
+    config: MockConfigState
   },
 ) {
   const noContent = Effect.succeed(HttpApiSchema.NoContent.make())
-  const configEntries = config.configEntries ?? []
+
+  // The document the mock writes a config patch into — the mock's highest-precedence global document. It is appended
+  // once, so a later read or a reload answers what the app last wrote, and `fallback: null` reads back as the saved
+  // no-fallback value rather than an absent field.
+  const patchedInfo: Partial<Config.Patch> = {}
+  const patched = { type: "document", path: `${config.directory}/.opencode/config.patch.jsonc`, info: patchedInfo }
+
+  const applyConfigPatch = (patch: Config.Patch) => {
+    Object.assign(patchedInfo, patch)
+
+    if (!state.config.entries.includes(patched)) state.config.entries.push(patched)
+  }
 
   // Without a persistent PTY config the mock is a server with a working daemon and no terminals, since the desktop
   // lists a session's terminals whenever its side panel renders.
@@ -804,7 +830,7 @@ function mockHandlers(
                 ? undefined
                 : { persistentPty: state.persistentPty.capability },
           }),
-        config: () => Effect.succeed(configEntries),
+        config: () => Effect.succeed(state.config.entries),
         reference: () => Effect.succeed({ location: location(config), data: [] }),
         // `beforeAgentsResponse` holds the Location's agent list, as a cold Location does while its plugins activate.
         agent: (ctx) =>
@@ -945,7 +971,18 @@ function mockHandlers(
             canonical: projectSeed(config)?.canonical ?? config.directory,
           }),
         configShells: () => Effect.succeed(config.shells ?? []),
-        configUpdate: () => noContent,
+        // Applies the patch to the config it later serves, and answers an armed rejection once (see
+        // `MockConfigState.failWrites`), so a scenario can fail one exchange half and then resume.
+        configUpdate: (ctx) =>
+          Effect.suspend(() => {
+            if (state.config.failWrites > 0) {
+              state.config.failWrites -= 1
+
+              return Effect.fail(new MockInternal({ message: "Config update failed" }))
+            }
+
+            return Effect.sync(() => applyConfigPatch(ctx.payload))
+          }).pipe(Effect.andThen(noContent)),
         websearchProviders: () =>
           Effect.sync(() => ({ location: location(config), data: resolve(config.websearchProviders ?? []) })),
         // No scenario signs in to an OpenCode Console workspace, so none has usage limits.

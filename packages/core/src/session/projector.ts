@@ -8,6 +8,7 @@ import { Config } from "../config.js"
 import { Database } from "../database/database.js"
 import { DatabaseBatch } from "../database/batch.js"
 import { Bus } from "../bus.js"
+import { EventTable } from "../event/sql.js"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Model } from "@opencode/schema/model"
 import { SessionEvent } from "./event.js"
@@ -196,6 +197,8 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
     yield* InstructionEntry.initialize(db, event.data.sessionID, event.data.instructionEntries, event.created)
 
   const forkedID = (seq: number) => SessionMessage.ID.make(`${SessionMessage.ID.fromEvent(event.id)}_${seq}`)
+  // A copied checkpoint's summary needs its own fork-owned identity, distinct from the candidate it pairs with.
+  const forkedSummaryID = (candidate: SessionMessage.ID) => SessionMessage.ID.make(`${candidate}_summary`)
   // The child stores the parent's inline media as blobs; the parent's rows are never rewritten.
   const media = yield* SessionBlob.ForkMedia
   let cursor = -1
@@ -212,6 +215,9 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
           sql`${SessionMessageTable.type} != 'assistant' or json_extract(${SessionMessageTable.data}, '$.time.completed') is not null`,
           sql`${SessionMessageTable.type} != 'shell' or json_extract(${SessionMessageTable.data}, '$.status') != 'running'`,
           sql`${SessionMessageTable.type} != 'compaction' or json_extract(${SessionMessageTable.data}, '$.status') != 'running'`,
+          // A candidate that was never published is not a checkpoint. A legacy row has no `published` key, so
+          // it stays eligible.
+          sql`${SessionMessageTable.type} != 'compaction' or coalesce(json_extract(${SessionMessageTable.data}, '$.published'), 1) = 1`,
         ),
       )
       .orderBy(asc(SessionMessageTable.seq))
@@ -222,6 +228,12 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
 
     const values = yield* Effect.forEach(rows, (row) =>
       Effect.gen(function* () {
+        // A copied checkpoint is identified by the fork: the candidate becomes the copied row's ID and its
+        // summary gets a fork-owned one, so nothing in the fork names the parent's pair.
+        const data =
+          row.type === "compaction" && "candidateID" in row.data
+            ? { ...row.data, candidateID: forkedID(row.seq), summaryID: forkedSummaryID(forkedID(row.seq)) }
+            : row.data
         const copy = {
           id: forkedID(row.seq),
           session_id: event.data.sessionID,
@@ -230,10 +242,10 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
           time_created: row.time_created,
           time_updated: row.time_updated,
           // Split parents' envelopes carry no content, so only unsplit parents' inline media moves here.
-          data: media ? yield* SessionBlob.externalizeRow(db, row.data) : row.data,
+          data: media ? yield* SessionBlob.externalizeRow(db, data) : data,
         }
         // A summary references the first message it kept, which the fork copied under a new ID.
-        const keepID = row.type === "compaction" ? row.data.metadata?.keepID : undefined
+        const keepID = row.type === "compaction" ? data.metadata?.keepID : undefined
         if (!Schema.is(SessionMessage.ID)(keepID)) return copy
         const kept = yield* db
           .select({ seq: SessionMessageTable.seq })
@@ -244,7 +256,7 @@ const projectFork = Effect.fn("SessionProjector.projectFork")(function* (
         if (!kept) return copy
         return {
           ...copy,
-          data: { ...row.data, metadata: { ...row.data.metadata, keepID: forkedID(kept.seq) } },
+          data: { ...data, metadata: { ...data.metadata, keepID: forkedID(kept.seq) } },
         }
       }),
     )
@@ -409,7 +421,7 @@ function run(db: DatabaseService, event: MessageEvent) {
           return message.type === "shell" ? message : undefined
         })
       },
-      getCompaction() {
+      getCompaction(candidateID) {
         return Effect.gen(function* () {
           const row = yield* db
             .select()
@@ -418,7 +430,8 @@ function run(db: DatabaseService, event: MessageEvent) {
               and(
                 eq(SessionMessageTable.session_id, event.data.sessionID),
                 eq(SessionMessageTable.type, "compaction"),
-                sql`json_extract(${SessionMessageTable.data}, '$.status') = 'running'`,
+                candidateID ? eq(SessionMessageTable.id, candidateID) : undefined,
+                candidateID ? undefined : sql`json_extract(${SessionMessageTable.data}, '$.status') = 'running'`,
               ),
             )
             .orderBy(desc(SessionMessageTable.seq))
@@ -429,6 +442,26 @@ function run(db: DatabaseService, event: MessageEvent) {
           const message = SessionHistory.decodeMessageRowSync(row)
           return message.type === "compaction" ? message : undefined
         })
+      },
+      hasCompactionCandidate(candidateID) {
+        return db
+          .select({ id: EventTable.id })
+          .from(EventTable)
+          .where(
+            and(
+              eq(EventTable.aggregate_id, event.data.sessionID),
+              eq(EventTable.type, Bus.versionedType(SessionEvent.Compaction.Started.type, 1)),
+              sql`json_extract(${EventTable.data}, '$.candidateID') = ${candidateID}`,
+              // The Started row being projected is already stored; excluding it keeps a fresh candidate valid
+              // while a replayed or duplicate identity still fails.
+              sql`${EventTable.seq} != ${event.durable.seq}`,
+            ),
+          )
+          .get()
+          .pipe(
+            Effect.orDie,
+            Effect.map((row) => row !== undefined),
+          )
       },
       appendMessage: (message) => insertMessage(db, event, message),
     }
@@ -1117,6 +1150,15 @@ const layer = Layer.effectDiscard(
     yield* bus.project(SessionEvent.RetryScheduled, (event) => run(db, event))
     yield* bus.project(SessionEvent.Compaction.Started, (event) => run(db, event))
     yield* bus.project(SessionEvent.Compaction.Ended, (event) =>
+      Effect.gen(function* () {
+        yield* run(db, event)
+        // Legacy ended events are themselves the publication fact. New candidate pairs
+        // advance the instruction epoch only when their exact Published event is applied.
+        if (event.data.candidateID === undefined)
+          yield* InstructionState.advanceEpoch(db, event.data.sessionID, event.durable.seq)
+      }),
+    )
+    yield* bus.project(SessionEvent.Compaction.Published, (event) =>
       Effect.gen(function* () {
         yield* run(db, event)
         yield* InstructionState.advanceEpoch(db, event.data.sessionID, event.durable.seq)

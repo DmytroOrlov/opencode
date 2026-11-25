@@ -257,10 +257,14 @@ export function timeout(value: unknown) {
 
 /** Request timeouts from provider settings, resolved for every route. `timeout` has no default. */
 export function timeouts(settings: Readonly<Record<string, unknown>>) {
+  const chunk = timeout(settings.chunkTimeout)
   return {
     timeout: timeout(settings.timeout),
     headerTimeout: timeout(settings.headerTimeout) ?? DEFAULT_TIMEOUT_MS,
-    chunkTimeout: timeout(settings.chunkTimeout) ?? DEFAULT_CHUNK_TIMEOUT_MS,
+    chunkTimeout: chunk ?? DEFAULT_CHUNK_TIMEOUT_MS,
+    // Core-owned transport policy: adaptive SSE read-deadline calibration, suppressed by an explicit
+    // `chunkTimeout` so that limit stays effective. Never forwarded to provider packages.
+    splashAdaptiveSseTimeout: settings.splashAdaptiveSseTimeout === true && chunk === undefined,
   }
 }
 

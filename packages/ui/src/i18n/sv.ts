@@ -119,6 +119,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "Redigerar",
   "ui.sessionTurn.status.runningCommands": "Kör kommandon",
   "ui.sessionTurn.status.thinking": "Tänker",
+  "ui.sessionTurn.status.fallback": "Reservmodell",
   "ui.sessionTurn.status.thinkingWithTopic": "Tänker - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Samlar tankar",
   "ui.sessionTurn.status.consideringNextSteps": "Funderar på nästa steg",

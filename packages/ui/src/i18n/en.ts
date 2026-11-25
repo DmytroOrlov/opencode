@@ -117,6 +117,7 @@ const source = {
   "ui.sessionTurn.status.makingEdits": "Making edits",
   "ui.sessionTurn.status.runningCommands": "Running commands",
   "ui.sessionTurn.status.thinking": "Thinking",
+  "ui.sessionTurn.status.fallback": "Fallback",
   "ui.sessionTurn.status.thinkingWithTopic": "Thinking - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Gathering thoughts",
   "ui.sessionTurn.status.consideringNextSteps": "Considering next steps",
@@ -244,6 +245,8 @@ const source = {
   "ui.promptInput.chooseAgent": "Choose agent",
   "ui.promptInput.chooseModel": "Choose model",
   "ui.promptInput.chooseVariant": "Choose model variant",
+  // The fallback slot's own variant control, so the two controls stay distinguishable by name.
+  "ui.promptInput.chooseFallbackVariant": "Choose fallback model variant",
   "ui.promptInput.send": "Send",
   "ui.promptInput.stop": "Stop",
   "ui.promptInput.exitShell": "Exit",

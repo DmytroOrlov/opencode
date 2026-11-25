@@ -88,6 +88,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "Menyunting",
   "ui.sessionTurn.status.runningCommands": "Menjalankan perintah",
   "ui.sessionTurn.status.thinking": "Berpikir",
+  "ui.sessionTurn.status.fallback": "Model cadangan",
   "ui.sessionTurn.status.thinkingWithTopic": "Berpikir - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Mengumpulkan pemikiran",
   "ui.sessionTurn.status.consideringNextSteps": "Mempertimbangkan langkah selanjutnya",

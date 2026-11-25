@@ -45,6 +45,9 @@ export const policy = (sessionID: SessionSchema.ID) =>
           decision: next.retry ? { retry: true, delay: next.delay } : { retry: false },
         }
         yield* input.hook(event)
+        // Hooks may override an ordinary retry recommendation within the
+        // available schedule, but cannot replenish an exhausted hard cap.
+        if (!next.hardAllowed) return { retry: false as const }
         if (!event.decision.retry) return event.decision
         const normalized =
           Number.isFinite(event.decision.delay) && event.decision.delay >= 0

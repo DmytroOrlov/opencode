@@ -84,6 +84,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "Provádění úprav",
   "ui.sessionTurn.status.runningCommands": "Spouštění příkazů",
   "ui.sessionTurn.status.thinking": "myšlení",
+  "ui.sessionTurn.status.fallback": "Záložní model",
   "ui.sessionTurn.status.thinkingWithTopic": "Myšlení - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Shromažďování myšlenek",
   "ui.sessionTurn.status.consideringNextSteps": "Zvažování dalších kroků",

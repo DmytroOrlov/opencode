@@ -1,4 +1,4 @@
-import { Cause, Context, Effect, Layer, Option, Schema, Stream } from "effect"
+import { Cause, Context, Effect, Layer, Option, Schema, Stream, Tracer } from "effect"
 import { Auth } from "./auth.js"
 import { Endpoint, type EndpointPatch } from "./endpoint.js"
 import { RequestExecutor } from "./executor.js"
@@ -148,6 +148,21 @@ export interface StreamOptions {
   readonly webSocket?: WebSocketChannelExecutor
   /** Session-independent observer hook for already-decoded provider protocol frames. */
   readonly observeFrame?: (protocol: string, frame: unknown) => void
+  /**
+   * Private dispatch coordination seam, asked once after lazy request compilation and transport preparation
+   * (including asynchronous authentication) and before the transport may send. The session runner uses it to
+   * discard a generation whose fallback intent was superseded while it was still being prepared. Ordinary
+   * callers omit it and keep the existing behavior.
+   */
+  readonly beforeDispatch?: Effect.Effect<boolean>
+  /**
+   * Private tracing companion to `beforeDispatch`: asked only after dispatch is accepted, and only then may the
+   * provider-stream span open. A discarded candidate therefore owns no provider span, while an accepted one opens it
+   * as a child of the attempt span that accepted it. Ordinary callers omit it.
+   */
+  readonly dispatchSpan?: () =>
+    | { readonly name: string; readonly options: Tracer.SpanOptions }
+    | undefined
 }
 
 export interface StreamMethod {
@@ -622,7 +637,14 @@ const streamRequestWith = (runtime: TransportRuntime) => (request: LLMRequest, o
   Stream.unwrap(
     Effect.gen(function* () {
       const compiled = yield* compile(request, options)
-      return compiled.route.streamPrepared(compiled.prepared, compiled.request, runtime, options)
+      // The final dispatch seam: all lazy compilation and transport preparation (including async auth) has
+      // completed. A false answer means the caller's generation was superseded; interrupt before the transport
+      // can send, so the superseded model owns no request.
+      if (options?.beforeDispatch !== undefined && !(yield* options.beforeDispatch))
+        return yield* Effect.interrupt
+      const dispatched = compiled.route.streamPrepared(compiled.prepared, compiled.request, runtime, options)
+      const span = options?.dispatchSpan?.()
+      return span === undefined ? dispatched : Stream.withSpan(dispatched, span.name, span.options)
     }),
   )
 

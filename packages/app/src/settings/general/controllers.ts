@@ -24,6 +24,7 @@ import { useServerCtx } from "@/runtime/server/runtime"
 import { useLanguage } from "@/runtime/i18n/language"
 import { showToast } from "@/shell/notifications/toast"
 import { errorMessage } from "@/shell/layout/helpers"
+import { committedConfigCode } from "@/runtime/server/config-outcome"
 import {
   createOptimisticSettingState,
   selectSettingMeta,
@@ -85,7 +86,15 @@ export function createOptimisticSetting<T, M, S>(options: {
     )
     void Promise.try(() => options.write(effect.value, effect.source)).then(
       () => settle(attempt, { type: "write.succeeded", attempt }),
-      (cause) => settle(attempt, { type: "write.failed", attempt, message: errorMessage(cause, "") }),
+      (cause) =>
+        settle(attempt, {
+          type: "write.failed",
+          attempt,
+          message: errorMessage(cause, ""),
+          // Read off the generated error's structural code, never its message: a committed-state rejection means the
+          // source already holds this value, so the machine re-reads instead of restoring the previous one.
+          committed: committedConfigCode(cause) !== undefined,
+        }),
     )
   }
 

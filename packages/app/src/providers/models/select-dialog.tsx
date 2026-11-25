@@ -15,7 +15,7 @@ import {
   untrack,
 } from "solid-js"
 import { createStore } from "solid-js/store"
-import { useLocal, type ModelSelection } from "@/providers/models/selection"
+import { useLocal, type ModelKey, type ModelSelection } from "@/providers/models/selection"
 import { isFreeModel } from "@/providers/models/models"
 import { useDialog } from "@opencode/ui/context/dialog"
 import { popularProviders } from "@/providers/catalog/providers"
@@ -83,6 +83,10 @@ const favoriteKeybind = parseKeybind("mod+f")
 
 const modelKey = (model: ModelItem) => `${model.provider.id}:${model.id}`
 
+// The key of the fallback picker's "None" row. It is an action rather than a model, and no `provider:model` key can
+// collide with it, so the row needs no identity of its own (FR-012).
+const NONE_KEY = "none"
+
 const sortModelGroups = (a: { category: string; items: ModelItem[] }, b: { category: string; items: ModelItem[] }) => {
   const aIndex = popularProviders.indexOf(a.category)
   const bIndex = popularProviders.indexOf(b.category)
@@ -104,6 +108,14 @@ const ModelList: Component<{
   provider?: string
   onSelect: () => void
   model?: ModelState
+  /** The model held in the other slot, offered as a normal row even when the user hid it (FR-024/FR-033). */
+  include?: () => ModelKey | undefined
+  /**
+   * This picker acts on the fallback slot, so it offers the "None" action row. Its presence is what adds the row;
+   * the callback answers whether fallback is off NOW, which is what makes that row the current selection. Absent
+   * keeps the primary picker exactly as it was: no "None" row (FR-012/FR-013).
+   */
+  none?: () => boolean
 }> = (props) => {
   const language = useLanguage()
   const usage = createModelUsage({ refresh: true })
@@ -112,6 +124,8 @@ const ModelList: Component<{
     model: props.model,
     provider: () => props.provider,
     onSelect: props.onSelect,
+    include: props.include,
+    none: props.none,
   })
 
   const [store, setStore] = createStore<{
@@ -148,10 +162,14 @@ const ModelList: Component<{
 
   let scrollRef: HTMLDivElement | undefined
 
+  // Arrow keys, the initial row and a new query all step through this key list. The "None" row leads it when this
+  // picker acts on the fallback slot: it is an action, so no search text filters it out and no variant or favorite
+  // affordance belongs to it (FR-012 read with FR-022).
+  const activeKeys = () => [...(controller.none ? [NONE_KEY] : []), ...visibleModels().map(modelKey)]
+
   const setSearch = (value: string) => {
     setStore("search", value)
-    const first = visibleModels()[0]
-    setStore("active", first ? modelKey(first) : "")
+    setStore("active", activeKeys()[0] ?? "")
   }
 
   createEffect(
@@ -166,7 +184,7 @@ const ModelList: Component<{
   )
 
   const moveActive = (delta: number) => {
-    const keys = visibleModels().map(modelKey)
+    const keys = activeKeys()
 
     if (keys.length === 0) return
     const index = keys.indexOf(store.active)
@@ -180,6 +198,12 @@ const ModelList: Component<{
   }
 
   const selectActive = () => {
+    if (store.active === NONE_KEY) {
+      controller.none?.select()
+
+      return
+    }
+
     const item = visibleModels().find((item) => modelKey(item) === store.active)
 
     if (item) controller.select(item)
@@ -229,6 +253,37 @@ const ModelList: Component<{
             </button>
           )}
         </For>
+      </SettingsList>
+    )
+  }
+
+  // The fallback slot's "None" action, shaped like a model row and marked current while fallback is off. It carries no
+  // model tooltip, no variant flyout and no favorite action: it names an action, never a model (FR-012).
+  function NoneRow(props: { current: () => boolean; select: () => void }) {
+    return (
+      <SettingsList variant="catalog">
+        <button
+          type="button"
+          data-component="settings-row"
+          data-option-key={NONE_KEY}
+          aria-pressed={props.current()}
+          class="-mx-4 w-[calc(100%+32px)] px-4 text-start first:rounded-t-lg last:rounded-b-lg hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none"
+          classList={{ "bg-v2-overlay-simple-overlay-hover": store.active === NONE_KEY }}
+          onMouseEnter={() => setStore("active", NONE_KEY)}
+          onMouseLeave={() => setStore("active", "")}
+          onClick={() => props.select()}
+        >
+          <div data-slot="settings-row-copy">
+            <div data-slot="settings-row-title" class="flex items-center gap-2">
+              <span class="min-w-0 truncate">{language.t("ui.sessionTurn.status.fallback.none")}</span>
+            </div>
+          </div>
+          <div data-slot="settings-row-control" class="size-4">
+            <Show when={props.current()}>
+              <Icon name="check" class="shrink-0 text-v2-icon-icon-base" />
+            </Show>
+          </div>
+        </button>
       </SettingsList>
     )
   }
@@ -283,6 +338,9 @@ const ModelList: Component<{
           class="settings-panel settings-models pt-1 pb-4"
           classList={{ "h-full px-4": !props.mobile, "max-h-[min(360px,40dvh)]": props.mobile }}
         >
+          <Show when={controller.none}>
+            {(none) => <NoneRow current={none().current} select={none().select} />}
+          </Show>
           <Show
             when={models().length > 0}
             fallback={<div class="settings-models-status">{language.t("dialog.model.empty")}</div>}
@@ -312,6 +370,8 @@ export function ModelSelectorDrawer(props: {
   model?: ModelState
   trigger: ModelSelectorTrigger
   onClose?: () => void
+  include?: () => ModelKey | undefined
+  none?: () => boolean
 }) {
   const dialog = useDialog()
   const location = useWorkspaceLocation()
@@ -320,6 +380,7 @@ export function ModelSelectorDrawer(props: {
     model: props.model,
     provider: () => props.provider,
     onSelect: () => props.onClose?.(),
+    include: props.include,
   })
 
   const chatgptPlan = createChatgptPlan(controller.current)
@@ -341,6 +402,8 @@ export function ModelSelectorDrawer(props: {
       model={props.model}
       provider={props.provider}
       onConnect={connect}
+      include={props.include}
+      none={props.none}
       chatgptPlan={chatgptPlan()}
       onClose={() => props.onClose?.()}
     />
@@ -355,6 +418,10 @@ function ModelDrawer(props: {
   onClose: () => void
   onManage: () => void
   onConnect?: () => void
+  /** Forwarded to the drawer's own list: the other slot's model as a row, and this slot's "None" action. Both are
+   *  the picker's business, so the drawer has to pass them on rather than rebuild the list without them. */
+  include?: () => ModelKey | undefined
+  none?: () => boolean
 }) {
   const language = useLanguage()
   const [drawer, setDrawer] = createSignal(createModelDrawerState())
@@ -427,6 +494,8 @@ function ModelDrawer(props: {
                   open={selectDrawerOpen(drawer())}
                   model={props.model}
                   provider={props.provider}
+                  include={props.include}
+                  none={props.none}
                   onSelect={() => dispatch({ type: "action.selected", action: "select" })}
                 />
               </div>
@@ -475,15 +544,35 @@ function createModelSelectorController(input: {
   provider: () => string | undefined
   model?: ModelState
   onSelect: () => void
+  /** The model held in the other slot, offered here as a normal row even when the user hid it (FR-024/FR-033). */
+  include?: () => ModelKey | undefined
+  /** Given to a picker acting on the fallback slot: it offers the "None" row, and this says whether fallback is off. */
+  none?: () => boolean
 }) {
   const model = input.model ?? useLocal().model
 
-  const allModels = createMemo(() =>
-    model
+  // Offered, not revealed: this changes nothing about the model's stored visibility, which is the composer's business
+  // only while it exchanges (FR-033).
+  const included = createMemo(() => {
+    const key = input.include?.()
+
+    if (!key) return
+
+    return model.list().find((item) => item.provider.id === key.providerID && item.id === key.modelID)
+  })
+
+  const allModels = createMemo(() => {
+    const extra = included()
+
+    return model
       .list()
-      .filter((item) => model.visible({ modelID: item.id, providerID: item.provider.id }))
-      .filter((item) => (input.provider() ? item.provider.id === input.provider() : true)),
-  )
+      .filter(
+        (item) =>
+          (extra && item.provider.id === extra.provider.id && item.id === extra.id) ||
+          model.visible({ modelID: item.id, providerID: item.provider.id }),
+      )
+      .filter((item) => (input.provider() ? item.provider.id === input.provider() : true))
+  })
 
   return {
     all: () => model.list().filter((item) => (input.provider() ? item.provider.id === input.provider() : true)),
@@ -511,12 +600,34 @@ function createModelSelectorController(input: {
       return value ? modelKey(value) : undefined
     },
     select: (item: ModelItem, variant?: string | null) => {
-      model.set({ modelID: item.id, providerID: item.provider.id }, { recent: true })
-
-      if (variant !== undefined) model.variant.set(variant ?? undefined)
+      // One intent named at the call site: the row (and the flyout option that leads a row click) says which variant
+      // this model should wear, so the value travels WITH the model write rather than after it. A caller that names
+      // `Default` says so with an explicit null; a plain row click names nothing and leaves the variant to what that
+      // model has recorded. This is what lets a wrapped slot tell its own follow-up apart from a later action (FR-036
+      // read with FR-018), and it is one save rather than two for the config-owned slot.
+      model.set(
+        { modelID: item.id, providerID: item.provider.id },
+        // Two shapes, not one with a hole: no `variant` key leaves the model's recorded variant alone, a present key
+        // (an explicit `null` for `Default`) says what to write. `set` reads the key's presence with `Object.hasOwn`.
+        variant === undefined ? { recent: true } : { recent: true, variant },
+      )
       input.onSelect()
     },
     variant: (item: ModelItem) => model.variant.current({ providerID: item.provider.id, modelID: item.id }),
+    // The "None" row's affordance, present only for a picker that was given one. It acts on this slot alone: the
+    // owner persists an explicit `fallback: null` for `set(undefined)`, the primary slot's model and variant stay
+    // untouched, and the picker closes exactly as a row click closes it. No model identity is manufactured, and the
+    // primary picker never gains the row (FR-012 read with FR-013).
+    none:
+      input.none === undefined
+        ? undefined
+        : {
+            current: input.none,
+            select: () => {
+              model.set(undefined)
+              input.onSelect()
+            },
+          },
     favorites: () => model.favorite.list().filter((item) => !input.provider() || item.provider.id === input.provider()),
     recent: () =>
       model
@@ -589,7 +700,8 @@ const clamp = (value: number) => Math.max(0, Math.min(1, value))
 
 const round = (value: number) => Math.round(value * 1000) / 1000
 
-type ModelRow = { id: string; item: ModelItem; group: ModelGroup }
+/** A row of the desktop picker: a model, or the fallback slot's "None" action, which has no model to name. */
+type ModelRow = { id: string; item: ModelItem | undefined; group: ModelGroup }
 
 function createChatgptPlan(current: () => string | undefined) {
   const data = useData()
@@ -627,7 +739,19 @@ function ChatgptPlanFooter() {
   )
 }
 
-export function DialogSelectModel(props: { provider?: string; model?: ModelState }) {
+export function DialogSelectModel(
+  props: {
+    provider?: string
+    model?: ModelState
+    include?: () => ModelKey | undefined
+    /** The model held in the other slot, offered here as a normal row even when the user hid it (FR-024/FR-033). */
+    /**
+     * This picker acts on the fallback slot, so it offers the "None" row; the callback says whether fallback is off
+     * now, which is what makes that row the current selection. The primary picker gains no such row (FR-012/FR-013).
+     */
+    none?: () => boolean
+  },
+) {
   const dialog = useDialog()
   const language = useLanguage()
 
@@ -635,6 +759,8 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
     model: props.model,
     provider: () => props.provider,
     onSelect: () => dialog.close(),
+    include: props.include,
+    none: props.none,
   })
 
   const labels = createProviderLabels(controller.all)
@@ -664,8 +790,18 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
     })
   })
 
+  // A picker acting on the fallback slot leads the list with its "None" action, in a section with no provider header:
+  // an action rather than a result, so the search text never filters it out and it is never deduped against a model.
+  const noneRows: ModelRow[] =
+    controller.none === undefined
+      ? []
+      : [{ id: NONE_KEY, item: undefined, group: { category: NONE_KEY, items: [] } }]
+
   const rows = createMemo(() =>
-    groups().flatMap((group) => group.items.map((item): ModelRow => ({ id: modelKey(item), item, group }))),
+    [
+      ...noneRows,
+      ...groups().flatMap((group) => group.items.map((item): ModelRow => ({ id: modelKey(item), item, group }))),
+    ],
   )
 
   const rowItem = (id: string) => rows().find((row) => row.id === id)?.item
@@ -936,7 +1072,8 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
     }
 
     if (matchKeybind(favoriteKeybind, event)) {
-      if (!active) return
+      // A favorite is a model's: the "None" row has no favorite action to toggle.
+      if (!active?.item) return
       event.preventDefault()
       toggleFavorite(active.item, "keyboard")
 
@@ -955,20 +1092,31 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
     // While searching, the forward arrow edits the query until the arrows have moved through the results.
     const forward = language.direction() === "rtl" ? "ArrowLeft" : "ArrowRight"
 
-    if (event.key === forward && active && (!query.search || query.navigated)) {
+    // Only a model row has a variant menu: the "None" row takes its action with Enter and opens no flyout, so the
+    // forward arrow stays with the query there (FR-012 read with FR-022).
+    const menuRow = active?.item
+
+    if (event.key === forward && menuRow && (!query.search || query.navigated)) {
       event.preventDefault()
-      const options = menuOptions(active.item)
+      const options = menuOptions(menuRow)
       dispatch({
         type: "menu.entered",
         id: active.id,
-        index: Math.max(0, options.indexOf(controller.variant(active.item))),
+        index: Math.max(0, options.indexOf(controller.variant(menuRow))),
       })
     }
   }
 
   const Row = (row: { model: ModelRow; attrs: SearchListRow }) => {
     const item = () => row.model.item
-    const selected = () => controller.current() === modelKey(item())
+
+    // The "None" row is current while fallback is off, and wears no variant label: only a model row has a variant.
+    const selected = () => {
+      const model = item()
+
+      return model ? controller.current() === modelKey(model) : controller.none?.current() === true
+    }
+
     const active = () => row.attrs["data-active"] !== undefined
 
     return (
@@ -1007,39 +1155,50 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
             <Icon name="check" />
           </Show>
         </span>
-        <span data-slot="model-dialog-name">
-          <span class="min-w-0 truncate">
-            <SearchHighlight text={item().name} />
-          </span>
-          {/* Favorites and Recent mix providers, so their rows name one, with its workspace when its header has one. */}
-          <Show when={row.model.group.title}>
-            <span class="min-w-0 shrink-[999] truncate text-v2-text-text-faint">{labels.name(item().provider)}</span>
-            <Show when={labels.workspace(item().provider)}>
-              {(workspace) => <Badge class="shrink-0">{workspace()}</Badge>}
-            </Show>
-          </Show>
-          <Show when={isFreeModel(item())}>
-            <Badge class="shrink-0">{language.t("model.tag.free")}</Badge>
-          </Show>
-          <Show when={item().latest}>
-            <Badge class="shrink-0">{language.t("model.tag.latest")}</Badge>
-          </Show>
-        </span>
-        {/* The active row shows its variant instead; its flyout leads with the budget. */}
-        <Show when={!active() && usage(item())}>
-          {(value) => (
-            <span data-slot="model-dialog-variant">
-              <ModelUsageTag usage={value()} />
-              {/* Holds the chevron's space, so the tag ends where the active row's variant label does. */}
-              <Icon name="chevron-right" class="invisible" />
-            </span>
+        {/* A model row names itself, its provider where a section mixes them, and wears its variant or its budget.
+            The "None" row names the action it takes and nothing else: no provider, no variant, no budget (FR-012). */}
+        <Show
+          when={item()}
+          fallback={<span data-slot="model-dialog-name" class="min-w-0 truncate">{language.t("ui.sessionTurn.status.fallback.none")}</span>}
+        >
+          {(model) => (
+            <>
+              <span data-slot="model-dialog-name">
+                <span class="min-w-0 truncate">
+                  <SearchHighlight text={model().name} />
+                </span>
+                {/* Favorites and Recent mix providers, so their rows name one, with its workspace when its header has one. */}
+                <Show when={row.model.group.title}>
+                  <span class="min-w-0 shrink-[999] truncate text-v2-text-text-faint">{labels.name(model().provider)}</span>
+                  <Show when={labels.workspace(model().provider)}>
+                    {(workspace) => <Badge class="shrink-0">{workspace()}</Badge>}
+                  </Show>
+                </Show>
+                <Show when={isFreeModel(model())}>
+                  <Badge class="shrink-0">{language.t("model.tag.free")}</Badge>
+                </Show>
+                <Show when={model().latest}>
+                  <Badge class="shrink-0">{language.t("model.tag.latest")}</Badge>
+                </Show>
+              </span>
+              {/* The active row shows its variant instead; its flyout leads with the budget. */}
+              <Show when={!active() && usage(model())}>
+                {(value) => (
+                  <span data-slot="model-dialog-variant">
+                    <ModelUsageTag usage={value()} />
+                    {/* Holds the chevron's space, so the tag ends where the active row's variant label does. */}
+                    <Icon name="chevron-right" class="invisible" />
+                  </span>
+                )}
+              </Show>
+              <Show when={active()}>
+                <span data-slot="model-dialog-variant">
+                  <span class="truncate capitalize">{controller.variant(model()) ?? language.t("common.default")}</span>
+                  <Icon name="chevron-right" />
+                </span>
+              </Show>
+            </>
           )}
-        </Show>
-        <Show when={active()}>
-          <span data-slot="model-dialog-variant">
-            <span class="truncate capitalize">{controller.variant(item()) ?? language.t("common.default")}</span>
-            <Icon name="chevron-right" />
-          </span>
         </Show>
       </button>
     )
@@ -1111,16 +1270,24 @@ export function DialogSelectModel(props: { provider?: string; model?: ModelState
             items={rows()}
             key={(row) => row.id}
             section={(row) => row.group.category}
-            header={(row) => (
-              <span data-slot="model-dialog-header-label" class="flex min-w-0 items-center gap-1.5">
-                <span class="min-w-0 truncate">{row.group.title ?? labels.name(row.item.provider)}</span>
-                <Show when={!row.group.title && labels.workspace(row.item.provider)}>
-                  {(workspace) => <Badge class="shrink-0">{workspace()}</Badge>}
-                </Show>
-              </span>
-            )}
+            header={(row) =>
+              // The "None" section has no header: the row names its own action, and a header would repeat it or
+              // invent a provider that no model belongs to (FR-012).
+              row.item ? (
+                <span data-slot="model-dialog-header-label" class="flex min-w-0 items-center gap-1.5">
+                  <span class="min-w-0 truncate">{row.group.title ?? labels.name(row.item.provider)}</span>
+                  <Show when={!row.group.title && labels.workspace(row.item.provider)}>
+                    {(workspace) => <Badge class="shrink-0">{workspace()}</Badge>}
+                  </Show>
+                </span>
+              ) : undefined
+            }
             empty={language.t("dialog.model.empty")}
-            onSelect={(row) => controller.select(row.item)}
+            onSelect={(row) => {
+              // Enter or a click on the "None" row takes its action instead of naming a model (FR-012).
+              if (!row.item) controller.none?.select()
+              else controller.select(row.item)
+            }}
             onKeyDown={onKeyDown}
           >
             {(row, attrs) => <Row model={row()} attrs={attrs} />}

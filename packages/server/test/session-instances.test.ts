@@ -20,6 +20,7 @@ import { AbsolutePath } from "@opencode/schema/schema"
 import { LayerNode } from "@opencode/util/effect/layer-node"
 import { makeGlobalNode } from "@opencode/util/effect/app-node"
 import { Global } from "@opencode/util/global"
+import { verifyTlsCaMode } from "@opencode/util/tls-ca"
 import { Context, Duration, Effect, Layer, LayerMap, RcMap, Schema } from "effect"
 import { HttpEffect, HttpRouter, HttpServer } from "effect/http"
 import { LanguageModel, LLMClient } from "../../ai/src/effect"
@@ -29,6 +30,10 @@ import { tempGlobalLayer } from "../../core/test/fixture/global"
 import { tmpdirScoped } from "../../core/test/fixture/tmpdir"
 import { it } from "../../core/test/lib/effect"
 import { createEmbeddedRoutes } from "../src/routes"
+
+// The embedded routes build ServerInfo, which reads the verified TLS CA mode; each test file needs its own
+// verification because Bun gives every test file its own module state.
+verifyTlsCaMode("bundled")
 
 it.live(
   "isolates same-directory Session tools, hooks, commands, and HTTP requests through one selector",

@@ -227,6 +227,224 @@ describe("persistStore", () => {
     root.dispose()
   })
 
+  test("a failed save is reported with the store's own payload until that store saves again", () => {
+    let refuse = false
+    const writes: string[] = []
+
+    const root = createRoot((dispose) => {
+      const [store, setStore] = createStore<State>({ count: 0, label: "" })
+
+      const persist = persistStore({
+        store,
+        setStore,
+        name: "state",
+        storage: {
+          getItem: () => null,
+          setItem: (_key: string, value: string) => {
+            writes.push(value)
+
+            return refuse ? false : true
+          },
+          removeItem: () => {},
+        },
+        serialize: JSON.stringify,
+        deserialize: JSON.parse,
+        delay: 10_000,
+      })
+
+      return { set: persist.setStore, persist, dispose }
+    })
+
+    refuse = true
+    root.set("count", 1)
+    root.persist.flush()
+    expect(root.persist.failure()).toEqual({
+      id: 1,
+      attempted: JSON.stringify({ count: 1, label: "" }),
+      fallback: undefined,
+    })
+
+    // The next save of the same store lands, so nothing is left claiming a failure.
+    refuse = false
+    root.set("count", 2)
+    root.persist.flush()
+    expect(root.persist.failure()).toBeUndefined()
+
+    // A later refused save is a new observation, ordered after the one it replaced, and says what storage holds.
+    refuse = true
+    root.set("count", 3)
+    root.persist.flush()
+    expect(root.persist.failure()).toEqual({
+      id: 2,
+      attempted: JSON.stringify({ count: 3, label: "" }),
+      fallback: JSON.stringify({ count: 2, label: "" }),
+    })
+    root.dispose()
+  })
+
+  test("a save that lands answers an older rejected one instead of becoming a failure", async () => {
+    const requests: Array<{ resolve: (value: string) => void; reject: (reason: Error) => void }> = []
+
+    const root = createRoot((dispose) => {
+      const [store, setStore] = createStore<State>({ count: 0, label: "" })
+
+      const persist = persistStore({
+        store,
+        setStore,
+        name: "state",
+        storage: {
+          getItem: () => null,
+          setItem: (_key: string, value: string) => {
+            const request = Promise.withResolvers<string>()
+            requests.push(request)
+
+            return request.promise
+          },
+          removeItem: () => {},
+        },
+        serialize: JSON.stringify,
+        deserialize: JSON.parse,
+        delay: 10_000,
+      })
+
+      return { set: persist.setStore, persist, dispose }
+    })
+
+    root.set("count", 1)
+    root.persist.flush()
+    root.set("count", 2)
+    root.persist.flush()
+    expect(root.persist.failure()).toBeUndefined()
+
+    // The first write's rejection arrives after a newer write was issued, so it is not this store's fact.
+    requests[0]!.reject(new Error("unavailable"))
+    await Promise.resolve()
+    expect(root.persist.failure()).toBeUndefined()
+
+    requests[1]!.reject(new Error("unavailable"))
+    await Promise.resolve()
+    expect(root.persist.failure()?.attempted).toBe(JSON.stringify({ count: 2, label: "" }))
+
+    root.set("count", 3)
+    root.persist.flush()
+    requests[2]!.resolve(JSON.stringify({ count: 3, label: "" }))
+    await Promise.resolve()
+    expect(root.persist.failure()).toBeUndefined()
+    root.dispose()
+  })
+
+  test("an older rejected save cannot move this store's own machine state", async () => {
+    const requests: Array<{ resolve: (value: string) => void; reject: (reason: Error) => void }> = []
+
+    const root = createRoot((dispose) => {
+      const [store, setStore] = createStore<State>({ count: 0, label: "" })
+
+      const persist = persistStore({
+        store,
+        setStore,
+        name: "state",
+        storage: {
+          getItem: () => null,
+          setItem: (_key: string, value: string) => {
+            const request = Promise.withResolvers<string>()
+            requests.push(request)
+
+            return request.promise
+          },
+          removeItem: () => {},
+        },
+        serialize: JSON.stringify,
+        deserialize: JSON.parse,
+        delay: 10_000,
+      })
+
+      return { set: persist.setStore, persist, dispose }
+    })
+
+    const stored = (count: number) => JSON.stringify({ count, label: "" })
+
+    root.set("count", 1)
+    root.persist.flush()
+    root.set("count", 2)
+    root.persist.flush()
+    requests[1]!.resolve(stored(2))
+    await Promise.resolve()
+    expect(root.persist.state()).toEqual({ status: "clean", last: stored(2) })
+
+    // The first write's rejection arrives later. It changes no state, records no failure, and issues no write: the
+    // machine's own `last !== attempted` rule already ignores it, and `persist-machine.test.ts` keeps that rule.
+    requests[0]!.reject(new Error("unavailable"))
+    await Promise.resolve()
+    expect(root.persist.state()).toEqual({ status: "clean", last: stored(2) })
+    expect(root.persist.failure()).toBeUndefined()
+
+    // Disposing mid-test would hide a queued write, so end the store cleanly.
+    root.dispose()
+  })
+
+  test("an older rejected save cannot roll back a later save that repeated its value", async () => {
+    const requests: Array<{ resolve: (value: string) => void; reject: (reason: Error) => void }> = []
+
+    const root = createRoot((dispose) => {
+      const [store, setStore] = createStore<State>({ count: 0, label: "" })
+
+      const persist = persistStore({
+        store,
+        setStore,
+        name: "state",
+        storage: {
+          getItem: () => null,
+          setItem: (_key: string, value: string) => {
+            const request = Promise.withResolvers<string>()
+            requests.push(request)
+
+            return request.promise
+          },
+          removeItem: () => {},
+        },
+        serialize: JSON.stringify,
+        deserialize: JSON.parse,
+        delay: 10_000,
+      })
+
+      return { set: persist.setStore, persist, dispose }
+    })
+
+    const stored = (count: number) => JSON.stringify({ count, label: "" })
+
+    // The first write is left in flight and never lands, so its rejection can only arrive after later saves.
+    root.set("count", 1)
+    root.persist.flush()
+    root.set("count", 2)
+    root.persist.flush()
+    requests[1]!.resolve(stored(2))
+    root.set("count", 1)
+    root.persist.flush()
+    await Promise.resolve()
+    expect(root.persist.state()).toEqual({ status: "clean", last: stored(1) })
+
+    // Storage never held this attempt's value any more, and the machine cannot tell that apart here, because a later
+    // save repeated the exact text: only the driver's attempt check keeps the rollback from rewriting `last` to a value
+    // storage stopped holding, which is what makes the next save of that text write again instead of adopting it.
+    requests[0]!.reject(new Error("unavailable"))
+    await Promise.resolve()
+    expect(root.persist.state()).toEqual({ status: "clean", last: stored(1) })
+    expect(root.persist.failure()).toBeUndefined()
+
+    // Dirty/save ordering follows that state: the store is still clean at that text, so a flush writes nothing, and
+    // the next edit writes exactly once.
+    root.persist.flush()
+    await Promise.resolve()
+    expect(requests.length).toBe(3)
+
+    root.set("count", 3)
+    root.persist.flush()
+    await Promise.resolve()
+    expect(requests.length).toBe(4)
+
+    root.dispose()
+  })
+
   test("disposing the owner and flushPersisted both save pending changes", () => {
     const first = setup({ delay: 10_000 })
     first.set("count", 1)

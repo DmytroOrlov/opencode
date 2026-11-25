@@ -1,12 +1,13 @@
 import path, { dirname, isAbsolute, join, relative, sep } from "path"
 import { realpathSync } from "fs"
 import { lookup } from "mime-types"
-import { Context, Effect, FileSystem, Layer, Schema } from "effect"
+import { Context, Effect, FileSystem, Layer, Option, Schema } from "effect"
 import type { PlatformError } from "effect/PlatformError"
 import { Glob } from "./glob.js"
 import { makeGlobalNode } from "./effect/app-node.js"
 import { filesystem } from "./effect/app-node-platform.js"
 import { sameDirectory } from "./path.js"
+import { localBackingNamespace, namespaceOf } from "./filesystem-provenance.js"
 
 export namespace FSUtil {
   export class FileSystemError extends Schema.TaggedError<FileSystemError>()("FileSystemError", {
@@ -48,6 +49,63 @@ export namespace FSUtil {
   }
 
   export class Service extends Context.Service<Service, Interface>()("@opencode/FSUtil") {}
+
+  /** The SAME filesystem that Config.update uses for its actual writes. */
+  export interface ConfigResourceIdentity {
+    readonly namespace: object
+    /** Strict, existing canonical path; also rebind this path into Global for the host. */
+    readonly directory: string
+    /** Stable directory-entry namespace, NOT the inode of opencode.json/jsonc. */
+    readonly directoryKey: string
+  }
+
+  export const identifyConfigResource = (
+    fs: Interface,
+    configDirectory: string,
+  ): Effect.Effect<ConfigResourceIdentity, Error> =>
+    Effect.gen(function* () {
+      const namespace = namespaceOf(fs)
+      if (!namespace)
+        return yield* Effect.fail(
+          new FileSystemError({
+            method: "identifyConfigResource",
+            cause: new globalThis.Error("Config filesystem has no proven backing namespace"),
+          }),
+        )
+
+      // Unlike FSUtil.resolve, realPath MUST NOT swallow NotFound/permission failures here.
+      const target = path.resolve(windowsPath(configDirectory))
+      yield* fs.ensureDir(target)
+      const directory = yield* fs.realPath(target)
+      const info = yield* fs.stat(directory)
+      if (info.type !== "Directory")
+        return yield* Effect.fail(
+          new FileSystemError({
+            method: "identifyConfigResource",
+            cause: new globalThis.Error(`Config resource is not a directory: ${directory}`),
+          }),
+        )
+
+      // dev/ino are directory identity, stable across atomic replacement of a leaf file.
+      // FileSystem.File.Info reports `dev` as a required bigint and `ino` as an Option: an unproven inode (or a
+      // backing store that reports neither) must never fall back to a bare path key outside the local OS namespace.
+      const ino = Option.isOption(info.ino) ? Option.getOrNull(info.ino) : null
+      const dev = typeof info.dev === "bigint" ? info.dev : undefined
+      const directoryKey =
+        ino !== null && dev !== undefined
+          ? `inode:${String(dev)}:${String(ino)}`
+          : namespace === localBackingNamespace
+            ? `realpath:${directory}`
+            : undefined
+      if (!directoryKey)
+        return yield* Effect.fail(
+          new FileSystemError({
+            method: "identifyConfigResource",
+            cause: new globalThis.Error("Config filesystem cannot prove stable directory identity"),
+          }),
+        )
+      return { namespace, directory, directoryKey }
+    })
 
   // Exported so simulation can wrap this layer and override the methods that
   // bypass the injected FileSystem (scan, globUp).

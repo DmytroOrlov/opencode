@@ -73,8 +73,8 @@ export function SearchList<T>(props: {
   section?: (item: T) => string
   /** Rows that show the same thing in two sections. ↑/↓ step past a copy, so the highlight always lands somewhere new. */
   same?: (a: T, b: T) => boolean
-  /** A section's header, from its first row. */
-  header?: (item: T) => JSX.Element
+  /** A section's header, from its first row. Nothing for a section that needs none, such as a lone action row. */
+  header?: (item: T) => JSX.Element | undefined
   /** Shown in place of the rows when there are none. */
   empty: JSX.Element
   /** A note beneath the rows, such as a hint that more results are hidden. */

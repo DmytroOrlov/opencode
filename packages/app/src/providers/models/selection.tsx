@@ -2,7 +2,7 @@ import { createSimpleContext } from "@opencode/ui/context"
 import { base64Encode } from "@opencode/util/encode"
 import { useParams } from "@solidjs/router"
 import { batch, createEffect, createMemo, createRoot, createSignal, onCleanup, untrack } from "solid-js"
-import { Predicate, Schema, SchemaGetter } from "effect"
+import { Option, Predicate, Schema, SchemaGetter } from "effect"
 import { useModels } from "@/providers/models/models"
 import { useSettings } from "@/settings/model"
 import { useProviders } from "@/providers/catalog/providers"
@@ -31,17 +31,25 @@ import {
   durableVariantSelection,
   getConfiguredAgentVariant,
   INHERIT_VARIANT,
+  recordedVariant,
   resolveModelVariant,
   variantSelectionFrom,
   type VariantSelection,
 } from "./variant"
 import { useWorkspaceLocation } from "@/workspaces/location"
 import { pathKey } from "@/workspaces/path-key"
-import { useData } from "@/runtime/server/current"
+import { useData, useServer } from "@/runtime/server/current"
 import { normalizeAgentList } from "@/runtime/server/global-sync/utils"
 import { useServerSDK } from "@/runtime/server/client"
 import { ScopedKey, type ServerScope } from "@/runtime/server/scope"
 import { useConfiguredModel } from "./configured"
+import { ConfigModel } from "@opencode/schema/config/model"
+import { useLanguage } from "@/runtime/i18n/language"
+import { showToast } from "@/shell/notifications/toast"
+import { formatServerError } from "@/runtime/server/errors"
+import { Model } from "@opencode/schema/model"
+import { Provider } from "@opencode/schema/provider"
+import { fallbackUpdateState } from "./fallback-update"
 
 const ModelKeySchema = Schema.Struct({
   providerID: Schema.String,
@@ -165,7 +173,7 @@ function acquireWorkspace(scope: ServerScope, directory: string, platform: Platf
 
 function openWorkspace(key: string, scope: ServerScope, directory: string, platform: Platform) {
   return createRoot((dispose) => {
-    const [saved, setSaved, , savedReady] = persisted(
+    const [saved, setSaved, , savedReady, savedFailure] = persisted(
       Persist.serverWorkspace(scope, directory, "model-selection"),
       ModelSelectionSchema,
       { session: {} },
@@ -248,6 +256,8 @@ function openWorkspace(key: string, scope: ServerScope, directory: string, platf
       state,
       dispatch,
       ready: () => state().status === "ready",
+      /** This workspace document's outstanding failed save, for whoever wants to learn a record did not land. */
+      failure: savedFailure,
       /** Whether any provider shows the Session now. */
       visible: (sessionID: string) => viewers.has(sessionID),
       view(sessionID: string) {
@@ -561,6 +571,11 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       ready: Object.assign(() => models.ready() && configuredModel.ready(), { promise: models.ready.promise }),
       key,
       preview,
+      /**
+       * This workspace's model-selection document has an outstanding failed save: what it attempted and what storage
+       * still holds. Scoped to the whole document, so it is evidence about a value, never about which edit failed.
+       */
+      recordFailure: () => workspace().failure(),
       current,
       recent,
       favorite: { list: favorite, toggle: models.favorite.toggle },
@@ -604,11 +619,16 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
         if (!entry) return
         model.set({ providerID: entry.provider.id, modelID: entry.id })
       },
-      set(item: ModelKey | undefined, options?: { recent?: boolean }) {
+      /** The guard this slot answers for itself: the driver asks it before writing, instead of guessing one rule. */
+      valid: validModel,
+      set(item: ModelKey | undefined, options?: { recent?: boolean; variant?: string | null }) {
         batch(() => {
           if (item && !validModel(item)) return
           const previous = current()
           const same = item && previous?.provider.id === item.providerID && previous.id === item.modelID
+          // The key's presence is the boundary: a caller that names the variant says so with `variant` (an explicit
+          // `null` is the user's own `Default`), and that write belongs to the model write, not to a later action.
+          const named = options !== undefined && Object.hasOwn(options, "variant")
 
           if (!item) {
             edit({ type: "model", agent: agent.current()?.name, choice: undefined })
@@ -616,10 +636,21 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
             return
           }
 
-          choose(item, same ? durableVariantSelection(model.variant.current()) : INHERIT_VARIANT)
+          // Selecting a model keeps the variant recorded for that model, never the replaced model's or the other slot's.
+          choose(
+            item,
+            named
+              ? durableVariantSelection(options?.variant ?? undefined)
+              : same
+                ? durableVariantSelection(model.variant.current())
+                : recordedVariant(models, item),
+          )
 
-          // A session selection owns its variant even when preferences change in another session.
-          if (id() && !same) choose(item, durableVariantSelection(model.variant.current()))
+          // A session selection owns its variant even when preferences change in another session. A variant named by
+          // this call is that selection, so the second write records it for the model as well.
+          if (id() && !same && !named) choose(item, durableVariantSelection(model.variant.current()))
+
+          if (named) models.variant.set(item, options?.variant ?? undefined)
           models.setVisibility(item, true)
 
           if (!options?.recent) return
@@ -730,5 +761,186 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
   },
 })
 
-export type ModelSelection = Omit<ReturnType<typeof useLocal>["model"], "trackSessionCommit" | "preview"> &
-  Partial<Pick<ReturnType<typeof useLocal>["model"], "trackSessionCommit" | "preview">>
+// `trackSessionCommit`, `preview`, `recordFailure` and `valid` are optional here: owners that already hold their own
+// values (a draft's prompt state, the global fallback config) answer them only where they have such a record or a guard
+// of their own. `valid` is what a pair coordinator asks a slot before writing, because the guards differ per slot.
+export type ModelSelection = Omit<ReturnType<typeof useLocal>["model"], "trackSessionCommit" | "preview" | "recordFailure" | "valid"> &
+  Partial<
+    Pick<ReturnType<typeof useLocal>["model"], "trackSessionCommit" | "preview" | "recordFailure" | "valid">
+  >
+
+// A config without `fallback` still falls back: this model was the shipped default before the field existed, mirroring
+// ConfigFallback.LEGACY_MODEL_FALLBACK in the core package, which the browser cannot import.
+const LEGACY_FALLBACK: ConfigModel.Selection = {
+  providerID: Provider.ID.make("mlx"),
+  model: Model.ID.make("qwen3.8-27b"),
+  variant: Model.VariantID.make("xhigh"),
+}
+
+type FallbackSelection = ModelSelection & {
+  /** False only when fallback is explicitly disabled; absent or unparseable config still offers the legacy model. */
+  enabled: () => boolean
+  /**
+   * Unlike the primary selection, `undefined` persists an explicit null so the field disables instead of clearing.
+   * `failed` replaces the default toast for one write, which is how a pair owner learns its fallback half was rejected.
+   */
+  set: (
+    item: ModelKey | undefined,
+    options?: { recent?: boolean; variant?: string | null; failed?: (cause: unknown) => void },
+  ) => void
+}
+
+/** The global fallback lives in config, beside every composer, not inside a Session's model selection. */
+export function createFallbackModelSelection(): FallbackSelection {
+  const models = useModels()
+  const server = useServer()
+  const language = useLanguage()
+  const fallbackUpdate = fallbackUpdateState<ConfigModel.Selection | null>(
+    server.ctx.sync,
+    (value) => server.ctx.sync.updateConfig({ fallback: value }),
+    // The sync layer's own config read: what a durable-but-unconfirmed write answers from.
+    () => server.ctx.sync.refreshConfig(),
+  )
+  const optimistic = fallbackUpdate.optimistic
+
+  const raw = () => {
+    const update = optimistic()
+
+    return update ? update.value : server.ctx.sync.data.config.fallback
+  }
+  const configured = () => {
+    const value = raw()
+
+    if (value === null) return undefined
+    if (value === undefined) return LEGACY_FALLBACK
+    return Option.getOrUndefined(Schema.decodeUnknownOption(ConfigModel.Selection)(value))
+  }
+  const key = createMemo<ModelKey | undefined>(() => {
+    const item = configured()
+
+    return item ? { providerID: item.providerID, modelID: item.model } : undefined
+  })
+  const current = createMemo(() => {
+    const item = key()
+
+    if (!item) return
+    return models.find(item)
+  })
+
+  const reported = (cause: unknown) =>
+    showToast({
+      title: language.t("common.requestFailed"),
+      description: formatServerError(cause, language.t),
+    })
+
+  /** One config write and its outcome. Callers that act on a pair pass their own `failed`; the default tells the user. */
+  const save = (value: ConfigModel.Selection | null, failed: (cause: unknown) => void = reported) =>
+    fallbackUpdate.save(value, failed)
+
+  const recent = createMemo(() =>
+    models.recent.list().map(models.find).filter((item): item is NonNullable<typeof item> => !!item),
+  )
+
+  const favorite = createMemo(() =>
+    models.favorite.list().map(models.find).filter((item): item is NonNullable<typeof item> => !!item),
+  )
+
+  // The config names a variant outright, so there is nothing to inherit: an unknown name resolves to no variant.
+  const variant = {
+    configured: () => configured()?.variant,
+    current(item?: ModelKey) {
+      const model = item ? models.find(item) : current()
+
+      return resolveModelVariant({
+        variants: Object.keys(model?.variants ?? {}),
+        selected: durableVariantSelection(configured()?.variant),
+        configured: undefined,
+      })
+    },
+    list() {
+      const model = current()
+
+      if (!model?.variants) return []
+      return Object.keys(model.variants)
+    },
+    set(value: string | undefined, failed?: (cause: unknown) => void) {
+      const item = configured()
+
+      if (!item) return
+      // Rebuilt without the `variant` key rather than written as `undefined`: the schema's optional `variant` rejects an
+      // explicit `undefined`, which would make the optimistic value fail its own decode and read as unconfigured
+      // until the write lands. The optional `failed` is the same per-write outcome `set` offers, needed on both of a
+      // pair's saves because this owner reports only the newest revision's rejection.
+      save(
+        value
+          ? { providerID: item.providerID, model: item.model, variant: Model.VariantID.make(value) }
+          : { providerID: item.providerID, model: item.model },
+        failed,
+      )
+    },
+    cycle() {
+      const items = this.list()
+
+      if (items.length === 0) return
+      this.set(
+        cycleModelVariant({
+          variants: items,
+          selected: durableVariantSelection(this.current()),
+          configured: undefined,
+        }),
+      )
+    },
+  }
+
+  return {
+    enabled: () => raw() !== null,
+    ready: Object.assign(() => models.ready(), { promise: models.ready.promise }),
+    key,
+    current,
+    recent,
+    favorite: { list: favorite, toggle: models.favorite.toggle },
+    list: models.list,
+    cycle(direction: 1 | -1) {
+      const items = recent()
+      const item = current()
+
+      if (!item) return
+      const index = items.findIndex((entry) => entry.provider.id === item.provider.id && entry.id === item.id)
+      const next = items[((index === -1 ? 0 : index) + direction + items.length) % items.length]
+
+      if (!next) return
+      this.set({ providerID: next.provider.id, modelID: next.id }, { recent: true })
+    },
+    set(item: ModelKey | undefined, options?: {
+      recent?: boolean
+      variant?: string | null
+      failed?: (cause: unknown) => void
+    }) {
+      if (item && !models.find(item)) return
+      const previous = configured()
+      const same = item && previous?.providerID === item.providerID && previous.model === item.modelID
+      const selectedVariant =
+        options && Object.hasOwn(options, "variant") ? options.variant : same ? previous?.variant : undefined
+
+      const record = item ? { providerID: Provider.ID.make(item.providerID), model: Model.ID.make(item.modelID) } : null
+
+      // The key is omitted rather than written as `undefined`: `ConfigModel.Selection`'s optional `variant` rejects an
+      // explicit `undefined`, which would make the optimistic value fail its own decode and read as unconfigured until
+      // the write lands. A named variant rides along with the model write; no key leaves the record's variant unset.
+      save(
+        record && selectedVariant ? { ...record, variant: Model.VariantID.make(selectedVariant) } : record,
+        options?.failed,
+      )
+
+      if (item) {
+        models.setVisibility(item, true)
+        if (options?.recent) models.recent.push(item)
+      }
+    },
+    /** The guard this slot answers for itself: a model the catalog lacks cannot be the fallback, connected or not. */
+    valid: (item: ModelKey) => !!models.find(item),
+    visible: models.visible,
+    setVisibility: models.setVisibility,
+    variant,
+  }
+}

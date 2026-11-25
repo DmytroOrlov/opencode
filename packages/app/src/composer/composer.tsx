@@ -20,6 +20,39 @@ import {
   transitionModelChip,
   type ModelChipEvent,
 } from "./model-chip-machine"
+import type { ComposerFallbackStatus } from "@/session/composer/selection"
+import type { ModelKey, ModelSelection } from "@/providers/models/selection"
+
+/**
+ * What a chip says about a model it can identify while the workspace catalog cannot name it: the picker's existing
+ * unavailable affordance, `dialog.model.unavailable` (FR-020 read with FR-030 — the chip must still name the model
+ * identity, never go blank, because a blank chip hides a fallback that is configured). Undefined only when the slot
+ * knows no model at all, which is where each chip falls back to its own empty-state copy.
+ */
+function modelIdentity(selection: ModelSelection, language: ReturnType<typeof useLanguage>) {
+  const model = selection.current()
+
+  if (model) return model.name
+  const key = selection.key()
+
+  return key ? language.t("dialog.model.unavailable", { model: key.modelID }) : undefined
+}
+
+/**
+ * What the fallback chip says for each `ComposerFallbackStatus` (FR-029): the model recovery would use, that the
+ * fallback is off, or that it would repeat the primary model. Always derived from the status, never a stored label.
+ */
+function fallbackChipLabel(
+  status: ComposerFallbackStatus,
+  fallback: ModelSelection & { enabled: () => boolean },
+  language: ReturnType<typeof useLanguage>,
+) {
+  if (status === "model") return modelIdentity(fallback, language)
+
+  if (status === "off") return language.t("ui.sessionTurn.status.fallback.none")
+
+  return language.t("ui.sessionTurn.status.fallback.sameModel")
+}
 
 export function Composer(props: {
   class?: string
@@ -37,14 +70,10 @@ export function Composer(props: {
 
     if (preview) return preview.model
     const selection = props.model.model.selection
-    const model = selection.current()
 
-    if (model) return model.name
-    const key = selection.key()
-
-    if (key) return language.t("dialog.model.unavailable", { model: key.modelID })
-
-    return language.t("dialog.model.select.title")
+    // The identity rule is the chip's everywhere: a named model, else the catalog-missing affordance, else this
+    // composer's empty-state copy (`dialog.model.select.title`).
+    return modelIdentity(selection, language) ?? language.t("dialog.model.select.title")
   }
 
   const modelLabel = () => {
@@ -80,8 +109,18 @@ export function Composer(props: {
             keybind={command.keybindParts("model.choose")}
             model={props.model.model.selection}
             label={modelLabel()}
+            fallbackKey={props.model.model.fallback.key()}
             onClose={props.model.restoreFocus}
             onUnpaidClick={() => dialog.show(() => <DialogSelectModelUnpaid model={props.model.model.selection} />)}
+          />
+        }
+        fallbackControl={
+          <ComposerFallbackChip
+            loading={props.model.model.loading}
+            fallback={props.model.model.fallback}
+            status={props.model.model.fallbackStatus}
+            primaryKey={props.model.model.selection.key()}
+            onClose={props.model.restoreFocus}
           />
         }
       />
@@ -97,6 +136,8 @@ function ComposerModelControl(props: {
   keybind: string[]
   model: ComposerModel["model"]["selection"]
   label: ComposerModelLabel
+  /** The model held in the fallback slot, offered here as an ordinary row (FR-024/FR-033). */
+  fallbackKey: ModelKey | undefined
   onClose: () => void
   onUnpaidClick: () => void
 }) {
@@ -109,7 +150,10 @@ function ComposerModelControl(props: {
     if (!props.paid) return props.onUnpaidClick()
     // A pointer open keeps focus in the composer, so the dialog returns it to the caret. A keyboard open
     // (a click with no pointer presses) returns focus to this trigger instead of moving it to the editor.
-    void dialog.show(() => <DialogSelectModel model={props.model} />, detail === 0 ? undefined : props.onClose)
+    void dialog.show(
+      () => <DialogSelectModel model={props.model} include={() => props.fallbackKey} />,
+      detail === 0 ? undefined : props.onClose,
+    )
   }
 
   // A previewed chip is visible before the catalog loads, so a click on it opens the dialog once loading finishes,
@@ -179,39 +223,138 @@ function ComposerModelControl(props: {
 
   return (
     <Show when={!props.loading || props.preview}>
-      <Tooltip
-        inactive={mobile()}
-        placement="top"
-        value={
-          <>
-            {props.title}
-            <Keybind keys={props.keybind} variant="neutral" />
-          </>
-        }
-      >
-        {/* While loading, the drawer would open on a catalog that isn't there yet, so the inert chip stands in. */}
+      <div class="flex min-w-0 items-center gap-2">
+        <Tooltip
+          inactive={mobile()}
+          placement="top"
+          value={
+            <>
+              {props.title}
+              <Keybind keys={props.keybind} variant="neutral" />
+            </>
+          }
+        >
+          {/* While loading, the drawer would open on a catalog that isn't there yet, so the inert chip stands in. */}
+          <Show
+            when={mobile() && !props.loading}
+            fallback={
+              <Button
+                ref={trigger}
+                data-action="composer-model"
+                data-control-type="dialog"
+                variant="ghost-muted"
+                size="normal"
+                class="min-w-0 max-w-[60cqw] justify-start ![font-weight:440] !px-0"
+                classList={{ "animate-in fade-in": shouldAnimate() }}
+                style={{ height: "28px" }}
+                aria-busy={pending() || undefined}
+                onMouseDown={(event: MouseEvent) => event.preventDefault()}
+                onClick={(event: MouseEvent) =>
+                  dispatch({
+                    type: "clicked",
+                    detail: event.detail,
+                    loading: props.loading,
+                    mobile: mobile(),
+                    dialogOpen: !!dialog.active,
+                  })
+                }
+              >
+                {content()}
+              </Button>
+            }
+          >
+            <ModelSelectorDrawer
+              model={props.model}
+              include={() => props.fallbackKey}
+              trigger={(triggerProps) => (
+                <Button
+                  {...triggerProps}
+                  variant="ghost-muted"
+                  size="normal"
+                  style={{ height: "28px" }}
+                  class="min-w-0 max-w-[60cqw] justify-start ![font-weight:440] !px-0"
+                  classList={{ "animate-in fade-in": shouldAnimate() }}
+                  data-action="composer-model"
+                  data-control-type="drawer"
+                >
+                  {content()}
+                </Button>
+              )}
+              onClose={props.onClose}
+            />
+          </Show>
+        </Tooltip>
+        {/* The fallback chip is its own row item (`ComposerFallbackChip` below), so the row reads model → variant →
+          fallback model → fallback variant, and nothing here acts on the pair: a row click in either picker does
+          (FR-004). */}
+      </div>
+    </Show>
+  )
+}
+
+/**
+ * The fallback chip: it names what recovery would use, or why it would not, without opening a picker (FR-029/FR-030).
+ * Its content is the derived `fallbackStatus`, never a stored flag, and its picker writes config while offering this
+ * composer's primary model as an ordinary row (FR-024/FR-033) and the "None" action that turns the fallback off
+ * (FR-012).
+ */
+function ComposerFallbackChip(props: {
+  loading: boolean
+  fallback: ModelSelection & { enabled: () => boolean }
+  status: ComposerFallbackStatus
+  primaryKey: ModelKey | undefined
+  onClose: () => void
+}) {
+  const language = useLanguage()
+  const dialog = useDialog()
+  const mobile = createMediaQuery("(max-width: 767px)")
+
+  const content = () => (
+    <>
+      <bdi class="min-w-0 truncate">
+        {fallbackChipLabel(props.status, props.fallback, language)}
+      </bdi>
+      <span class="-ms-0.5 flex shrink-0">
+        <Icon name="chevron-down" />
+      </span>
+    </>
+  )
+
+  // The two-word label is never the only carrier of that meaning: a fallback that would repeat the primary model says
+  // so, and why (FR-029).
+  const description = () =>
+    props.status === "inactive" ? language.t("ui.sessionTurn.status.fallback.inactiveDescription") : undefined
+
+  return (
+    <Show when={!props.loading}>
+      <Tooltip placement="top" value={language.t("ui.sessionTurn.status.fallback")}>
         <Show
-          when={mobile() && !props.loading}
+          when={mobile()}
           fallback={
             <Button
-              ref={trigger}
-              data-action="composer-model"
-              data-control-type="dialog"
               variant="ghost-muted"
               size="normal"
-              class="min-w-0 max-w-[60cqw] justify-start ![font-weight:440] !px-0"
-              classList={{ "animate-in fade-in": shouldAnimate() }}
               style={{ height: "28px" }}
-              aria-busy={pending() || undefined}
+              class="min-w-0 max-w-[170px] justify-start ![font-weight:440] !px-0"
+              aria-label={language.t("ui.sessionTurn.status.fallback")}
+              aria-description={description()}
+              data-action="composer-fallback-model"
+              data-control-type="dialog"
+              // The chip's variant control needs the picker's own name: the row has two of them, and a shared
+              // `ModelSelector` control falls back to a generic "Switch model" otherwise (FR-034's naming rule).
+              title={language.t("ui.promptInput.chooseFallbackVariant")}
               onMouseDown={(event: MouseEvent) => event.preventDefault()}
               onClick={(event: MouseEvent) =>
-                dispatch({
-                  type: "clicked",
-                  detail: event.detail,
-                  loading: props.loading,
-                  mobile: mobile(),
-                  dialogOpen: !!dialog.active,
-                })
+                void dialog.show(
+                  () => (
+                    <DialogSelectModel
+                      model={props.fallback}
+                      include={() => props.primaryKey}
+                      none={() => !props.fallback.enabled()}
+                    />
+                  ),
+                  event.detail === 0 ? undefined : props.onClose,
+                )
               }
             >
               {content()}
@@ -219,17 +362,21 @@ function ComposerModelControl(props: {
           }
         >
           <ModelSelectorDrawer
-            model={props.model}
+            model={props.fallback}
+            include={() => props.primaryKey}
+            none={() => !props.fallback.enabled()}
             trigger={(triggerProps) => (
               <Button
                 {...triggerProps}
                 variant="ghost-muted"
                 size="normal"
                 style={{ height: "28px" }}
-                class="min-w-0 max-w-[60cqw] justify-start ![font-weight:440] !px-0"
-                classList={{ "animate-in fade-in": shouldAnimate() }}
-                data-action="composer-model"
+                class="min-w-0 max-w-[170px] justify-start ![font-weight:440] !px-0"
+                aria-label={language.t("ui.sessionTurn.status.fallback")}
+                aria-description={description()}
+                data-action="composer-fallback-model"
                 data-control-type="drawer"
+                title={language.t("ui.promptInput.chooseFallbackVariant")}
               >
                 {content()}
               </Button>

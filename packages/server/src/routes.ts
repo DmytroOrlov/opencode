@@ -10,6 +10,9 @@ import { EventLogger } from "@opencode/core/event-logger"
 import { FileSystemSearch } from "@opencode/core/filesystem/search"
 import { Credential } from "@opencode/core/credential"
 import { Config } from "@opencode/core/config"
+import { FallbackRuntimeIntent } from "@opencode/core/config/fallback-runtime-intent"
+import { SessionGenerationAdmission } from "@opencode/core/session/generation-admission"
+import { ResourceCoordination } from "@opencode/core/effect/resource-coordination"
 import { PermissionSaved } from "@opencode/core/permission/saved"
 import { PtyTicket } from "@opencode/core/pty/ticket"
 import { PersistentPty } from "@opencode/core/persistent-pty"
@@ -134,6 +137,8 @@ function makeRoutes<AuthError, AuthServices>(
   serviceURLs: () => ReadonlyArray<string>,
   // Runtime-profile replacements (e.g. workerd) applied after the standard set, so later entries win.
   overrides: LayerNode.Replacements,
+  // Embedded hosts coordinate one Config resource per (backing filesystem, config directory): the same
+  // admission and fallback-intent pair is shared by every host that writes that same document.
   embedded: boolean,
   instances?: InstanceNode,
 ) {
@@ -147,7 +152,12 @@ function makeRoutes<AuthError, AuthServices>(
     Watcher.node.replace(Watcher.configured({ enabled: options.fs?.filewatcher })),
     FileWatch.node.replace(FileWatch.configured({ enabled: options.fs?.filewatcher })),
     FileSystemSearch.node.replace(FileSystemSearch.configured({ fff: options.fs?.fff })),
-    Global.node.replace(Global.layerWith(options.config?.directory ? { config: options.config.directory } : {})),
+    Global.node.replace(
+      Global.layerWith(
+        options.config?.directory ? { config: options.config.directory } : {},
+        embedded ? { skipConfig: true } : {},
+      ),
+    ),
     Config.node.replace(
       Config.configured({
         project: options.config?.project,
@@ -173,24 +183,78 @@ function makeRoutes<AuthError, AuthServices>(
       }),
     ),
   ]
-  const build = (overrides: LayerNode.Replacements) => {
+  const build = (overrides: LayerNode.Replacements, bound: LayerNode.Replacements) => {
     const replacements: LayerNode.Replacements = [
       ...standard,
-      // Private instances resolve this list lazily so they inherit the complete host graph, including the selector.
+      // Private instances resolve this list lazily so they inherit the complete host graph, including the
+      // resource-bound values and their own selector overrides.
       ...(instances ? [Instance.node.replace(instances(() => replacements))] : []),
       ...overrides,
+      // Appended after every runtime and simulation override, so later entries win: nothing those profiles supply
+      // may replace the proven Config filesystem authority or the borrowed pair.
+      ...bound,
     ]
     return AppNodeBuilder.build(applicationServices, replacements)
   }
-  const serviceLayer = options.simulation
-    ? Layer.unwrap(
-        Effect.gen(function* () {
-          const { simulationReplacements } = yield* Effect.promise(() => import("@opencode/simulation/backend"))
-          const simulation = yield* simulationReplacements({ version: App.make(options.app).version })
-          return build([...overrides, ...simulation])
-        }),
-      )
-    : build(overrides)
+  const simulate = Effect.fn("Routes.simulate")(function* () {
+    const { simulationReplacements } = yield* Effect.promise(() => import("@opencode/simulation/backend"))
+    return yield* simulationReplacements({ version: App.make(options.app).version })
+  })
+  /**
+   * Embedded hosts resolve their effective Config filesystem and Global roots BEFORE the application graph exists,
+   * prove the config directory's identity through that same writer, and borrow one admission/fallback-intent pair
+   * per (backing namespace, directory). The values are then injected, so the graph's Config writer is exactly the
+   * filesystem the identity was proved from.
+   *
+   * `Effect.scope` is this layer's build scope: the borrow's finalizer is registered before the host graph acquires
+   * anything and so runs last, which closes sessions, locations and requests before the pair is released, and
+   * releases only this host's reference when a sibling outlives it.
+   */
+  const embeddedLayer = Effect.fn("Routes.embedded")(function* (hostOverrides: LayerNode.Replacements) {
+    const scope = yield* Effect.scope
+    const prerequisites = yield* Layer.buildWithMemoMap(
+      LayerNode.compile(LayerNode.group([Global.node, FSUtil.node]), {
+        replacements: [...standard, ...hostOverrides],
+      }),
+      Layer.makeMemoMapUnsafe(),
+      scope,
+    )
+    const global = Context.get(prerequisites, Global.Service)
+    const fs = Context.get(prerequisites, FSUtil.Service)
+    const identity = yield* FSUtil.identifyConfigResource(fs, global.config)
+    const pair = yield* ResourceCoordination.borrow(identity.namespace, identity.directoryKey)
+    return build(hostOverrides, [
+      // The host's Global addresses the strictly resolved directory it proved, so every writer in the graph
+      // opens the same document the borrow keyed.
+      Global.node.replace(
+        Layer.succeed(Global.Service, Global.Service.of({ ...global, config: identity.directory })),
+      ),
+      FSUtil.node.replace(Layer.succeed(FSUtil.Service, fs)),
+      SessionGenerationAdmission.node.replace(
+        Layer.succeed(SessionGenerationAdmission.Service, pair.admission),
+      ),
+      FallbackRuntimeIntent.node.replace(
+        Layer.succeed(FallbackRuntimeIntent.Service, pair.fallbackIntent),
+      ),
+    ])
+  })
+  const serviceLayer = embedded
+    ? options.simulation
+      ? Layer.unwrap(
+          Effect.gen(function* () {
+            const simulation = yield* simulate()
+            return yield* embeddedLayer([...overrides, ...simulation])
+          }),
+        )
+      : Layer.unwrap(embeddedLayer(overrides))
+    : options.simulation
+      ? Layer.unwrap(
+          Effect.gen(function* () {
+            const simulation = yield* simulate()
+            return build([...overrides, ...simulation], [])
+          }),
+        )
+      : build(overrides, [])
   return serviceLayer.pipe(
     Layer.flatMap((context) => {
       const services = Layer.succeedContext(context)

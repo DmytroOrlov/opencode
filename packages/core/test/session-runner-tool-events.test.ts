@@ -35,6 +35,10 @@ const capture = (
     readonly interruptProgress?: boolean
     readonly beforeTextDelta?: Effect.Effect<void>
     readonly pendingSnapshot?: Effect.Effect<Snapshot.ID | undefined>
+    /** Simulates a storage failure while a tool's result event is written. */
+    readonly failToolSuccess?: boolean
+    /** Simulates a one-shot storage failure while a synthetic tool-failure repair is written. */
+    readonly failToolFailureOnce?: { pending: boolean }
   },
 ) => {
   const published: Array<{ readonly type: string; readonly data: unknown }> = []
@@ -48,6 +52,12 @@ const capture = (
         })
         return event
       })
+      if (definition.type === SessionEvent.Tool.Success.type && options?.failToolSuccess)
+        return Effect.die(new Error("tool output persistence failed"))
+      if (definition.type === SessionEvent.Tool.Failed.type && options?.failToolFailureOnce?.pending) {
+        options.failToolFailureOnce.pending = false
+        return Effect.die(new Error("tool failure repair persistence failed"))
+      }
       if (definition.type === SessionEvent.Text.Delta.type && options?.beforeTextDelta)
         return options.beforeTextDelta.pipe(Effect.andThen(publish))
       return definition.type === SessionEvent.Tool.Progress.type && options?.interruptProgress
@@ -136,6 +146,130 @@ test("provider-executed success derives content and retains provider result stat
     native: { result: { type: "content" } },
   })
 })
+
+// Settlement evidence: `resulted` claims a DURABLE result record, so it may only be set once that record is written.
+// A call whose result is rejected or whose publication fails may still have performed its external effect, and
+// `toolFacts()` must report that unknown effect instead of an affirmative result a later generation could replay.
+const successCount = (published: ReadonlyArray<{ readonly type: string }>) =>
+  published.filter((event) => event.type === "session.tool.success.2").length
+
+test("a local tool result whose publication fails records no durable result", async () => {
+  const { published, publisher } = capture("openai", { failToolSuccess: true })
+  await Effect.runPromise(publisher.publish(call))
+  const exit = await Effect.runPromiseExit(
+    publisher.toolExecution(call.id, call.name, {
+      output: { text: "Wrote the file" },
+      content: [{ type: "text", text: "Wrote the file" }],
+    }),
+  )
+  expect(Exit.isFailure(exit)).toBe(true)
+  expect(successCount(published)).toBe(0)
+  // Settled (a second execution is still refused) but not resulted, so the attempt's facts disqualify replay.
+  expect(publisher.toolFacts()).toEqual({
+    local: { results: 0, failures: 1, unresolved: 0 },
+    hosted: { results: 0, unresolved: 0 },
+  })
+  const duplicate = await Effect.runPromiseExit(
+    publisher.toolExecution(call.id, call.name, { content: [{ type: "text", text: "again" }] }),
+  )
+  expect(Exit.isFailure(duplicate)).toBe(true)
+  expect(successCount(published)).toBe(0)
+})
+
+test("a local tool result with no content records no durable result", async () => {
+  const { published, publisher } = capture()
+  await Effect.runPromise(publisher.publish(call))
+  const exit = await Effect.runPromiseExit(publisher.toolExecution(call.id, call.name, { content: [] }))
+  expect(Exit.isFailure(exit)).toBe(true)
+  expect(successCount(published)).toBe(0)
+  expect(publisher.toolFacts()).toEqual({
+    local: { results: 0, failures: 1, unresolved: 0 },
+    hosted: { results: 0, unresolved: 0 },
+  })
+})
+
+test("a hosted success whose publication fails leaves the call unresolved and duplicate-protected", async () => {
+  const { published, publisher } = capture("openai", { failToolSuccess: true })
+  await Effect.runPromise(publisher.publish(LLMEvent.toolCall({ ...call, providerExecuted: true })))
+  const first = await Effect.runPromiseExit(publisher.publish(hostedResult))
+  expect(Exit.isFailure(first)).toBe(true)
+  expect(successCount(published)).toBe(0)
+  // The provider may have executed the call and its answer never became durable, so the provider-answered
+  // tier stays empty and the call counts as unknown-effect.
+  expect(publisher.toolFacts()).toEqual({
+    local: { results: 0, failures: 0, unresolved: 0 },
+    hosted: { results: 0, unresolved: 1 },
+  })
+  // The duplicate-result invariant survives the failed publication: a late success would mean double execution.
+  const second = await Effect.runPromiseExit(publisher.publish(hostedResult))
+  expect(Exit.isFailure(second)).toBe(true)
+  expect(successCount(published)).toBe(0)
+  // A late error result stays the benign straggler it was before.
+  const late = await Effect.runPromiseExit(
+    publisher.publish(
+      LLMEvent.toolResult({
+        id: call.id,
+        name: call.name,
+        providerExecuted: true,
+        result: { type: "error", value: "Provider cancelled the call" },
+      }),
+    ),
+  )
+  expect(Exit.isSuccess(late)).toBe(true)
+  expect(published.filter((event) => event.type === "session.tool.failed.2")).toHaveLength(0)
+})
+
+test("a failed repair publication stays repair-eligible and publishes exactly one durable failure later", async () => {
+  // The tool performed its external effect, but its success event failed to publish. The attempt's synthetic
+  // repair then fails to publish too, so the in-memory `terminal` flag must remain unset: a repair that was not
+  // durably written is not terminal settlement. A later repair publishes exactly once, and the durable failure
+  // remains unknown-effect evidence rather than an affirmative result a later generation could replay.
+  const repair = { pending: true }
+  const { published, publisher } = capture("openai", { failToolSuccess: true, failToolFailureOnce: repair })
+  await Effect.runPromise(publisher.publish(call))
+  const executed = await Effect.runPromiseExit(
+    publisher.toolExecution(call.id, call.name, {
+      output: { text: "Wrote the file" },
+      content: [{ type: "text", text: "Wrote the file" }],
+    }),
+  )
+  expect(Exit.isFailure(executed)).toBe(true)
+  expect(successCount(published)).toBe(0)
+  const failureCount = () => published.filter((event) => event.type === "session.tool.failed.2").length
+  expect(failureCount()).toBe(0)
+  const factsBeforeRepair = publisher.toolFacts()
+  expect(factsBeforeRepair).toEqual({
+    local: { results: 0, failures: 1, unresolved: 0 },
+    hosted: { results: 0, unresolved: 0 },
+  })
+
+  const unrecorded = { type: "tool.result-missing", message: "Tool result could not be durably recorded" } as const
+  const repairFailure = await Effect.runPromiseExit(publisher.failUnrecordedTools(unrecorded))
+  expect(Exit.isFailure(repairFailure)).toBe(true)
+  expect(failureCount()).toBe(0)
+  // No durable terminal event exists and the facts report the same unknown effect, so replay stays barred.
+  expect(publisher.toolFacts()).toEqual(factsBeforeRepair)
+
+  // The one-shot failure is gone: the next repair publishes exactly one durable failure.
+  expect(await Effect.runPromise(publisher.failUnrecordedTools(unrecorded))).toBe(true)
+  expect(failureCount()).toBe(1)
+  expect(published.find((event) => event.type === "session.tool.failed.2")?.data).toMatchObject({
+    id: call.id,
+    error: unrecorded,
+  })
+  // A second repair is a no-op, so the terminal event cannot be duplicated.
+  expect(await Effect.runPromise(publisher.failUnrecordedTools(unrecorded))).toBe(false)
+  expect(failureCount()).toBe(1)
+  // The repair did not become an affirmative result: facts stay in the unknown-effect tier.
+  expect(publisher.toolFacts()).toEqual(factsBeforeRepair)
+  // Duplicate external execution is still refused after the repair.
+  const duplicate = await Effect.runPromiseExit(
+    publisher.toolExecution(call.id, call.name, { content: [{ type: "text", text: "again" }] }),
+  )
+  expect(Exit.isFailure(duplicate)).toBe(true)
+  expect(successCount(published)).toBe(0)
+})
+
 
 testEffect(
   AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, SessionProjector.node]), [

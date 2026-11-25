@@ -370,6 +370,17 @@ export const layer = Layer.effect(
       const request = {
         ...base,
         model: route === base.model.route ? base.model : LanguageModel.update(base.model, { route }),
+        http:
+          kind === "primary" && model.splashAdaptiveSseTimeout === true
+            ? {
+                ...base.http,
+                splashAdaptiveSseTimeout: true,
+                // The endpoint is the effective selected route after model hooks; the HTTP transport still
+                // revalidates the actual request URL against this origin before calibrating.
+                splashAdaptiveEndpoint:
+                  typeof route.endpoint.baseURL === "string" ? route.endpoint.baseURL : undefined,
+              }
+            : base.http,
         headers: Object.keys(modelHook.headers).length === 0 ? undefined : modelHook.headers,
       }
       const hasHttpHooks =

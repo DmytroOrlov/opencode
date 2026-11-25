@@ -31,7 +31,9 @@ const touchScroll = /mobile-timeline-scroll\.spec\.ts/
 export default defineConfig({
   testDir: "./e2e",
   // Each has its own config and script: test:service-worker and test:stability.
-  testIgnore: ["service-worker/**", "stability/**"],
+  // `utils` is the shared harness, not a spec directory: its one `*.test.ts` is a bun test (`test:harness`) and imports
+  // `bun:test`, which Playwright's loader cannot resolve. Ignored here as `e2e/AGENTS.md` → Test Ownership requires.
+  testIgnore: ["service-worker/**", "stability/**", "utils/**"],
   outputDir: "./e2e/test-results",
   timeout: 60_000,
   expect: {

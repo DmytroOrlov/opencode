@@ -5,6 +5,8 @@ import {
   durableVariantSelection,
   getConfiguredAgentVariant,
   INHERIT_VARIANT,
+  promptVariantValue,
+  recordedVariant,
   resolveModelVariant,
   variantSelectionFrom,
 } from "./variant"
@@ -12,6 +14,13 @@ import {
 const variants = ["low", "high", "xhigh"]
 
 const named = (value: string) => ({ type: "named", value }) as const
+
+const selected = { providerID: "openai", modelID: "gpt-5.2" }
+
+// The per-model store, as both selection owners read it.
+const store = (values: Record<string, string | undefined>) => ({
+  variant: { get: (model: { providerID: string; modelID: string }) => values[`${model.providerID}/${model.modelID}`] },
+})
 
 describe("model variant", () => {
   test.each([
@@ -75,5 +84,47 @@ describe("model variant", () => {
     expect(variantSelectionFrom("high")).toEqual(named("high"))
     expect(durableVariantSelection(undefined)).toEqual(DEFAULT_VARIANT)
     expect(durableVariantSelection("high")).toEqual(named("high"))
+  })
+
+  test.each([
+    { name: "nothing recorded", values: {}, expected: INHERIT_VARIANT },
+    { name: "a recorded variant", values: { "openai/gpt-5.2": "high" }, expected: named("high") },
+    { name: "a recorded Default", values: { "openai/gpt-5.2": "default" }, expected: DEFAULT_VARIANT },
+  ])("recordedVariant $name", ({ values, expected }) => {
+    expect(recordedVariant(store(values), selected)).toEqual(expected)
+  })
+
+  test("recordedVariant reads the store for the model being selected, never for another model", () => {
+    const values = { "openai/gpt-5.2": "xhigh" }
+
+    expect(recordedVariant(store(values), selected)).toEqual(named("xhigh"))
+    expect(recordedVariant(store(values), { providerID: "anthropic", modelID: "claude-sonnet-4" })).toEqual(INHERIT_VARIANT)
+    expect(recordedVariant(store(values), { providerID: "openai", modelID: "gpt-5.1" })).toEqual(INHERIT_VARIANT)
+  })
+
+  test("a recorded selection resolves the way a committed variant does, ahead of configuration", () => {
+    const values = { "openai/gpt-5.2": "high" }
+
+    expect(resolveModelVariant({ variants, selected: recordedVariant(store(values), selected), configured: "xhigh" })).toBe(
+      "high",
+    )
+    // A preference recorded as "default" is the model's own default, so it clears the configured variant.
+    expect(
+      resolveModelVariant({
+        variants,
+        selected: recordedVariant(store({ "openai/gpt-5.2": "default" }), selected),
+        configured: "xhigh",
+      }),
+    ).toBeUndefined()
+  })
+
+  test("seeds the prompt mirror with the same rule the session owner seeds its choice with", () => {
+    expect(promptVariantValue(INHERIT_VARIANT)).toBeUndefined()
+    expect(promptVariantValue(DEFAULT_VARIANT)).toBeNull()
+    expect(promptVariantValue(named("high"))).toBe("high")
+    // The store spells an explicit Default as the name "default"; both owners see it as the Default.
+    expect(promptVariantValue(recordedVariant(store({ "openai/gpt-5.2": "default" }), selected))).toBeNull()
+    expect(promptVariantValue(recordedVariant(store({ "openai/gpt-5.2": "high" }), selected))).toBe("high")
+    expect(promptVariantValue(recordedVariant(store({}), selected))).toBeUndefined()
   })
 })

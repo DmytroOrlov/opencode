@@ -91,6 +91,9 @@ export type ComposerEditorProps = {
   borderUnderlay?: boolean
   class?: string
   modelControl?: JSX.Element
+  /** The fallback chip, its own row item: a chip that states a state, not an action (`ComposerModelControl` in
+   *  `composer/composer.tsx`). Rendered after this composer's variant control. */
+  fallbackControl?: JSX.Element
   modelControlsVisible?: boolean
   attachKeybind?: string[]
   attachShortcut?: string
@@ -503,6 +506,24 @@ export function ComposerEditor(props: ComposerEditorProps) {
                         title={i18n.t("ui.promptInput.chooseVariant")}
                         keybind={["Shift", "Mod", "D"]}
                         control={control}
+                        class={control.current() === "default" ? "!px-0 composer-variant-default" : "!px-0"}
+                      />
+                    </Show>
+                  )}
+                </Show>
+                {/* The fallback pair follows the primary pair: model, then its variant. Both write config, never this
+                  Session, and each names the model it would recover to without opening a picker (FR-030). */}
+                {props.fallbackControl}
+                <Show when={view.fallbackVariant} keyed>
+                  {(control) => (
+                    <Show when={control.options().length > 1}>
+                      <ComposerEditorConfiguredSelect
+                        mobileDrawer
+                        title={i18n.t("ui.promptInput.chooseFallbackVariant")}
+                        control={control}
+                        // FR-032's quiet-at-rest parity: this control parks a `default` entry exactly the way the
+                        // primary's variant control does, so the row never highlights one of the two (FR-034's naming
+                        // rule keeps them distinguishable by name instead).
                         class={control.current() === "default" ? "!px-0 composer-variant-default" : "!px-0"}
                       />
                     </Show>

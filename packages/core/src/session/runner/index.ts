@@ -18,7 +18,15 @@ export type RunError =
   | Instructions.InitializationBlocked
   | FileSystem.DirectoryNotFoundError
 
-export type Continuation = { readonly step: number }
+export type Continuation = {
+  readonly step: number
+  /**
+   * Provider/model identities this active turn already dispatched, so a fallback naming one of them is not a
+   * distinct recovery. Transient: it is carried across a move/reload handoff or a tool-driven continuation of the
+   * same turn, and reset when new input begins a new turn.
+   */
+  readonly attempted?: ReadonlySet<string>
+}
 
 export type DrainResult = Data.TaggedEnum<{
   Complete: {}

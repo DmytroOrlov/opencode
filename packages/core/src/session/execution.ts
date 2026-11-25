@@ -11,6 +11,7 @@ import { SessionEvent } from "./event.js"
 import { SessionInbox } from "./inbox.js"
 import { SubagentReport } from "./execution/subagent-report.js"
 import { SessionRunCoordinator } from "./run-coordinator.js"
+import { SessionGenerationAdmission } from "./generation-admission.js"
 import { SessionRunner } from "./runner/index.js"
 import { SessionSchema } from "./schema.js"
 import { SessionStore } from "./store.js"
@@ -63,6 +64,7 @@ export const layer = Layer.effect(
     const jobs = yield* Job.Service
     const inbox = yield* SessionInbox.Service
     const scope = yield* Effect.scope
+    const admission = yield* SessionGenerationAdmission.Service
     const db = (yield* Database.Service).db
     const reportLifecycle = <A>(sessionID: SessionSchema.ID, effect: Effect.Effect<A>) =>
       effect.pipe(
@@ -136,6 +138,7 @@ export const layer = Layer.effect(
       })
     })
     const coordinator = yield* SessionRunCoordinator.make<SessionSchema.ID, SessionRunner.RunError, InterruptReason>({
+      admission,
       started: (sessionID) =>
         reportLifecycle(
           sessionID,
@@ -224,7 +227,15 @@ function publishTerminal(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [SessionStore.node, Instance.node, Bus.node, Database.node, Job.node, SessionInbox.node],
+  deps: [
+    SessionStore.node,
+    Instance.node,
+    Bus.node,
+    Database.node,
+    Job.node,
+    SessionInbox.node,
+    SessionGenerationAdmission.node,
+  ],
 })
 
 /** Low-level compatibility layer for callers that only need durable Session recording. */

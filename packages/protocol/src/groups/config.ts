@@ -4,6 +4,31 @@ import { Schema } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/http-api"
 import { LocationQuery, locationQueryOpenApi } from "./location.js"
 
+/**
+ * PATCH /api/experimental/config only.
+ *
+ * Ordinary 500 responses have no code. A code is present only when an
+ * actual durable commit has been attributed to this request.
+ *
+ * This MUST be a constructor-backed TaggedError, not Schema.Struct:
+ * the installed Promise generator's declaredErrorFields() requires
+ * a SchemaAST declaration with "~constructor" and a literal tag.
+ */
+export class ConfigUpdateFailure extends Schema.TaggedError<ConfigUpdateFailure>()(
+  "UnknownError",
+  {
+    message: Schema.String,
+    ref: Schema.optional(Schema.String),
+    code: Schema.optional(
+      Schema.Literals([
+        "CONFIG_COMMITTED_BUT_UNPUBLISHED",
+        "CONFIG_COMMITTED_WITH_POSTPUBLICATION_FAILURE",
+      ]),
+    ),
+  },
+  { httpApiStatus: 500 },
+) {}
+
 export const ConfigGroup = HttpApiGroup.make("server.config")
   .add(
     HttpApiEndpoint.get("config.get", "/api/config", {
@@ -35,6 +60,7 @@ export const ConfigGroup = HttpApiGroup.make("server.config")
     HttpApiEndpoint.patch("config.update", "/api/experimental/config", {
       payload: Config.Patch,
       success: HttpApiSchema.NoContent,
+      error: ConfigUpdateFailure,
     }).annotateMerge(
       OpenApi.annotations({
         identifier: "experimental.config.update",

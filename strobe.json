@@ -1,6 +1,6 @@
 {
   "build": { "command": "bun run build", "cwd": "packages/app", "output": "packages/app/dist" },
-  "serve": { "command": "bun e2e/utils/serve.ts --host 127.0.0.1 --port {port}", "cwd": "packages/app" },
+  "serve": { "command": "bun run serve --host 127.0.0.1 --port {port} --strictPort", "cwd": "packages/app" },
   "apps": {
     "opencode": {
       "exe": {

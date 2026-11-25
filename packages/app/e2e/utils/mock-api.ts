@@ -1,5 +1,6 @@
 import { Predicate, Schema, SchemaGetter } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, HttpApiSchema } from "effect/http-api"
+import { Config } from "@opencode/schema/config"
 import { PersistentPty } from "@opencode/schema/persistent-pty"
 import { Pty } from "@opencode/schema/pty"
 import { Worktree } from "@opencode/schema/worktree"
@@ -228,9 +229,12 @@ const Group = HttpApiGroup.make("mock")
   )
   .add(HttpApiEndpoint.get("configShells", "/api/config/shell", { success: Json }))
   .add(
+    // The real protocol's `Config.Patch`, so the mock can answer a `fallback` write the way the server does, and fail
+    // one the way a server does with a 500 (see `MockConfigState.failWrites`).
     HttpApiEndpoint.patch("configUpdate", "/api/experimental/config", {
-      payload: Schema.Struct({ shell: Schema.NullOr(Schema.String) }),
+      payload: Config.Patch,
       success: HttpApiSchema.NoContent,
+      error: MockInternal.pipe(HttpApiSchema.status(500)),
     }),
   )
   .add(HttpApiEndpoint.get("websearchProviders", "/api/websearch/provider", { success: Json }))

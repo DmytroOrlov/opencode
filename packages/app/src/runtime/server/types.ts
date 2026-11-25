@@ -128,6 +128,7 @@ export type ProviderAuthResponse = Record<string, unknown>
 export type Config = {
   model?: string
   small_model?: string
+  fallback?: string | { providerID: string; model: string; variant?: string } | null
   default_agent?: string
   username?: string
   share?: "manual" | "auto" | "disabled"

@@ -1,11 +1,12 @@
 import type { Data } from "@opencode/client/solid"
 import type { SessionMessageUser } from "@opencode/client/promise"
 import type { Accessor } from "solid-js"
-import type { ModelSelection } from "@/providers/models/selection"
+import type { ModelKey, ModelSelection } from "@/providers/models/selection"
 import type { ServerSDK } from "@/runtime/server/client"
 import type { SessionMessageHandoff } from "@/session/handoff"
 import type { ComposerStateTarget } from "./submission-state"
 import type { ComposerModelLabel } from "./model-label"
+import type { ComposerFallbackStatus } from "@/session/composer/selection"
 
 export type ComposerControls = {
   agents: {
@@ -16,13 +17,19 @@ export type ComposerControls = {
     select: (name: string | undefined) => void
   }
   model: {
+    /** Both slots are the composer's wrapped objects, so every composer write path obeys the pair rule. */
     selection: ModelSelection
-    providerName?: string
-    label?: ComposerModelLabel
+    fallback: ModelSelection & { enabled: () => boolean }
+    /** Recomputed from the two owners and never stored: what the fallback chip names (FR-029/FR-030). */
+    fallbackStatus: ComposerFallbackStatus
+    /** Whether the pair was applied, which is how a refusal stays observable without an event (FR-020). */
+    exchange: (target: ModelKey, from: "primary" | "fallback") => boolean
     paid: boolean
     loading: boolean
     /** While loading, the expected model's names from a catalog already loaded for another Location. */
     preview?: { provider?: string; model: string; label?: ComposerModelLabel; variant: string; variants: string[] }
+    providerName?: string
+    label?: ComposerModelLabel
   }
 }
 

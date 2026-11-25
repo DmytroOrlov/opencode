@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionRunCoordinator } from "@opencode/core/session/run-coordinator"
+import { SessionGenerationAdmission } from "@opencode/core/session/generation-admission"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(Layer.empty)
@@ -706,6 +707,99 @@ describe("SessionRunCoordinator", () => {
       yield* Deferred.await(completed)
 
       expect(runs).toBe(limit)
+    }),
+  )
+
+  it.effect("keeps the shared lease until settlement finishes so an exclusive update follows the terminal", () =>
+    Effect.gen(function* () {
+      const admission = yield* SessionGenerationAdmission.make
+      const order: string[] = []
+      const settling = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const coordinator = yield* SessionRunCoordinator.make<string, never, string>({
+        admission,
+        drain: () => Effect.void,
+        settled: () =>
+          Deferred.succeed(settling, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(Effect.sync(() => order.push("settled"))),
+            Effect.asVoid,
+          ),
+      })
+
+      yield* coordinator.wake("session")
+      yield* Deferred.await(settling)
+      // The drain has exited and this generation's terminal is still being written, so a durable
+      // update that takes the exclusive lease must land after the terminal, never inside it.
+      const update = yield* Effect.gen(function* () {
+        const lease = yield* admission.acquireExclusive
+        order.push("update")
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+      yield* Effect.forEach([1, 2, 3, 4], () => Effect.yieldNow, { discard: true })
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(update)
+      expect(order).toEqual(["settled", "update"])
+      expect(yield* coordinator.active).toEqual(new Set())
+    }),
+  )
+
+  it.effect("keeps the lease through settlement of a failed execution and reports the exit to joiners", () =>
+    Effect.gen(function* () {
+      const admission = yield* SessionGenerationAdmission.make
+      const order: string[] = []
+      const settling = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const failure = new Error("drain failed")
+      const coordinator = yield* SessionRunCoordinator.make<string, Error, string>({
+        admission,
+        drain: () => Effect.fail(failure),
+        settled: () =>
+          Deferred.succeed(settling, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(Effect.sync(() => order.push("settled"))),
+            Effect.asVoid,
+          ),
+      })
+
+      const joined = yield* coordinator.run("session").pipe(Effect.forkChild)
+      yield* Deferred.await(settling)
+      const update = yield* Effect.gen(function* () {
+        const lease = yield* admission.acquireExclusive
+        order.push("update")
+        yield* lease.release
+      }).pipe(Effect.forkChild)
+      yield* Effect.forEach([1, 2, 3, 4], () => Effect.yieldNow, { discard: true })
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(update)
+      expect(order).toEqual(["settled", "update"])
+      const exit = yield* Fiber.await(joined)
+      expect(Exit.isFailure(exit) && Cause.squash(exit.cause)).toBe(failure)
+      expect(yield* coordinator.active).toEqual(new Set())
+    }),
+  )
+
+  it.effect("cancels a run parked at shared admission and releases the next exclusive owner", () =>
+    Effect.gen(function* () {
+      const admission = yield* SessionGenerationAdmission.make
+      const protectedConfigUpdate = yield* admission.acquireExclusive
+      const drained = yield* Deferred.make<void>()
+      const coordinator = yield* SessionRunCoordinator.make<string, never, string>({
+        admission,
+        drain: () => Deferred.succeed(drained, undefined),
+      })
+      const run = yield* coordinator.run("session").pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(yield* coordinator.isActive("session")).toBe(true)
+      expect(yield* Deferred.isDone(drained)).toBe(false)
+
+      expect(yield* coordinator.interrupt("session", "user")).toBe(true)
+      yield* coordinator.awaitIdle("session")
+      yield* protectedConfigUpdate.release
+      const next = yield* admission.acquireExclusive
+      yield* next.release
+      expect(yield* Deferred.isDone(drained)).toBe(false)
+      expect(Exit.isFailure(yield* Fiber.await(run))).toBe(true)
     }),
   )
 })

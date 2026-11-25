@@ -1,5 +1,6 @@
 import type { Page, Route } from "@playwright/test"
 import type { MockRequest, MockResponse, PrepareContext } from "@hona/strobe"
+import { fixture } from "../../e2e/utils/session-fixture"
 
 type Handler = Parameters<Page["route"]>[1]
 
@@ -29,7 +30,7 @@ export function cached(ctx: Pick<PrepareContext<unknown>, "playwright" | "mock" 
     // oxlint-disable-next-line anti-slop/no-runtime-typeof -- discriminates Playwright's own URL matcher union
     if (typeof url !== "string") throw new Error("strobe mocks URL globs; no benchmark routes by RegExp or predicate")
 
-    await mock(url.replaceAll("**", "*"), (request) => answer(request, handler))
+    await mock(url.replaceAll("**", "*"), (request) => legacy(request) ?? answer(request, handler))
 
     return { dispose: kept, [Symbol.asyncDispose]: kept }
   }
@@ -38,6 +39,50 @@ export function cached(ctx: Pick<PrepareContext<unknown>, "playwright" | "mock" 
   page.routeWebSocket = async () => {}
 
   return page
+}
+
+// A `--base <ref>` comparison drives one harness at two builds, so the older build's client still asks for three
+// endpoints this checkout no longer routes: its protocol probe (`src/utils/server-protocol.ts` reads `/global/health`
+// then `/api/health`, and needs the numeric `pid` before it recognises v2), the current-project lookup, and the
+// question poll. Refusing one is not a finding: `mock-server.ts:422` throws on an unmocked API request, that launch
+// never settles, and the base side measures nothing (`RunIncomplete: setup: cdp Runtime.evaluate: no reply in 70s`).
+// These are the baseline's own contracts, copied from its `e2e/utils/mock-server.ts` (`:77`, `:153`, `:171`) and its
+// `location` helper (`:317`) — not invented successes — over the directory and project id the benchmark fixtures
+// configure the app with (`session-fixture.ts:336`, used by `mockLargeDraft` and `mockStressTimeline`). No benchmark
+// sets pending questions, so that poll legitimately answers none.
+//
+// Only these three exact GET pathnames: any other path, any other method, and every other request fall through to
+// `answer`, so the variant's own routes keep Playwright's order and this checkout's mock server still answers 501,
+// then throws, for a path it does not route. The one header mirrors the mock server's CORS block (`:549`).
+const cors = { "access-control-allow-origin": "*" }
+
+function legacy(request: MockRequest): MockResponse | undefined {
+  if (request.method !== "GET") return undefined
+
+  const pathname = new URL(request.url).pathname
+
+  if (pathname === "/api/health") return fulfilled({ json: { healthy: true, version: "2.0.0", pid: 1 }, headers: cors })
+
+  if (pathname === "/api/project/current")
+    return fulfilled({
+      json: { id: fixture.project.id, directory: fixture.directory },
+      headers: cors,
+    })
+
+  if (pathname === "/api/question/request")
+    return fulfilled({
+      json: {
+        location: {
+          directory: fixture.directory,
+          project: { id: fixture.project.id, directory: fixture.directory },
+        },
+        // A benchmark's project has nothing awaiting an answer.
+        data: [],
+      },
+      headers: cors,
+    })
+
+  return undefined
 }
 
 // `ctx.playwright` is Chromium's: reading it in another engine throws.

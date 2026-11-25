@@ -81,6 +81,36 @@ export interface StepRecord {
   readonly needsContinuation: boolean
 }
 
+/**
+ * How far the attempt's own tool calls got, read while they have all finished and BEFORE `failUnsettledTools`,
+ * `failIncompleteTools` or `failAssistant` can synthesize a terminal event for them. A call that reached no
+ * terminal event here has an unknown external effect: a later cleanup event is not evidence that it settled,
+ * so neither an ordinary retry nor a distinct-model generation may replay it.
+ *
+ * Counts are settlement EVIDENCE, and the three kinds are not equally strong. `local.results` and `hosted.results`
+ * are affirmative: the call's own result (a provider-returned error result included, since the provider answered
+ * for it) is durable, so a later generation replays that record instead of re-running the call. That tier is entered
+ * only after the result event itself has been published, so a call whose result was rejected or whose publication
+ * failed falls into the tier below instead. `local.failures` proves only that the local call was marked settled
+ * without an affirmative durable result; it does not establish absence of external effects or durable terminal
+ * publication. `*.unresolved` says nothing at all. A caller that needs affirmative evidence therefore treats both
+ * `failures` and `unresolved` as disqualifying, and only a caller that tolerates unknown effects may read
+ * `unresolved` alone.
+ */
+export interface ToolFacts {
+  /** Local calls this attempt started, and how each one ended on its own. */
+  readonly local: {
+    /** Ran and published a durable normalized result; a later generation replays it and never re-executes it. */
+    readonly results: number
+    /** Settled without an affirmative durable result, including failed result publication. */
+    readonly failures: number
+    /** Reached no terminal event, so its external effect is unknown. */
+    readonly unresolved: number
+  }
+  /** Provider-hosted calls: results the provider itself sent, versus calls that never received one. */
+  readonly hosted: { readonly results: number; readonly unresolved: number }
+}
+
 /** Derives canonical model content from a provider-hosted tool result. */
 type NonEmptyContent = readonly [Tool.Content, ...Tool.Content[]]
 
@@ -109,11 +139,37 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     called: boolean
     settled: boolean
     providerExecuted: boolean
+    /** This call's result event was published, so the record is durable; a failure published for it does not count. */
+    resulted: boolean
+    /** A terminal failure event was published for this call, whether by its own execution or by repair. */
+    terminal: boolean
     progress?: Tool.Metadata
     input?: InputExcerpt
     malformed?: boolean
   }
   const tools = new Map<string, ToolState>()
+  /** Folds the attempt's recorded calls into immutable settlement facts; see `ToolFacts`. */
+  const foldToolFacts = (): ToolFacts => {
+    let localResults = 0
+    let localFailures = 0
+    let localUnresolved = 0
+    let hostedResults = 0
+    let hostedUnresolved = 0
+    for (const tool of tools.values()) {
+      if (!tool.called) continue
+      // A hosted call the provider never answered has an unknown effect even if something settles it later.
+      if (tool.providerExecuted) {
+        if (tool.resulted) hostedResults++
+        else hostedUnresolved++
+      } else if (tool.resulted) localResults++
+      else if (tool.settled) localFailures++
+      else localUnresolved++
+    }
+    return {
+      local: { results: localResults, failures: localFailures, unresolved: localUnresolved },
+      hosted: { results: hostedResults, unresolved: hostedUnresolved },
+    }
+  }
   const failureSnapshot = (tool: { readonly progress?: Tool.Metadata }, metadata?: Tool.Metadata) => {
     if (tool.progress === undefined) return metadata === undefined ? {} : { metadata }
     if (metadata === undefined) return { metadata: tool.progress }
@@ -311,6 +367,8 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       called: false,
       settled: false,
       providerExecuted: event.providerExecuted === true,
+      resulted: false,
+      terminal: false,
     }
     tools.set(event.id, tool)
     yield* toolInput.start(event.id)
@@ -379,6 +437,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       ...failureSnapshot(tool, metadata),
       executed: tool.providerExecuted,
     })
+    tool.terminal = true
     return true
   })
 
@@ -397,6 +456,35 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       if (tool.called || tool.settled) continue
       yield* failToolInput(id, tool, "incomplete")
     }
+  })
+
+  /**
+   * Repairs a call that was claimed for execution and settled, but whose result publication failed: the tool may
+   * have acted, yet no durable success or failure event exists. Publication is deliberately not retried (the
+   * external effect is unknown and a later generation must not replay it); this only completes the durable record
+   * before the assistant is marked complete, so history never carries a running call without a terminal part.
+   * The caller reads `toolFacts()` before this, so the repair cannot turn unknown effect into replay permission.
+   */
+  const failUnrecordedTools = Effect.fn("SessionRunner.failUnrecordedTools")(function* (error: SessionError.Error) {
+    let failed = false
+    for (const [id, tool] of tools) {
+      if (!tool.called || !tool.settled || tool.resulted || tool.terminal) continue
+
+      yield* bus.publish(SessionEvent.Tool.Failed, {
+        sessionID: input.sessionID,
+        assistantMessageID,
+        id,
+        error,
+        ...failureSnapshot(tool),
+        executed: tool.providerExecuted,
+      })
+
+      // Only a successfully published event proves durable terminal settlement.
+      // A failed repair remains eligible for EVENT repair, never tool re-execution.
+      tool.terminal = true
+      failed = true
+    }
+    return failed
   })
 
   const failAssistant = Effect.fnUntraced(function* (error: SessionError.Error) {
@@ -519,6 +607,9 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
           if (event.result.type === "error") return
           return yield* Effect.die(new Error(`Duplicate tool result: ${event.id}`))
         }
+        // As in `toolExecution`: `settled` commits early for duplicate protection, and `resulted` — the claim that
+        // the provider's answer for this call is durable — only after that answer's event has been published, so a
+        // failed publication cannot report an affirmative result for a hosted call the provider may have acted on.
         tool.settled = true
         const executed = event.providerExecuted === true || tool.providerExecuted
         if (event.result.type === "error") {
@@ -531,6 +622,8 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
             executed,
             native: native(event.providerMetadata),
           })
+          // The provider answered for this call, so its durable error result is affirmative evidence.
+          tool.resulted = true
           return
         }
         yield* bus.publish(SessionEvent.Tool.Success, {
@@ -541,6 +634,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
           executed,
           native: native(event.providerMetadata),
         })
+        tool.resulted = true
         return
       }
       case "step-finish":
@@ -582,6 +676,11 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     if (tool.name !== name)
       return yield* Effect.die(new Error(`Tool execution name changed for ${id}: ${tool.name} -> ${name}`))
     if (tool.settled) return yield* Effect.die(new Error(`Duplicate tool execution: ${id}`))
+    // `settled` commits synchronously, before the first await, so a second execution of this call is refused even
+    // while this one is in flight. `resulted` is different evidence: it claims a DURABLE result record exists, so
+    // it may only be set once that record has actually been written. A call whose content is rejected or whose
+    // publication fails may still have performed its external effect, and `toolFacts()` must report that unknown
+    // effect rather than an affirmative result a later generation could replay.
     tool.settled = true
     const content = result.content
     if (!isReadonlyArrayNonEmpty(content)) return yield* Effect.die(new Error(`Tool execution has no content: ${id}`))
@@ -593,6 +692,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
       ...(result.metadata === undefined ? {} : { metadata: result.metadata }),
       executed: tool.providerExecuted,
     })
+    tool.resulted = true
   })
 
   return {
@@ -602,6 +702,7 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
     flush,
     failAssistant,
     failTool,
+    failUnrecordedTools,
     publishStepFailure,
     failUnsettledTools,
     failIncompleteTools,
@@ -617,6 +718,8 @@ export const createLLMEventPublisher = (bus: Pick<Bus.Interface, "publish">, inp
         (tool) => !tool.providerExecuted && (tool.called || tool.settled),
       ),
     }),
+    /** How the attempt's own tool calls ended, captured before any cleanup can settle them synthetically. */
+    toolFacts: foldToolFacts,
     startAssistant,
     streamed,
   }

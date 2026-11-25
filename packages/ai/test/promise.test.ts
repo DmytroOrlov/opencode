@@ -7,7 +7,8 @@ import { HttpClientRequest } from "effect/http"
 import { AIError, LLMEvent, Media } from "../src/effect.js"
 import { SpeechEvent, TranscriptionEvent } from "../src/experimental.js"
 import { RequestExecutor, type StreamOptions } from "../src/route.js"
-import { AI } from "../src/index.js"
+import { adaptSseDiagnosticSink, AI } from "../src/index.js"
+import { CurrentSseDiagnosticSink, type SseTransportSummary } from "../src/route/transport/http.js"
 import { AssemblyAI, OpenAI, XAI } from "../src/providers.js"
 import { handlerLayer, json } from "./lib/http.js"
 import { finishChunk, toolCallChunk } from "./lib/openai-chunks.js"
@@ -132,6 +133,86 @@ const executor = (seen: Array<string>) =>
       ),
     ),
   )
+
+const SSE_HEADERS = { headers: { "content-type": "text/event-stream" } }
+const textEvent = (text: string) =>
+  `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`
+
+const oneChunkSseBody = (payload: string) => {
+  const encoder = new TextEncoder()
+  let pulled = 0
+  return new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (pulled++ === 0) {
+          controller.enqueue(encoder.encode(payload))
+          return
+        }
+        controller.close()
+      },
+    },
+    { highWaterMark: 0 },
+  )
+}
+
+const heldSseBody = (payload: string, onCancel?: () => void) => {
+  const encoder = new TextEncoder()
+  let pulled = 0
+  let startRead = () => {}
+  const readStarted = new Promise<void>((resolve) => (startRead = resolve))
+  let cancel = () => {}
+  const cancelled = new Promise<void>((resolve) => (cancel = resolve))
+  let releaseHeld = () => {}
+  const held = new Promise<void>((resolve) => (releaseHeld = resolve))
+  const body = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (pulled++ === 0) {
+          controller.enqueue(encoder.encode(payload))
+          return
+        }
+        startRead()
+        return held
+      },
+      cancel() {
+        releaseHeld()
+        onCancel?.()
+        cancel()
+      },
+    },
+    { highWaterMark: 0 },
+  )
+  return { body, readStarted, cancelled }
+}
+
+const sseClient = (
+  body: ReadableStream<Uint8Array>,
+  callback: (summary: SseTransportSummary) => void | PromiseLike<void>,
+) =>
+  AI.make({
+    layer: Layer.mergeAll(
+      RequestExecutor.layer.pipe(
+        Layer.provide(handlerLayer((input) => Effect.succeed(input.respond(body, SSE_HEADERS)))),
+      ),
+      Layer.succeed(CurrentSseDiagnosticSink, adaptSseDiagnosticSink(callback)),
+    ),
+  })
+
+const summaryRecorder = () => {
+  const summaries: SseTransportSummary[] = []
+  let deliver: (summary: SseTransportSummary) => void = () => {}
+  const delivered = new Promise<SseTransportSummary>((resolve) => (deliver = resolve))
+  return {
+    summaries,
+    delivered,
+    callback: (summary: SseTransportSummary) => {
+      summaries.push(summary)
+      deliver(summary)
+    },
+  }
+}
+
+const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
 
 describe("AI promise client", () => {
   test("generates text, images, and streams over one managed runtime, and queues images", async () => {
@@ -629,4 +710,353 @@ describe("AI promise client", () => {
     expect(typeof AI.ai.video.start).toBe("function")
     expect(typeof AI.ai.experimental.speech.generate).toBe("function")
   })
+
+  test("classifies iterator return as consumer cancellation instead of abort", async () => {
+    const recorder = summaryRecorder()
+    const held = heldSseBody(textEvent("Hello"))
+    const ai = sseClient(held.body, recorder.callback)
+    try {
+      const iterator = ai.stream({ model: openai.chat("gpt-4o-mini"), prompt: "Say hello." })[Symbol.asyncIterator]()
+      for (;;) {
+        const next = await iterator.next()
+        if (next.done) throw new Error("expected a text delta")
+        if (LLMEvent.is.textDelta(next.value)) break
+      }
+
+      const pending = iterator.next()
+      await held.readStarted
+      await iterator.return!()
+      await pending.catch(() => undefined)
+      await held.cancelled
+
+      const summary = await recorder.delivered
+      expect(summary.terminalOutcome).toBe("consumer_cancel")
+      expect(recorder.summaries).toHaveLength(1)
+      expect(held.body.locked).toBe(false)
+    } finally {
+      await ai.dispose()
+    }
+  })
+
+  test("rejects an explicit abort with its reason and reports abort", async () => {
+    const recorder = summaryRecorder()
+    const held = heldSseBody(textEvent("Hello"))
+    const ai = sseClient(held.body, recorder.callback)
+    const controller = new AbortController()
+    const reason = new Error("explicit diagnostic abort")
+    try {
+      const iterator = ai
+        .stream({ model: openai.chat("gpt-4o-mini"), prompt: "Say hello." }, { signal: controller.signal })
+        [Symbol.asyncIterator]()
+      for (;;) {
+        const next = await iterator.next()
+        if (next.done) throw new Error("expected a text delta")
+        if (LLMEvent.is.textDelta(next.value)) break
+      }
+
+      const pending = iterator.next()
+      await held.readStarted
+      controller.abort(reason)
+
+      const failure = await pending.then(
+        () => undefined,
+        (error: unknown) => error,
+      )
+      expect(failure).toBe(reason)
+      await held.cancelled
+
+      const summary = await recorder.delivered
+      expect(summary.terminalOutcome).toBe("abort")
+      expect(recorder.summaries).toHaveLength(1)
+      expect(held.body.locked).toBe(false)
+    } finally {
+      await ai.dispose()
+    }
+  })
+
+  test("lets an abort that becomes visible during teardown outrank consumer cancellation", async () => {
+    const recorder = summaryRecorder()
+    const controller = new AbortController()
+    const reason = new Error("abort during teardown")
+    const held = heldSseBody(textEvent("Hello"), () => controller.abort(reason))
+    const ai = sseClient(held.body, recorder.callback)
+    try {
+      const iterator = ai
+        .stream({ model: openai.chat("gpt-4o-mini"), prompt: "Say hello." }, { signal: controller.signal })
+        [Symbol.asyncIterator]()
+      for (;;) {
+        const next = await iterator.next()
+        if (next.done) throw new Error("expected a text delta")
+        if (LLMEvent.is.textDelta(next.value)) break
+      }
+
+      const pending = iterator.next()
+      await held.readStarted
+      await iterator.return!()
+      await pending.catch(() => undefined)
+      await held.cancelled
+
+      const summary = await recorder.delivered
+      expect(summary.terminalOutcome).toBe("abort")
+      expect(recorder.summaries).toHaveLength(1)
+      expect(held.body.locked).toBe(false)
+    } finally {
+      await ai.dispose()
+    }
+  })
+
+  test("keeps a classified consumer cancellation frozen after a late abort", async () => {
+    const recorder = summaryRecorder()
+    const held = heldSseBody(textEvent("Hello"))
+    const ai = sseClient(held.body, recorder.callback)
+    const controller = new AbortController()
+    try {
+      const iterator = ai
+        .stream({ model: openai.chat("gpt-4o-mini"), prompt: "Say hello." }, { signal: controller.signal })
+        [Symbol.asyncIterator]()
+      for (;;) {
+        const next = await iterator.next()
+        if (next.done) throw new Error("expected a text delta")
+        if (LLMEvent.is.textDelta(next.value)) break
+      }
+
+      const pending = iterator.next()
+      await held.readStarted
+      await iterator.return!()
+      await pending.catch(() => undefined)
+      await held.cancelled
+
+      const summary = await recorder.delivered
+      expect(summary.terminalOutcome).toBe("consumer_cancel")
+      controller.abort(new Error("late abort"))
+      await settle()
+
+      expect(recorder.summaries).toHaveLength(1)
+      expect(recorder.summaries[0]).toBe(summary)
+      expect(summary.terminalOutcome).toBe("consumer_cancel")
+      expect(Object.isFrozen(summary)).toBe(true)
+      expect(held.body.locked).toBe(false)
+    } finally {
+      await ai.dispose()
+    }
+  })
+
+  test("preserves a pre-aborted signal reason and reports no SSE summary", async () => {
+    let invocations = 0
+    const ai = AI.make({
+      layer: Layer.mergeAll(
+        RequestExecutor.layer.pipe(Layer.provide(handlerLayer(() => Effect.never))),
+        Layer.succeed(
+          CurrentSseDiagnosticSink,
+          adaptSseDiagnosticSink(() => {
+            invocations++
+          }),
+        ),
+      ),
+    })
+    const controller = new AbortController()
+    const reason = new Error("already aborted")
+    controller.abort(reason)
+    try {
+      const failure = await ai
+        .generate(
+          { model: openai.chat("gpt-4o-mini"), prompt: "Say hello." },
+          { signal: controller.signal },
+        )
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        )
+      expect(failure).toBe(reason)
+      await settle()
+      expect(invocations).toBe(0)
+    } finally {
+      await ai.dispose()
+    }
+  })
+
+  test("the Promise sink adapter completes without awaiting pending delivery", async () => {
+    const summary: SseTransportSummary = {
+      terminalOutcome: "completed",
+      responseHeaderWaitMs: 0,
+      sseStreamDurationMs: 0,
+      successfulReadCount: 0,
+      chunkCount: 0,
+      splashAdaptiveSseTimeoutEligible: false,
+      adaptiveSampleCount: 0,
+    }
+    let invoked = 0
+    await Effect.runPromise(
+      adaptSseDiagnosticSink(() => {
+        invoked++
+        return new Promise<void>(() => {})
+      })(summary),
+    )
+    expect(invoked).toBe(1)
+  })
+
+  test("isolates a synchronously throwing Promise sink", async () => {
+    let invocations = 0
+    let resolveInvoked = () => {}
+    const invoked = new Promise<void>((resolve) => (resolveInvoked = resolve))
+    const body = oneChunkSseBody(chatBody)
+    const ai = sseClient(body, () => {
+      invocations++
+      resolveInvoked()
+      throw new Error("diagnostic sync failure")
+    })
+    try {
+      const response = await ai.generate({ model: openai.chat("gpt-4o-mini"), prompt: "Say hello." })
+      await invoked
+      await settle()
+      expect(response.text).toBe("Hello world")
+      expect(invocations).toBe(1)
+      expect(body.locked).toBe(false)
+    } finally {
+      await ai.dispose()
+    }
+  })
+
+  test("isolates an asynchronously rejecting Promise sink without an unhandled rejection", async () => {
+    const unhandled: Array<unknown> = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on("unhandledRejection", onUnhandled)
+    let invocations = 0
+    let resolveInvoked = () => {}
+    const invoked = new Promise<void>((resolve) => (resolveInvoked = resolve))
+    const body = oneChunkSseBody(chatBody)
+    const ai = sseClient(body, () => {
+      invocations++
+      resolveInvoked()
+      return Promise.reject(new Error("diagnostic async failure"))
+    })
+    try {
+      const response = await ai.generate({ model: openai.chat("gpt-4o-mini"), prompt: "Say hello." })
+      await invoked
+      await new Promise<void>((resolve) => setTimeout(resolve, 10))
+      expect(response.text).toBe("Hello world")
+      expect(invocations).toBe(1)
+      expect(unhandled).toEqual([])
+      expect(body.locked).toBe(false)
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+      await ai.dispose()
+    }
+  })
+
+  test("does not retain an Effect waiter for an indefinitely pending Promise sink", async () => {
+    let invocations = 0
+    let resolveInvoked = () => {}
+    const invoked = new Promise<void>((resolve) => (resolveInvoked = resolve))
+    const held = new Promise<void>(() => {})
+    const body = oneChunkSseBody(chatBody)
+    const ai = sseClient(body, () => {
+      invocations++
+      resolveInvoked()
+      return held
+    })
+
+    const response = await ai.generate({ model: openai.chat("gpt-4o-mini"), prompt: "Say hello." })
+    await invoked
+    expect(response.text).toBe("Hello world")
+    expect(invocations).toBe(1)
+    expect(body.locked).toBe(false)
+    await ai.dispose()
+    expect(invocations).toBe(1)
+  })
+
+  for (const outcome of ["abort", "consumer_cancel"] as const) {
+    for (const delivery of ["throw", "reject", "pending"] as const) {
+      test(`preserves ${outcome} with ${delivery} diagnostic delivery`, async () => {
+        const recorder = summaryRecorder()
+        const held = heldSseBody(textEvent("Hello"))
+        const controller = new AbortController()
+        const reason = new Error("request abort")
+        const unhandled: unknown[] = []
+
+        const onUnhandled = (error: unknown) => {
+          unhandled.push(error)
+        }
+
+        if (delivery === "reject") process.on("unhandledRejection", onUnhandled)
+
+        const ai = sseClient(held.body, (summary) => {
+          recorder.callback(summary)
+
+          if (delivery === "throw") throw new Error("diagnostic sync failure")
+
+          if (delivery === "reject") return Promise.reject(new Error("diagnostic async failure"))
+
+          return new Promise<void>(() => {})
+        })
+
+        let disposal: Promise<void> | undefined
+        const dispose = () => (disposal ??= ai.dispose())
+
+        try {
+          const iterator = ai
+            .stream({ model: openai.chat("gpt-4o-mini"), prompt: "Say hello." }, { signal: controller.signal })
+            [Symbol.asyncIterator]()
+
+          for (;;) {
+            const next = await iterator.next()
+            if (next.done) throw new Error("expected a text delta")
+
+            if (LLMEvent.is.textDelta(next.value)) {
+              expect(next.value.text).toBe("Hello")
+              break
+            }
+          }
+
+          const pending = iterator.next()
+
+          // Attach rejection handling immediately.
+          const observed = pending.then(
+            (value) => ({ value }) as const,
+            (error: unknown) => ({ error }) as const,
+          )
+
+          await held.readStarted
+
+          if (outcome === "abort") {
+            controller.abort(reason)
+
+            expect(await observed).toEqual({ error: reason })
+
+            const result = await observed
+            expect("error" in result ? result.error : undefined).toBe(reason)
+          } else {
+            const returned = await iterator.return!()
+            expect(returned.done).toBe(true)
+
+            const result = await observed
+            expect("value" in result).toBe(true)
+
+            if ("value" in result) expect(result.value.done).toBe(true)
+          }
+
+          await held.cancelled
+          expect(held.body.locked).toBe(false)
+
+          const summary = await recorder.delivered
+
+          expect(summary.terminalOutcome).toBe(outcome)
+          expect(Object.isFrozen(summary)).toBe(true)
+          expect(recorder.summaries).toHaveLength(1)
+
+          // Pending diagnostic delivery is deliberately never
+          // resolved. Runtime disposal must not depend on it.
+          await dispose()
+          await settle()
+
+          expect(recorder.summaries).toHaveLength(1)
+          expect(held.body.locked).toBe(false)
+          expect(unhandled).toEqual([])
+        } finally {
+          process.off("unhandledRejection", onUnhandled)
+          await dispose()
+        }
+      })
+    }
+  }
 })

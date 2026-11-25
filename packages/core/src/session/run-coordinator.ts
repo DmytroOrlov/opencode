@@ -2,6 +2,7 @@ export * as SessionRunCoordinator from "./run-coordinator.js"
 
 import { Deferred, Effect, Exit, Fiber, FiberSet, Scope } from "effect"
 import type { Promotable } from "./inbox.js"
+import { SessionGenerationAdmission } from "./generation-admission.js"
 
 /** Serializes execution for each key while allowing different keys to run concurrently. */
 export interface Coordinator<Key, E, Reason = never> {
@@ -45,6 +46,10 @@ type Execution<E, Reason> = {
   interruptionReason?: Reason
 }
 
+/** Used when a coordinator has no generation admission to hold. */
+const noLease: SessionGenerationAdmission.Lease = { release: Effect.void }
+const acquireNoLease: Effect.Effect<SessionGenerationAdmission.Lease> = Effect.succeed(noLease)
+
 /**
  * ```text
  *              wake | run
@@ -58,6 +63,8 @@ type Execution<E, Reason> = {
  */
 export const make = <Key, E, Reason = never>(options: {
   readonly drain: (key: Key, force: boolean, scope: Promotable) => Effect.Effect<void, E>
+  /** Holds shared generation admission for this complete busy period, including settlement. */
+  readonly admission?: { readonly acquireShared: Effect.Effect<SessionGenerationAdmission.Lease> }
   /** Runs once when a process-local busy period begins, before its first drain. */
   readonly started?: (key: Key) => Effect.Effect<void>
   /**
@@ -90,18 +97,43 @@ export const make = <Key, E, Reason = never>(options: {
         stopping: false,
       }
       executions.set(key, execution)
+      // One terminal observation per busy period. It stays inside the shared lease, so an exclusive
+      // acquisition (a fallback-config update, for instance) cannot slip in between the last drain and
+      // the durable terminal. A period cancelled while parked at admission never took the lease, so it
+      // observes its exit below the acquisition instead; the guard keeps that report to exactly once.
+      let observed = false
+      const observe = (exit: Exit.Exit<void, E>) =>
+        observed
+          ? Effect.void
+          : Effect.sync(() => {
+              observed = true
+              execution.owner = undefined
+            }).pipe(Effect.andThen(options.settled?.(key, exit, execution.interruptionReason) ?? Effect.void))
       // The leading yield lets `owner` be assigned before the drain can settle, and keeps
       // failing self-waking executions from growing the stack across successor starts.
       // Drains start one tick after wake; callers observe progress through events or run.
       execution.owner = fork(
         Effect.yieldNow.pipe(
-          Effect.andThen(Effect.uninterruptible(options.started?.(key) ?? Effect.void)),
-          Effect.andThen(loop(key, execution, force)),
-          Effect.onExit((exit) =>
-            Effect.sync(() => {
-              execution.owner = undefined
-            }).pipe(Effect.andThen(options.settled?.(key, exit, execution.interruptionReason) ?? Effect.void)),
+          Effect.andThen(
+            Effect.suspend(() =>
+              (options.admission?.acquireShared ?? acquireNoLease).pipe(
+                Effect.flatMap((lease) =>
+                  Effect.uninterruptible(options.started?.(key) ?? Effect.void)
+                    .pipe(Effect.andThen(loop(key, execution, force)))
+                    .pipe(Effect.onExit(observe))
+                    // The lease is released only after the terminal observation, so an exclusive
+                    // acquisition cannot slip between the last drain and the durable terminal.
+                    .pipe(Effect.ensuring(lease.release)),
+                ),
+                // A period cancelled while parked at admission never took the lease, so it observes
+                // below the acquisition instead; the guard above keeps that to one observation.
+                Effect.onExit(observe),
+              ),
+            ),
           ),
+          // A period cancelled at its leading yield, or while parked at admission before the lease was
+          // taken, never reaches the observations above; this is where it observes its exit.
+          Effect.onExit(observe),
           Effect.onExit((exit) => Effect.sync(() => settle(key, execution, exit))),
           Effect.exit,
           Effect.asVoid,

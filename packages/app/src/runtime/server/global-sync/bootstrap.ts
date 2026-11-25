@@ -1,5 +1,5 @@
 import type { Config, Path } from "@/runtime/server/types"
-import type { LocationGetInput, LocationGetOutput, ProjectListOutput } from "@opencode/client/promise"
+import type { ConfigGetOutput, LocationGetInput, LocationGetOutput, ProjectListOutput } from "@opencode/client/promise"
 import { retry } from "@opencode/util/retry"
 import type { SetStoreFunction } from "solid-js/store"
 import type { GlobalStore } from "./types"
@@ -8,11 +8,23 @@ import { QueryClient, queryOptions } from "@tanstack/solid-query"
 import type { ServerScope } from "@/runtime/server/scope"
 import { withWorktreeInventory, worktreeInventoryKey } from "@/workspaces/inventory"
 
-export const loadGlobalConfigQuery = (scope: ServerScope) =>
+export const loadGlobalConfigQuery = (
+  scope: ServerScope,
+  api: { readonly get: () => Promise<ConfigGetOutput> },
+) =>
   queryOptions({
     queryKey: [scope, "config"],
-    // TODO: Restore config loading when the V2 client exposes a config API.
-    queryFn: async (): Promise<Config> => ({}),
+    queryFn: async (): Promise<Config> => {
+      const entries = await api.get()
+      const documents = entries.filter((entry) => entry.type === "document")
+
+      // Later documents win, and a document that disables fallback says so with `null`, so precedence compares against
+      // `undefined`; a truthiness check would drop that and read a stale model instead.
+      return {
+        fallback: documents.findLast((entry) => entry.info.fallback !== undefined)?.info.fallback,
+        share: documents.findLast((entry) => entry.info.share !== undefined)?.info.share,
+      }
+    },
   })
 
 type ProjectApi = {
@@ -54,13 +66,14 @@ export async function bootstrapGlobal(input: {
   serverAPI: {
     readonly location: LocationApi
     readonly project: ProjectApi
+    readonly config: { readonly get: () => Promise<ConfigGetOutput> }
   }
   scope: ServerScope
   setGlobalStore: SetStoreFunction<GlobalStore>
   queryClient: QueryClient
 }) {
   await Promise.allSettled([
-    input.queryClient.fetchQuery(loadGlobalConfigQuery(input.scope)),
+    input.queryClient.fetchQuery(loadGlobalConfigQuery(input.scope, input.serverAPI.config)),
     input.queryClient
       .fetchQuery(loadPathQuery(input.scope, null, input.serverAPI.location))
       .then((data) => input.setGlobalStore("path", data)),

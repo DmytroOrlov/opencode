@@ -1414,7 +1414,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UnknownErrorEncoded"
+                  "$ref": "#/components/schemas/UnknownErrorEncoded_c4f29c80427d"
                 }
               }
             }
@@ -2888,7 +2888,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UnknownErrorEncoded"
+                  "$ref": "#/components/schemas/UnknownErrorEncoded_c4f29c80427d"
                 }
               }
             }
@@ -2996,7 +2996,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UnknownErrorEncoded"
+                  "$ref": "#/components/schemas/UnknownErrorEncoded_c4f29c80427d"
                 }
               }
             }
@@ -3139,7 +3139,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UnknownErrorEncoded"
+                  "$ref": "#/components/schemas/UnknownErrorEncoded_c4f29c80427d"
                 }
               }
             }
@@ -3269,7 +3269,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UnknownErrorEncoded"
+                  "$ref": "#/components/schemas/UnknownErrorEncoded_c4f29c80427d"
                 }
               }
             }
@@ -4897,7 +4897,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UnknownErrorEncoded"
+                  "$ref": "#/components/schemas/UnknownErrorEncoded_c4f29c80427d"
                 }
               }
             }
@@ -10293,6 +10293,7 @@
                     "session.archived",
                     "session.unarchived",
                     "session.usage.updated",
+                    "session.telemetry",
                     "session.deleted",
                     "session.forked",
                     "session.inbox.delivered",
@@ -10330,6 +10331,7 @@
                     "session.compaction.started",
                     "session.compaction.delta",
                     "session.compaction.ended",
+                    "session.compaction.published",
                     "session.compaction.failed",
                     "session.revert.staged",
                     "session.revert.cleared",
@@ -10404,6 +10406,7 @@
                           "session.archived",
                           "session.unarchived",
                           "session.usage.updated",
+                          "session.telemetry",
                           "session.deleted",
                           "session.forked",
                           "session.inbox.delivered",
@@ -10441,6 +10444,7 @@
                           "session.compaction.started",
                           "session.compaction.delta",
                           "session.compaction.ended",
+                          "session.compaction.published",
                           "session.compaction.failed",
                           "session.revert.staged",
                           "session.revert.cleared",
@@ -15359,7 +15363,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/UnknownErrorEncoded"
+                  "$ref": "#/components/schemas/UnknownErrorEncoded_c4f29c80427d"
                 }
               }
             }
@@ -16072,6 +16076,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/LocationNotFoundErrorEncoded"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "UnknownError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnknownErrorEncoded_e307db54c7af"
                 }
               }
             }
@@ -16994,6 +17008,16 @@
               }
             ]
           },
+          "fallback": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Config.ModelSelectionEncoded"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "default_agent": {
             "type": "string"
           },
@@ -17760,6 +17784,33 @@
         },
         "additionalProperties": false
       },
+      "Config.ModelSelectionEncoded": {
+        "anyOf": [
+          {
+            "type": "string",
+            "pattern": "^[^/#]+\\/[^#]+(?:#[^#]+)?$"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "providerID": {
+                "type": "string",
+                "pattern": "^[^/#]+$"
+              },
+              "model": {
+                "type": "string",
+                "pattern": "^[^#]+$"
+              },
+              "variant": {
+                "type": "string",
+                "pattern": "^[^#]+$"
+              }
+            },
+            "required": ["providerID", "model"],
+            "additionalProperties": false
+          }
+        ]
+      },
       "Config.Patch": {
         "type": "object",
         "properties": {
@@ -17772,9 +17823,31 @@
                 "type": "null"
               }
             ]
+          },
+          "fallback": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "providerID": {
+                    "type": "string"
+                  },
+                  "model": {
+                    "type": "string"
+                  },
+                  "variant": {
+                    "type": "string"
+                  }
+                },
+                "required": ["providerID", "model"],
+                "additionalProperties": false
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
-        "required": ["shell"],
         "additionalProperties": false
       },
       "Config.Plugin.EntryEncoded": {
@@ -17825,6 +17898,15 @@
                 "enum": [false]
               }
             ]
+          },
+          "mlxTelemetry": {
+            "type": "boolean"
+          },
+          "splashTelemetry": {
+            "type": "boolean"
+          },
+          "splashAdaptiveSseTimeout": {
+            "type": "boolean"
           },
           "compaction": {
             "$ref": "#/components/schemas/Provider.Compaction"
@@ -22885,6 +22967,15 @@
               }
             ]
           },
+          "mlxTelemetry": {
+            "type": "boolean"
+          },
+          "splashTelemetry": {
+            "type": "boolean"
+          },
+          "splashAdaptiveSseTimeout": {
+            "type": "boolean"
+          },
           "compaction": {
             "$ref": "#/components/schemas/Provider.Compaction"
           },
@@ -23252,6 +23343,17 @@
             "required": ["tmp"],
             "additionalProperties": false
           },
+          "tlsCaMode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["bundled", "system"]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "capabilities": {
             "anyOf": [
               {
@@ -23430,6 +23532,9 @@
           },
           {
             "$ref": "#/components/schemas/session.compaction.ended"
+          },
+          {
+            "$ref": "#/components/schemas/session.compaction.published"
           },
           {
             "$ref": "#/components/schemas/session.compaction.failed"
@@ -24183,6 +24288,15 @@
             "required": ["created"],
             "additionalProperties": false
           },
+          "candidateID": {
+            "$ref": "#/components/schemas/Session.Message.ID"
+          },
+          "summaryID": {
+            "$ref": "#/components/schemas/Session.Message.ID"
+          },
+          "published": {
+            "type": "boolean"
+          },
           "status": {
             "type": "string",
             "enum": ["completed"]
@@ -24233,6 +24347,15 @@
             "required": ["created"],
             "additionalProperties": false
           },
+          "candidateID": {
+            "$ref": "#/components/schemas/Session.Message.ID"
+          },
+          "summaryID": {
+            "$ref": "#/components/schemas/Session.Message.ID"
+          },
+          "published": {
+            "type": "boolean"
+          },
           "status": {
             "type": "string",
             "enum": ["failed"]
@@ -24276,6 +24399,15 @@
             },
             "required": ["created"],
             "additionalProperties": false
+          },
+          "candidateID": {
+            "$ref": "#/components/schemas/Session.Message.ID"
+          },
+          "summaryID": {
+            "$ref": "#/components/schemas/Session.Message.ID"
+          },
+          "published": {
+            "type": "boolean"
           },
           "status": {
             "type": "string",
@@ -25594,7 +25726,7 @@
         "required": ["_tag", "message"],
         "additionalProperties": false
       },
-      "UnknownErrorEncoded": {
+      "UnknownErrorEncoded_c4f29c80427d": {
         "type": "object",
         "properties": {
           "_tag": {
@@ -25608,6 +25740,41 @@
             "anyOf": [
               {
                 "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "UnknownErrorEncoded_e307db54c7af": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["UnknownError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["CONFIG_COMMITTED_BUT_UNPUBLISHED", "CONFIG_COMMITTED_WITH_POSTPUBLICATION_FAILURE"]
               },
               {
                 "type": "null"
@@ -25852,6 +26019,9 @@
             "$ref": "#/components/schemas/session.usage.updated"
           },
           {
+            "$ref": "#/components/schemas/session.telemetry"
+          },
+          {
             "$ref": "#/components/schemas/session.deleted"
           },
           {
@@ -25961,6 +26131,9 @@
           },
           {
             "$ref": "#/components/schemas/session.compaction.ended"
+          },
+          {
+            "$ref": "#/components/schemas/session.compaction.published"
           },
           {
             "$ref": "#/components/schemas/session.compaction.failed"
@@ -27956,6 +28129,12 @@
               },
               "tokens": {
                 "$ref": "#/components/schemas/TokenUsage.Info"
+              },
+              "candidateID": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "summaryID": {
+                "$ref": "#/components/schemas/Session.Message.ID"
               }
             },
             "required": ["sessionID", "reason", "text"],
@@ -28016,6 +28195,9 @@
               "inputID": {
                 "$ref": "#/components/schemas/Session.Message.ID"
               },
+              "candidateID": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
               "cost": {
                 "$ref": "#/components/schemas/Money.USD"
               },
@@ -28024,6 +28206,61 @@
               }
             },
             "required": ["sessionID", "reason", "error"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "created", "type", "durable", "data"],
+        "additionalProperties": false
+      },
+      "session.compaction.published": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Event.ID"
+          },
+          "created": {
+            "type": "number"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.compaction.published"]
+          },
+          "durable": {
+            "type": "object",
+            "properties": {
+              "aggregateID": {
+                "type": "string"
+              },
+              "seq": {
+                "$ref": "#/components/schemas/Event.Seq"
+              },
+              "version": {
+                "$ref": "#/components/schemas/Event.VersionEncoded_c77c5abcb68d"
+              }
+            },
+            "required": ["aggregateID", "seq", "version"],
+            "additionalProperties": false
+          },
+          "location": {
+            "$ref": "#/components/schemas/Location.Ref"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "$ref": "#/components/schemas/Session.ID"
+              },
+              "candidateID": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "summaryID": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              }
+            },
+            "required": ["sessionID", "candidateID", "summaryID"],
             "additionalProperties": false
           }
         },
@@ -28076,6 +28313,9 @@
                 "enum": ["auto", "manual"]
               },
               "inputID": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "candidateID": {
                 "$ref": "#/components/schemas/Session.Message.ID"
               }
             },
@@ -30084,6 +30324,106 @@
           }
         },
         "required": ["id", "created", "type", "durable", "data"],
+        "additionalProperties": false
+      },
+      "session.telemetry": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Event.ID"
+          },
+          "created": {
+            "type": "number"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.telemetry"]
+          },
+          "location": {
+            "$ref": "#/components/schemas/Location.Ref"
+          },
+          "data": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "$ref": "#/components/schemas/Session.ID"
+              },
+              "assistantMessageID": {
+                "$ref": "#/components/schemas/Session.Message.ID"
+              },
+              "attemptID": {
+                "$ref": "#/components/schemas/Event.ID"
+              },
+              "attemptSequence": {
+                "type": "integer",
+                "maximum": 9007199254740991,
+                "exclusiveMinimum": 0
+              },
+              "phase": {
+                "type": "string",
+                "enum": ["start", "prefill", "decode", "complete", "discard"]
+              },
+              "measurements": {
+                "type": "array",
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "metric": {
+                          "type": "string",
+                          "enum": ["prefill-progress"]
+                        },
+                        "processed": {
+                          "type": "number"
+                        },
+                        "total": {
+                          "type": "number"
+                        },
+                        "source": {
+                          "type": "string",
+                          "enum": ["provider-native", "estimated"]
+                        },
+                        "approximate": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": ["metric", "processed", "total", "source", "approximate"],
+                      "additionalProperties": false
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "metric": {
+                          "type": "string",
+                          "enum": ["decode-rate"]
+                        },
+                        "tokensPerSecond": {
+                          "type": "number"
+                        },
+                        "source": {
+                          "type": "string",
+                          "enum": ["provider-native", "estimated"]
+                        },
+                        "approximate": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": ["metric", "tokensPerSecond", "source", "approximate"],
+                      "additionalProperties": false
+                    }
+                  ]
+                }
+              }
+            },
+            "required": ["sessionID", "assistantMessageID", "attemptID", "attemptSequence", "phase", "measurements"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "created", "type", "data"],
         "additionalProperties": false
       },
       "session.text.delta": {

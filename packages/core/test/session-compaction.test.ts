@@ -43,7 +43,7 @@ import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
 import { Skill } from "@opencode/schema/skill"
 import { Shell } from "@opencode/schema/shell"
-import { DateTime, Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Exit, Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { asc, eq, inArray, sql } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
@@ -587,12 +587,20 @@ const compactManually = (
   Effect.gen(function* () {
     const bus = yield* Bus.Service
     const compaction = yield* SessionCompaction.Service
+    const candidateID = SessionCompaction.manualCandidateID(inputID)
     yield* bus.publish(SessionEvent.Compaction.Started, {
       sessionID: session.id,
       reason: "manual",
       inputID,
+      candidateID,
     })
-    return yield* compaction.compact({ reason: "manual", context: loaded(session, messages), inputID })
+    return yield* compaction.compact({
+      reason: "manual",
+      context: loaded(session, messages),
+      inputID,
+      candidateID,
+      started: true,
+    })
   })
 
 /** Stores messages as the session's history so far, ahead of anything published next. */
@@ -756,6 +764,7 @@ it.effect("manual compaction summarizes short context instead of no-op", () =>
       { type: Bus.versionedType(SessionEvent.Compaction.Started.type, 1) },
       { type: Bus.versionedType(SessionEvent.UsageRecorded.type, 1) },
       { type: Bus.versionedType(SessionEvent.Compaction.Ended.type, 1) },
+      { type: Bus.versionedType(SessionEvent.Compaction.Published.type, 1) },
     ])
   }),
 )
@@ -943,6 +952,7 @@ it.effect("compaction hooks can supply the summary instead of the model", () =>
     ).toEqual([
       { type: Bus.versionedType(SessionEvent.Compaction.Started.type, 1) },
       { type: Bus.versionedType(SessionEvent.Compaction.Ended.type, 1) },
+      { type: Bus.versionedType(SessionEvent.Compaction.Published.type, 1) },
     ])
   }),
 )
@@ -1254,7 +1264,7 @@ it.effect("automatic compaction swaps in the background summary without another 
         tokens: { input: 10, output: 4, reasoning: 2, cache: { read: 3, write: 2 } },
       },
     ])
-    // The background call is billed once, when it finishes, and the compaction ends after it.
+    // The background call is billed once, when it finishes, then the candidate is published as the checkpoint.
     const types = (yield* db
       .select({ type: EventTable.type })
       .from(EventTable)
@@ -1262,14 +1272,12 @@ it.effect("automatic compaction swaps in the background summary without another 
       .orderBy(asc(EventTable.seq))
       .all()
       .pipe(Effect.orDie)).map((row) => row.type)
-    expect(types.at(-1)).toBe(Bus.versionedType(SessionEvent.Compaction.Ended.type, 1))
-    expect(types.toSorted()).toEqual(
-      [
-        Bus.versionedType(SessionEvent.UsageRecorded.type, 1),
-        Bus.versionedType(SessionEvent.Compaction.Started.type, 1),
-        Bus.versionedType(SessionEvent.Compaction.Ended.type, 1),
-      ].toSorted(),
-    )
+    expect(types).toEqual([
+      Bus.versionedType(SessionEvent.Compaction.Started.type, 1),
+      Bus.versionedType(SessionEvent.UsageRecorded.type, 1),
+      Bus.versionedType(SessionEvent.Compaction.Ended.type, 1),
+      Bus.versionedType(SessionEvent.Compaction.Published.type, 1),
+    ])
   }),
 )
 
@@ -1299,6 +1307,104 @@ it.effect("automatic compaction waits for a background summary still being writt
     expect(yield* Fiber.join(compacting)).toEqual({ status: "completed" })
     expect(requests).toHaveLength(1)
   }).pipe(Effect.ensuring(Effect.sync(() => (beforeResponse = Effect.void)))),
+)
+
+it.effect("an interrupted automatic compaction settles the candidate it started", () =>
+  Effect.gen(function* () {
+    requests = []
+    const release = yield* Deferred.make<void>()
+    beforeResponse = Deferred.await(release)
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        beforeResponse = Effect.void
+      }),
+    )
+    const bus = yield* Bus.Service
+    const db = (yield* Database.Service).db
+    const store = yield* SessionStore.Service
+    const compaction = yield* SessionCompaction.Service
+    const sessionID = Session.ID.make("ses_interrupted_auto_candidate")
+    const session = yield* insertSession(sessionID)
+    // A usable checkpoint already leads the history; the interrupted candidate must leave it readable.
+    const history = precomputeHistory()
+    const messages = [completedSummary("Existing checkpoint"), ...history.due]
+    yield* storeMessages(sessionID, messages)
+
+    // A below-threshold automatic call skips: it opens no candidate, so it gets no failure of its own either.
+    expect(
+      yield* compaction.compact({
+        reason: "auto",
+        context: loaded(session, messages),
+        estimate: { measured: 0, estimated: 0 },
+      }),
+    ).toEqual({ status: "skipped" })
+
+    const started = yield* bus
+      .subscribe(SessionEvent.Compaction.Started)
+      .pipe(
+        Stream.filter((event) => event.data.sessionID === sessionID),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild({ startImmediately: true }),
+      )
+    const compacting = yield* compaction
+      .compact({ reason: "auto", context: loaded(session, messages) })
+      .pipe(Effect.forkChild({ startImmediately: true }))
+
+    // The candidate row is open while its summary request is still held back, so this is the state that used to
+    // strand a running row: an interrupt here has to settle the candidate the Started event named.
+    const startedEvents = Array.from(yield* Fiber.join(started))
+    expect(startedEvents).toHaveLength(1)
+    expect(compacting.pollUnsafe()).toBeUndefined()
+
+    yield* Fiber.interrupt(compacting)
+    const interrupted = yield* Fiber.await(compacting)
+    expect(Exit.isFailure(interrupted) && Cause.hasInterruptsOnly(interrupted.cause)).toBe(true)
+
+    const events = yield* db
+      .select({ type: EventTable.type, data: EventTable.data })
+      .from(EventTable)
+      .where(eq(EventTable.aggregate_id, sessionID))
+      .orderBy(asc(EventTable.seq))
+      .all()
+      .pipe(Effect.orDie)
+    const startedRows = events.filter((event) => event.type === Bus.versionedType(SessionEvent.Compaction.Started.type, 1))
+    expect(startedRows).toHaveLength(1)
+    const candidateID = startedRows[0].data.candidateID
+    expect(typeof candidateID).toBe("string")
+    // Exactly one failure, and it names that same candidate rather than settling whatever row is running.
+    expect(
+      events
+        .filter((event) => event.type === Bus.versionedType(SessionEvent.Compaction.Failed.type, 1))
+        .map((event) => event.data.candidateID),
+    ).toEqual([candidateID])
+    expect(events.some((event) => event.type === Bus.versionedType(SessionEvent.Compaction.Published.type, 1))).toBe(false)
+    // The candidate's row is failed, never published.
+    expect((yield* store.messages({ sessionID })).find((message) => message.id === candidateID)).toMatchObject({
+      type: "compaction",
+      status: "failed",
+      reason: "auto",
+      candidateID,
+      published: false,
+      error: { type: "compaction.interrupted", message: "Compaction was interrupted" },
+    })
+    // The checkpoint and the conversation it summarizes still read as the Session's history.
+    expect((yield* store.context(sessionID)).map((message) => [message.type, "status" in message ? message.status : undefined])).toEqual([
+      ["compaction", "completed"],
+      ["user", undefined],
+      ["assistant", undefined],
+      ["user", undefined],
+      ["assistant", undefined],
+      ["user", undefined],
+      ["assistant", undefined],
+      ["compaction", "failed"],
+    ])
+    expect((yield* store.context(sessionID))[0]).toMatchObject({
+      type: "compaction",
+      status: "completed",
+      summary: "Existing checkpoint",
+    })
+  }),
 )
 
 it.effect("a model switch waits for the new model's first response before summarizing in the background", () =>

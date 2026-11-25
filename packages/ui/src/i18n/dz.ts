@@ -84,6 +84,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "ཞུན་དག་འབད་དོ།",
   "ui.sessionTurn.status.runningCommands": "བརྡ་བཀོད་ཚུ་གཡོག་བཀོལ་དོ།",
   "ui.sessionTurn.status.thinking": "བསམ་ཤེས།",
+  "ui.sessionTurn.status.fallback": "Fallback",
   "ui.sessionTurn.status.thinkingWithTopic": "བསམ་གཞིག - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "བསམ་བློ་བསྡུ་ལེན་འབད་ནི།",
   "ui.sessionTurn.status.consideringNextSteps": "གོམ་པ་ཤུལ་མམ་ཚུ་བརྩི་འཇོག་འབད་དོ།",

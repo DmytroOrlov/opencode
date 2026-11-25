@@ -120,7 +120,142 @@ for (const direction of ["ltr", "rtl"] as const) {
       await expect(providers.getByRole("searchbox", { name: "Search providers", exact: true })).toBeFocused()
       await expect(page.getByRole("dialog")).toHaveCount(1)
     })
+
   }
+
+  // FR-023 read with FR-003 at phone width, for the pair a phone user has configured: the fallback slot's own
+  // variant control opens a drawer of its own rather than a desktop popover, each drawer belongs to its slot, both
+  // model controls keep the drawer that offers the OTHER slot's model, and no dismissal leaves an overlay or a
+  // pointer-dead page behind. The drawer's direction-specific parts (`dir`, its inline padding) are re-read here
+  // because this is the added control's first phone case.
+  test(`the fallback pair opens its own drawers in ${direction}`, async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 })
+    await openPickerSession(page, direction, true, "opencode/mobile-b#high")
+
+    const composer = page.locator('[data-component="composer"]')
+    const prompt = composer.getByRole("textbox", { name: "Prompt", exact: true })
+    const primaryModel = composer.locator('[data-action="composer-model"]')
+    const primaryVariant = composer.getByRole("button", { name: "Choose model variant", exact: true })
+    const fallbackModel = composer.locator('[data-action="composer-fallback-model"]')
+    const fallbackVariant = composer.getByRole("button", { name: "Choose fallback model variant", exact: true })
+
+    // The row states the whole pair without opening anything, and the variant beside the fallback chip is the value
+    // recorded for THAT model (`high`), not this composer's own (`balanced`), which is what keeps the two variant
+    // controls from reading as one.
+    await expect(primaryModel).toHaveText("Mobile Model A")
+    await expect(fallbackModel).toHaveText("Mobile Model B")
+    await expect(primaryVariant).toHaveText("balanced")
+    await expect(fallbackVariant).toHaveText("high")
+    await expect(fallbackModel).toHaveAttribute("data-control-type", "drawer")
+
+    // 1. The added control opens as a bottom drawer, and there is no menu or popover to open instead.
+    await fallbackVariant.click()
+    const variants = page.getByRole("dialog", { name: "Choose fallback model variant", exact: true })
+    await expect(variants).toBeVisible()
+    await expect(variants).toBeInViewport({ ratio: 1 })
+    await expect(variants).not.toHaveAttribute("data-transitioning")
+    await expect(page.getByRole("menu")).toHaveCount(0)
+    await expect(page.getByRole("menuitemradio")).toHaveCount(0)
+
+    // The drawer is the app's bottom drawer: its content element carries this direction, and its rows keep the same
+    // inset on both inline edges (12px drawer padding plus the 1px row-list border), so a mirrored drawer holds its
+    // rows the same way instead of pushing them past the drawer's edge.
+    const insets = await variants.evaluate((element) => {
+      const content = element.closest('[data-slot="mobile-drawer-content"]')
+
+      if (!content) throw new Error("The variant drawer is not inside a mobile drawer")
+
+      const drawer = content.getBoundingClientRect()
+      const row = element.querySelector('[aria-pressed="true"]')!.getBoundingClientRect()
+
+      return {
+        dir: content.getAttribute("dir"),
+        rowStart: Math.round(row.left - drawer.left),
+        rowEnd: Math.round(drawer.right - row.right),
+      }
+    })
+
+    expect(insets).toEqual({ dir: direction, rowStart: 13, rowEnd: 13 })
+
+    // The drawer offers this slot's own model's variants, with the recorded one pressed - not the primary slot's
+    // choice. Its rows keep the drawer's inline padding on this direction's start edge, so labels sit at the right
+    // edge and nothing overhangs.
+    await expect(variants.getByRole("button", { name: "high", exact: true })).toHaveAttribute("aria-pressed", "true")
+    await expect(variants.getByRole("button", { name: "max", exact: true })).toHaveAttribute("aria-pressed", "false")
+    await expect(variants.getByRole("button", { name: "balanced", exact: true })).toHaveCount(1)
+    await expect(variants.getByRole("button", { name: "max", exact: true })).toHaveCSS("padding-inline-start", "12px")
+
+    // 2. Choosing a variant there writes the config field for the fallback half only, in one request, and the drawer
+    // closes back onto the control that opened it.
+    const written = page.waitForRequest(
+      (request) => new URL(request.url()).pathname === "/api/experimental/config",
+    )
+
+    await variants.getByRole("button", { name: "max", exact: true }).click()
+    await expect(variants).toBeHidden()
+    expect(JSON.parse((await written).postData()!)).toEqual({
+      fallback: { providerID: "opencode", model: "mobile-b", variant: "max" },
+    })
+    await expect(fallbackVariant).toHaveText("max")
+    await expect(fallbackVariant).toBeFocused()
+    // The other three controls named what they named before: a variant write belongs to one slot.
+    await expect(primaryVariant).toHaveText("balanced")
+    await expect(primaryModel).toHaveText("Mobile Model A")
+    await expect(fallbackModel).toHaveText("Mobile Model B")
+
+    // 3. The primary slot's variant control opens a separate drawer, and the fallback's drawer is gone: two
+    // controls, two values, each with its own pressed row.
+    await primaryVariant.click()
+    const primaryVariants = page.getByRole("dialog", { name: "Choose model variant", exact: true })
+    await expect(primaryVariants).toBeInViewport({ ratio: 1 })
+    await expect(page.getByRole("dialog", { name: "Choose fallback model variant", exact: true })).toHaveCount(0)
+    await expect(primaryVariants.getByRole("button", { name: "balanced", exact: true })).toHaveAttribute("aria-pressed", "true")
+    await expect(primaryVariants.getByRole("button", { name: "max", exact: true })).toHaveAttribute("aria-pressed", "false")
+    await page.keyboard.press("Escape")
+    await expect(primaryVariants).toBeHidden()
+    await expect(primaryVariant).toBeFocused()
+    await expect(primaryVariant).toHaveText("balanced")
+    await expect(fallbackVariant).toHaveText("max")
+
+    // The drawers stay force-mounted for their exit transition, so the phone contract is that they are closed rather
+    // than gone: no dialog role is left, no drawer content or overlay sits open where it could catch a pointer, and the
+    // draft answers pointers again.
+    const expectClosedDrawers = async () => {
+      await expect(page.getByRole("dialog")).toHaveCount(0)
+      await expect(page.locator('[data-slot="mobile-drawer-content"]:not([data-closed])')).toHaveCount(0)
+      await expect(page.locator('[data-slot="mobile-drawer-overlay"]:not([data-closed])')).toHaveCount(0)
+      await expect(page.locator("body")).not.toHaveCSS("pointer-events", "none")
+      await expect(prompt).toBeEditable()
+    }
+
+    // Nothing survives the closed drawers.
+    await expectClosedDrawers()
+
+    // 4. Both model controls open the existing model drawer, and each offers the other slot's model as an ordinary
+    // row, which is how a phone user exchanges the pair in one action (FR-024/FR-033 read with FR-023).
+    await primaryModel.click()
+    const models = page.getByRole("dialog", { name: "Select model", exact: true })
+    await expect(models.locator('[data-slot="model-selector-drawer"]')).toBeFocused()
+    await expect(models.getByRole("button", { name: /Mobile Model A/ })).toHaveAttribute("aria-pressed", "true")
+    await expect(models.locator('[data-option-key="opencode:mobile-b"]')).toBeVisible()
+    await page.locator('[data-slot="mobile-drawer-overlay"]').click({ position: { x: 10, y: 10 } })
+    await expect(models).toBeHidden()
+    await expect(primaryModel).toBeFocused()
+
+    await fallbackModel.click()
+    const fallbackModels = page.getByRole("dialog", { name: "Select model", exact: true })
+    await expect(fallbackModels.locator('[data-slot="model-selector-drawer"]')).toBeFocused()
+    await expect(fallbackModels.locator('[data-option-key="opencode:mobile-b"]')).toHaveAttribute("aria-pressed", "true")
+    await expect(fallbackModels.locator('[data-option-key="opencode:mobile-a"]')).toBeVisible()
+    // Dismissing the fallback's drawer by its overlay restores its own chip, and looking at the pair changes nothing
+    // in it.
+    await page.locator('[data-slot="mobile-drawer-overlay"]').click({ position: { x: 10, y: 10 } })
+    await expect(fallbackModels).toBeHidden()
+    await expect(fallbackModel).toBeFocused()
+    await expectClosedDrawers()
+    await expect(fallbackModel).toHaveText("Mobile Model B")
+    await expect(fallbackVariant).toHaveText("max")
+  })
 
   test(`desktop model button opens the model dialog in ${direction}`, async ({ page }) => {
     const { composer, model, variant, dialog } = await openDesktopPicker(page, direction)
@@ -364,6 +499,43 @@ test.describe("touch composer pickers", () => {
     await search.tap()
     await expect(search).toBeFocused()
   })
+
+  // FR-012/FR-013 on the phone: the drawer the fallback chip opens leads with its "None" action row, and the drawer's
+  // OWN list still carries the other slot's model as a row - both are the picker's business, so the drawer has to pass
+  // them on rather than rebuild the list without them. The action writes the config field and closes the drawer.
+  test("the fallback drawer offers its None row and the other slot's model", async ({ page }) => {
+    await openPickerSession(page, "ltr", true)
+    const composer = page.locator('[data-component="composer"]')
+    const model = composer.locator('[data-action="composer-model"]')
+    const chip = composer.locator('[data-action="composer-fallback-model"]')
+
+    // The session names `Mobile Model A`, and no config document names a fallback, so the shipped default is the
+    // effective one: an enabled fallback the catalog has no model for, which leaves that slot no variant control.
+    await expect(model).toHaveText("Mobile Model A")
+    await expect(chip).toHaveText("qwen3.8-27b (unavailable)")
+
+    const patches: string[] = []
+    const written = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/experimental/config")
+    page.on("request", (request) => {
+      if (new URL(request.url()).pathname === "/api/experimental/config") patches.push(request.method())
+    })
+
+    await chip.tap()
+    const models = page.getByRole("dialog", { name: "Select model", exact: true })
+    const none = models.locator('[data-option-key="none"]')
+    await expect(none).toBeVisible()
+    await expect(none.locator('[data-slot="settings-row-title"]')).toHaveText("None")
+    // A fallback is in effect, so the row is not yet the current entry, and the other slot's model is still a row here.
+    await expect(none).toHaveAttribute("aria-pressed", "false")
+    await expect(models.locator('[data-option-key="opencode:mobile-a"]')).toBeVisible()
+
+    await none.tap()
+    await expect(models).toBeHidden()
+    expect(JSON.parse((await written).postData()!)).toEqual({ fallback: null })
+    await expect(model).toHaveText("Mobile Model A")
+    await expect(chip).toHaveText("None")
+    expect(patches).toEqual(["PATCH"])
+  })
 })
 
 async function openDesktopPicker(page: Page, direction: "ltr" | "rtl") {
@@ -379,9 +551,26 @@ async function openDesktopPicker(page: Page, direction: "ltr" | "rtl") {
   }
 }
 
-async function openPickerSession(page: Page, direction: "ltr" | "rtl", paid: boolean) {
+// The config document the mock answers through `GET /api/config`, spelled as `e2e/regression/composer.spec.ts` does,
+// so the app's own config reader (`runtime/server/sync.tsx`) resolves the fallback the pair cases stage.
+const configPath = "/home/test/.config/opencode/opencode.jsonc"
+
+async function openPickerSession(
+  page: Page,
+  direction: "ltr" | "rtl",
+  paid: boolean,
+  fallback?: string,
+) {
+  // A configured fallback the catalog can name, so the phone row carries the fallback slot's own variant control
+  // (FR-003 read with FR-023). Only the pair cases pass this, and the other cases keep the shipped default fallback
+  // whose model the catalog cannot name.
+  const fallbackConfig = fallback
+    ? { configEntries: [{ type: "document", path: configPath, info: { fallback } }] }
+    : {}
+
   await mockOpenCodeServer(page, {
     ...fixture,
+    ...fallbackConfig,
     sessions: fixture.sessions.map((session) => ({
       ...session,
       model: { id: "mobile-a", providerID: "opencode", variant: "balanced" },

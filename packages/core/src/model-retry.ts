@@ -77,13 +77,21 @@ export const policy = Effect.gen(function* () {
         Pull.catchDone(() => Effect.succeed(undefined)),
       )
       if (!next) return undefined
+
       const [, duration] = next
       attempt++
-      if (input.cause.reason._tag === "Transport" && input.cause.reason.code === "Timeout") timeouts++
+
+      if (input.cause.reason._tag === "Transport" && input.cause.reason.code === "Timeout") {
+        timeouts++
+      }
+
+      const hardAllowed = timeouts <= MAX_TIMEOUT_RETRIES
+
       return {
         attempt,
         delay: Math.ceil(Duration.toMillis(duration)),
-        retry: input.retry && timeouts <= MAX_TIMEOUT_RETRIES,
+        retry: input.retry && hardAllowed,
+        hardAllowed,
       }
     })
 })

@@ -635,6 +635,7 @@ export namespace Compaction {
       ...Base,
       reason: Schema.Literals(["auto", "manual"]),
       inputID: SessionMessage.ID.pipe(optional),
+      candidateID: SessionMessage.ID.pipe(optional),
     },
   })
   export type Started = typeof Started.Type
@@ -661,9 +662,22 @@ export namespace Compaction {
       // stays the accounting source for session totals and stats.
       cost: SessionMessage.CompactionCompleted.fields.cost,
       tokens: SessionMessage.CompactionCompleted.fields.tokens,
+      candidateID: SessionMessage.ID.pipe(optional),
+      summaryID: SessionMessage.ID.pipe(optional),
     },
   })
   export type Ended = typeof Ended.Type
+
+  export const Published = Event.durable({
+    type: "session.compaction.published",
+    ...options,
+    schema: {
+      ...Base,
+      candidateID: SessionMessage.ID,
+      summaryID: SessionMessage.ID,
+    },
+  })
+  export type Published = typeof Published.Type
 
   export const Failed = Event.durable({
     type: "session.compaction.failed",
@@ -673,6 +687,7 @@ export namespace Compaction {
       reason: Started.data.fields.reason,
       error: SessionError.Error,
       inputID: SessionMessage.ID.pipe(optional),
+      candidateID: SessionMessage.ID.pipe(optional),
       cost: SessionMessage.CompactionFailed.fields.cost,
       tokens: SessionMessage.CompactionFailed.fields.tokens,
     },
@@ -744,6 +759,7 @@ export const Definitions = Event.inventory(
   Compaction.Started,
   Compaction.Delta,
   Compaction.Ended,
+  Compaction.Published,
   Compaction.Failed,
   RevertEvent.Staged,
   RevertEvent.Cleared,

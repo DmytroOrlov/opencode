@@ -82,6 +82,7 @@ export const dict = {
   "ui.sessionTurn.status.makingEdits": "Üýtgetmeler girizmek",
   "ui.sessionTurn.status.runningCommands": "Işleýän buýruklar",
   "ui.sessionTurn.status.thinking": "Oýlanmak",
+  "ui.sessionTurn.status.fallback": "Rezerv model",
   "ui.sessionTurn.status.thinkingWithTopic": "Oýlanmak - {{topic}}",
   "ui.sessionTurn.status.gatheringThoughts": "Pikirleri ýygnamak",
   "ui.sessionTurn.status.consideringNextSteps": "Indiki ädimleri göz öňünde tutmak",

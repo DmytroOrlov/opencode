@@ -15,6 +15,10 @@ import {
 } from "./route/client.js"
 import { RequestExecutor, type HttpMiddleware } from "./route/executor.js"
 import {
+  CurrentSseRequest,
+  type SseTransportSummary,
+} from "./route/transport/http.js"
+import {
   AIError,
   InvalidRequestError,
   LanguageModel,
@@ -105,22 +109,55 @@ export const make = (options: Options = {}) => {
 
   /** Run any package Effect (for example `ai.compact(...)` from `@opencode/ai/effect`) inside this runtime. */
   const run = <A, E>(effect: Effect.Effect<A, E, Services>, options?: RunOptions) =>
-    runtime.runPromise(Effect.raceFirst(scoped(effect, options?.http), abortEffect(options?.signal)))
-
-  const iterate = <A, E>(stream: Stream.Stream<A, E, Services>, options?: RunOptions): AsyncIterable<A> =>
-    Stream.toAsyncIterable(
-      Stream.unwrap(
-        runtime.contextEffect.pipe(
-          Effect.map(
-            (context): Stream.Stream<A, unknown> =>
-              scoped(stream, options?.http).pipe(
-                Stream.interruptWhen(abortEffect(options?.signal)),
-                Stream.provideContext(context),
-              ),
-          ),
+    runtime.runPromise(
+      Effect.raceFirst(
+        scoped(effect, options?.http).pipe(
+          Effect.provideService(CurrentSseRequest, {
+            signal: options?.signal,
+          }),
         ),
+        abortEffect(options?.signal),
       ),
     )
+
+  const iterate = <A, E>(
+    stream: Stream.Stream<A, E, Services>,
+    options?: RunOptions,
+  ): AsyncIterable<A> => ({
+    [Symbol.asyncIterator]() {
+      let returned = false
+
+      const iterator = Stream.toAsyncIterable(
+        Stream.unwrap(
+          runtime.contextEffect.pipe(
+            Effect.map(
+              (context): Stream.Stream<A, unknown> =>
+                scoped(stream, options?.http).pipe(
+                  Stream.provideService(CurrentSseRequest, {
+                    signal: options?.signal,
+                    consumerReturned: () => returned,
+                  }),
+                  Stream.interruptWhen(
+                    abortEffect(options?.signal),
+                  ),
+                  Stream.provideContext(context),
+                ),
+            ),
+          ),
+        ),
+      )[Symbol.asyncIterator]()
+
+      return {
+        next: () => iterator.next(),
+        return: () => {
+          returned = true
+          return iterator.return!()
+        },
+        throw: (error?: unknown) =>
+          iterator.throw!(error),
+      }
+    },
+  })
 
   function generate<const Model extends LanguageModel, S extends OutputSchema>(
     input: LLMRequestInput<Model> & { readonly schema: S },
@@ -328,6 +365,27 @@ const scoped = <Self extends Effect.Effect<unknown, unknown, unknown> | Stream.S
   self: Self,
   http: HttpMiddleware | undefined,
 ) => (http === undefined ? self : RequestExecutor.withMiddleware(http)(self))
+
+/** @internal — adapts host/test diagnostic delivery without retaining an Effect waiter. */
+export const adaptSseDiagnosticSink = (
+  callback: (
+    summary: SseTransportSummary,
+  ) => void | PromiseLike<void>,
+) =>
+  (summary: SseTransportSummary) =>
+    Effect.sync(() => {
+      try {
+        const delivery = callback(summary)
+
+        // Attach rejection handling in the same synchronous
+        // handoff. Never await or adopt delivery into Effect.
+        void Promise.resolve(delivery).catch(
+          () => undefined,
+        )
+      } catch {
+        // Observational delivery cannot fail the request.
+      }
+    })
 
 const fileError = (message: string, cause: unknown) =>
   new AIError({ reason: new InvalidRequestError({ message, cause }) })

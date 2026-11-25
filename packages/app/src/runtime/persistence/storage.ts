@@ -6,7 +6,7 @@ import { createStore, type SetStoreFunction, type Store } from "solid-js/store"
 import { Option, Predicate, Schema } from "effect"
 import { pathKey } from "@/workspaces/path-key"
 import { ScopedKey, ServerScope } from "@/runtime/server/scope"
-import { persistStore } from "./persist"
+import { persistStore, type PersistWriteFailure } from "./persist"
 import { canWriteBackHydration } from "./persist-machine"
 import { Persistence } from "./schema"
 import {
@@ -24,6 +24,8 @@ type PersistedWithReady<T> = [
   SetStoreFunction<T>,
   InitType,
   Accessor<boolean> & { promise: undefined | Promise<unknown> },
+  /** This store's outstanding failed save, or `undefined` once a later save of it landed. */
+  Accessor<PersistWriteFailure | undefined>,
 ]
 
 type PersistTarget = {
@@ -703,5 +705,6 @@ export function persisted<S extends Schema.ConstraintCodec<object, unknown>>(
     persist.setStore,
     persist.init,
     Object.assign(persist.ready, { promise: persist.init instanceof Promise ? persist.init : undefined }),
+    persist.failure,
   ]
 }

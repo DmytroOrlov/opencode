@@ -1,13 +1,21 @@
 import path from "node:path"
+import fs from "node:fs/promises"
 import { expect } from "bun:test"
 import { OpenCode } from "@opencode/client"
 import { Database } from "@opencode/core/database/database"
 import { Global } from "@opencode/util/global"
+import { verifyTlsCaMode } from "@opencode/util/tls-ca"
 import { Context, Effect } from "effect"
+import { filesystem as platformFilesystem } from "@opencode/util/effect/app-node-platform"
 import { tempGlobalLayer } from "../../core/test/fixture/global"
+import { filesystemInjection } from "./fixture/config-fs"
 import { tmpdirScoped } from "../../core/test/fixture/tmpdir"
 import { it } from "../../core/test/lib/effect"
 import { serveRoutes } from "./fixture/routes"
+
+// `serveRoutes` builds the production route graph, whose server-info read asks for the verified TLS CA mode. Naming it
+// here keeps this file correct on its own instead of depending on another test file's load order.
+verifyTlsCaMode("bundled")
 
 const large = "x".repeat(60_000)
 
@@ -79,5 +87,47 @@ it.live("other defects answer 500 with a ref, and unknown routes keep their 404"
     })
 
     expect((yield* server.request("GET", "/api/does-not-exist")).status).toBe(404)
+  }),
+)
+
+it.live("a config route defect keeps the uncoded envelope, so a committed outcome stays the only coded case", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped("opencode-defect-config-")
+    const global = path.join(dir.path, "global")
+    const config = path.join(global, "opencode.jsonc")
+    yield* Effect.promise(() => fs.mkdir(global, { recursive: true }))
+    yield* Effect.promise(() => fs.writeFile(config, `{ "shell": "bash" }\n`))
+    const injection = filesystemInjection()
+    // The rename is the commit boundary: failing there is an ordinary defect with the previous document intact.
+    injection.faults.rename = true
+    const server = yield* serveRoutes(
+      {
+        app: { version: "test" },
+        database: { path: path.join(dir.path, "opencode.db") },
+        models: { fetch: false },
+        fs: { filewatcher: false },
+        config: { directory: global },
+      },
+      [platformFilesystem.replace(injection.layer)],
+    )
+
+    const response = yield* Effect.promise(async () => {
+      const result = await server.fetch("http://opencode.local/api/experimental/config", {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ shell: "/bin/zsh" }),
+      })
+      return { status: result.status, body: await result.text() }
+    })
+
+    expect(response.status).toBe(500)
+    expect(injection.calls.renames.length).toBe(1)
+    expect(yield* Effect.promise(() => fs.readFile(config, "utf8"))).toContain('"shell": "bash"')
+    // An exact envelope comparison is the assertion: no `code` key may appear when nothing was committed.
+    expect(JSON.parse(response.body)).toEqual({
+      _tag: "UnknownError",
+      message: "Server failed to handle the request. Check server logs for details.",
+      ref: expect.stringMatching(/^err_[0-9a-f]{8}$/),
+    })
   }),
 )

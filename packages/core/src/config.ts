@@ -2,9 +2,10 @@ export * as Config from "./config.js"
 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import path from "path"
+import { randomUUID } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 import { applyEdits, modify, type ParseError, parse } from "jsonc-parser"
-import { Context, Effect, FiberMap, Layer, Option, PubSub, Ref, Schema, Semaphore, Stream } from "effect"
+import { Cause, Context, Effect, Exit, FiberMap, Layer, Option, PubSub, Ref, Schema, Semaphore, Stream } from "effect"
 import { Directory, Document, Info, type Patch, type Entry, Event } from "@opencode/schema/config"
 import { Credential } from "./credential.js"
 import { Bus } from "./bus.js"
@@ -15,6 +16,7 @@ import { Location } from "./location.js"
 import { AbsolutePath } from "./schema.js"
 import { ConfigVariable } from "./config/variable.js"
 import { ConfigNormalize } from "./config/normalize.js"
+import { ConfigModel } from "@opencode/schema/config/model"
 import { ConfigDiscovery } from "./config/discovery.js"
 import { ConfigWatch } from "./config/watch.js"
 import { ConfigIntegration } from "./config/integration.js"
@@ -24,11 +26,67 @@ import { Connection } from "@opencode/schema/connection"
 import { WellKnown } from "./wellknown.js"
 import { AppProcess } from "@opencode/util/process"
 import { ChildProcess } from "effect/process"
+import { SessionGenerationAdmission } from "./session/generation-admission.js"
+import { FallbackRuntimeIntent } from "./config/fallback-runtime-intent.js"
 
 export function latest<K extends keyof Info>(entries: readonly Entry[], key: K): Info[K] | undefined {
   return entries.findLast((entry): entry is Document => entry.type === "document" && entry.info[key] !== undefined)
     ?.info[key]
 }
+
+/**
+ * An update rejected before any byte changed. The previous document stays committed
+ * and neither committed-state identity below applies.
+ */
+export class CandidateRejectedError extends Schema.TaggedError<CandidateRejectedError>()("Config.CandidateRejected", {
+  file: Schema.String,
+  reason: Schema.String,
+}) {
+  override get message() {
+    return `Rejected configuration update for ${this.file}: ${this.reason}`
+  }
+}
+
+/**
+ * The atomic rename committed the new document, but protected readers were not refreshed.
+ * The new bytes remain authoritative and reconciliation keeps running forward: this is
+ * never a rollback.
+ */
+export class CommittedButUnpublishedError extends Schema.TaggedError<CommittedButUnpublishedError>()(
+  "Config.CommittedButUnpublished",
+  {
+    file: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message() {
+    const detail = this.cause instanceof Error ? this.cause.message : this.cause && String(this.cause)
+    return `Committed ${this.file} without publishing it to protected readers${detail ? `: ${detail}` : ""}`
+  }
+}
+
+/**
+ * The rename committed and protected readers hold the new document; the notification
+ * other owners rely on did not complete and no later reload repeats it.
+ */
+export class CommittedWithPostPublicationFailureError extends Schema.TaggedError<
+  CommittedWithPostPublicationFailureError
+>()("Config.CommittedWithPostPublicationFailure", {
+  file: Schema.String,
+  cause: Schema.optional(Schema.Defect()),
+}) {
+  override get message() {
+    const detail = this.cause instanceof Error ? this.cause.message : this.cause && String(this.cause)
+    return `Committed and published ${this.file} with an incomplete completion step${detail ? `: ${detail}` : ""}`
+  }
+}
+
+/** Error union for {@link Interface.update}; the later server owner maps these identities. */
+export type UpdateError =
+  | FSUtil.Error
+  | CandidateRejectedError
+  | CommittedButUnpublishedError
+  | CommittedWithPostPublicationFailureError
 
 export interface Interface {
   /** Returns location config documents and discovery sources from lowest to highest priority. */
@@ -44,8 +102,14 @@ export interface Interface {
    * source files they parse and rebuild their own state.
    */
   readonly changes: () => Stream.Stream<Watcher.Update>
-  /** Updates supported global config fields while preserving unrelated JSONC content. */
-  readonly update?: (patch: Patch) => Effect.Effect<void, FSUtil.Error>
+  /**
+   * Updates supported global config fields while preserving unrelated JSONC content.
+   * Failures identify actual state: precommit failures carry no committed marker, a reconciliation
+   * failure no commit can be attributed to surfaces its own cause, and the two committed
+   * identities describe a renamed document this owner made that did or did not reach protected
+   * readers. No call reports success while protected readers remain stale.
+   */
+  readonly update?: (patch: Patch) => Effect.Effect<void, UpdateError>
   /**
    * Replaces, or clears with `undefined`, the document an integration connection contributes. It loads right after
    * managed policies: its settings layer below remote, user, and project config, while its policies outrank theirs.
@@ -131,8 +195,9 @@ export const layer = (options?: Options) =>
       const integrations = new Map<string, ConfigIntegration.Document>()
       // Integrations set their documents from outside this layer, so their reloads run with its services.
       const context = yield* Effect.context<FSUtil.Service | Global.Service | Location.Service>()
+      const admission = yield* SessionGenerationAdmission.Service
+      const fallbackIntent = yield* FallbackRuntimeIntent.Service
       const reloadLock = Semaphore.makeUnsafe(1)
-      const updateLock = Semaphore.makeUnsafe(1)
       const decodeOptions = { errors: "all", onExcessProperty: "ignore" } as const
       const decodeInfo = Schema.decodeUnknownOption(Info, decodeOptions)
       const parseInfo = Effect.fn("Config.parseInfo")(function* (text: string, source: string) {
@@ -378,6 +443,10 @@ export const layer = (options?: Options) =>
       })
 
       const initial = yield* ConfigDiscovery.discover(options)
+      // Highest shared committed revision this owner has actually reconciled from disk. Read BEFORE
+      // the initial load: a commit landing during that load must not be marked observed, or a later
+      // protected read could present bytes it never read.
+      let observedCommitted = yield* fallbackIntent.committedRevision()
       let sources = initial
       let configs = yield* load(initial)
       const updates = yield* PubSub.unbounded<Watcher.Update>()
@@ -402,18 +471,45 @@ export const layer = (options?: Options) =>
         }
       })
 
+      // Installs reader state from disk. `false` means the decoded document and compatibility
+      // roots are already equal, which is coherent, so nothing is announced.
+      const refresh = Effect.fn("Config.refreshReaders")(function* () {
+        // Captured before discovery and loading, so the revision this owner can claim to have read
+        // is the one that existed when it started reading. A commit racing the disk load keeps the
+        // marker behind that commit, and the next protected read reconciles again instead of
+        // presenting bytes this owner never read.
+        const committedAtStart = yield* fallbackIntent.committedRevision()
+        const discovered = yield* ConfigDiscovery.discover(options)
+        const next = yield* load(discovered)
+        yield* reconcile(discovered)
+        const compatibilityChanged =
+          !isDeepStrictEqual(sources.claude, discovered.claude) ||
+          !isDeepStrictEqual(sources.agents, discovered.agents)
+        if (isDeepStrictEqual(configs, next) && !compatibilityChanged) {
+          observedCommitted = committedAtStart
+          return false
+        }
+        sources = discovered
+        configs = next
+        observedCommitted = committedAtStart
+        return true
+      })
+
+      // Announces a refreshed document. `Event.Updated` is ephemeral, so Bus runs inline
+      // listeners without isolating them: a listener that aborts stops live and typed subscribers
+      // from seeing the event at all, and a deferred rescan cannot repeat the announcement because
+      // `refresh` then short-circuits on an equal document. The failure therefore propagates;
+      // boundaries that must name the state observe it with `Effect.exit`.
+      const announceUpdate = Effect.fn("Config.announceUpdate")(function* () {
+        yield* bus.publish(Event.Updated, {})
+      })
+
       const reload = Effect.fn("Config.reload")(
         function* () {
-          const discovered = yield* ConfigDiscovery.discover(options)
-          const next = yield* load(discovered)
-          yield* reconcile(discovered)
-          const compatibilityChanged =
-            !isDeepStrictEqual(sources.claude, discovered.claude) ||
-            !isDeepStrictEqual(sources.agents, discovered.agents)
-          if (isDeepStrictEqual(configs, next) && !compatibilityChanged) return
-          sources = discovered
-          configs = next
-          yield* bus.publish(Event.Updated, {})
+          if (!(yield* refresh())) return
+          // Ordinary reload callers keep the previous contract: an aborted notification
+          // propagates instead of being discarded.
+          yield* announceUpdate()
         },
         (effect) => reloadLock.withPermit(effect),
       )
@@ -466,32 +562,354 @@ export const layer = (options?: Options) =>
       )
       yield* reloadLock.withPermit(reconcile(initial))
 
-      const update = Effect.fn("Config.update")(
-        function* (patch: Patch) {
+      // Two distinct faults, kept apart so a committed-state identity is never invented:
+      // `pendingCommit` is a durable commit made by this owner that protected readers were not
+      // published to, while `readersStale` records that a reconciliation attempt failed, so
+      // readers may lag durable disk state without any commit belonging to this call. Either
+      // one keeps a protected read from serving a stale document.
+      let pendingCommit = false
+      let readersStale = false
+      // An aborted mandatory announcement whose delivery has not been retried yet. Reader state
+      // may already be coherent, but the pending delivery must not be dropped silently.
+      let deliveryPending = false
+
+      // A protected read must not silently return a document older than the last durable
+      // commit, so it reconciles from disk. If that refresh fails the read fails explicitly
+      // with the real cause: the last coherent document stays held internally as pending state
+      // and the fault stays armed for a later retry, but it is never presented as a current
+      // successful read. A mandatory announcement that aborts is handled the same way: the
+      // coherent document stays installed, the actual failure surfaces to this reader, and the
+      // delivery stays pending so the next protected read retries it instead of losing it.
+      const reconcileReaders = Effect.fn("Config.reconcileReaders")(function* () {
+        const reconciled = yield* Effect.exit(
+          reloadLock
+            .withPermit(
+              Effect.gen(function* () {
+                // Preserve mandatory notification across multiple physical loads. A refresh can read
+                // an older snapshot while another location commits. Do not publish or return a KNOWN
+                // stale result.
+                let changed = false
+
+                while (true) {
+                  changed = (yield* refresh()) || changed
+
+                  // The marker captured by refresh() was taken BEFORE the load. If another location
+                  // committed during that load, run another refresh under the existing reloadLock.
+                  if (observedCommitted < (yield* fallbackIntent.committedRevision())) continue
+
+                  if (changed || deliveryPending) {
+                    deliveryPending = true
+                    yield* announceUpdate()
+                    deliveryPending = false
+                    changed = false
+                  }
+
+                  // A newer commit may also arrive while mandatory notification is executing. Check
+                  // again before completing this read.
+                  if (observedCommitted < (yield* fallbackIntent.committedRevision())) continue
+
+                  pendingCommit = false
+                  readersStale = false
+                  return configs
+                }
+              }),
+            )
+            .pipe(Effect.provide(context)),
+        )
+        if (Exit.isSuccess(reconciled)) return reconciled.value
+        const cause = Exit.getCause(reconciled)
+        // The reconciliation is known to have stalled, so the fault stays armed: the next
+        // protected read retries it instead of returning the in-memory document unchecked.
+        readersStale = true
+        yield* Effect.logWarning("configuration readers could not be reconciled", {
+          cause: Option.getOrUndefined(cause),
+        })
+        return yield* Option.match(cause, {
+          // Re-raised unchanged, so a defect, typed failure or interruption keeps its own
+          // identity and callers see a failed read rather than stale state.
+          onSome: (cause) => Effect.failCause(cause),
+          onNone: () => Effect.die(new Error("config reader reconciliation failed")),
+        })
+      })
+
+      // Candidate validation mirrors the reload pipeline for the complete serialized document
+      // produced by sparse editing: it must parse as JSONC, normalize without dropping a recognized
+      // field, and decode as Info. Diagnostic kinds "unsupported" (legacy fields) and "conflict"
+      // (native/legacy precedence) stay tolerated so legacy documents, comments and formatting
+      // still commit.
+      const validateCandidate = (text: string): string | undefined => {
+        const errors: ParseError[] = []
+        const input: unknown = parse(text, errors, { allowTrailingComma: true })
+        if (errors.length) return "malformed JSON or JSONC document"
+        const result = ConfigNormalize.normalize(input)
+        if (result.type === "rejected") return "configuration root is not an object"
+        const invalid = result.diagnostics.filter((diagnostic) => diagnostic.kind === "invalid")
+        if (invalid.length)
+          return `invalid recognized field ${invalid.map((diagnostic) => diagnostic.path.join(".")).join(", ")}`
+        if (Option.isNone(decodeInfo(result.encoded))) return "canonical configuration failed validation"
+        return undefined
+      }
+
+      const update = Effect.fn("Config.update")(function* (patch: Patch) {
+        const hasFallback = Object.hasOwn(patch, "fallback")
+        const fallback = hasFallback
+          ? patch.fallback === null
+            ? null
+            : Schema.decodeUnknownSync(ConfigModel.Selection)(patch.fallback)
+          : undefined
+        // FR-007: the update-owner entry position is reserved BEFORE validation. Accepted
+        // commits serialize in entry order even when validation finishes out of order, and
+        // the position retires on every exit path, so invalid or cancelled updates release
+        // it without blocking later writers. The former update lock is gone: entry order
+        // comes from the reservation boundary below and commit serialization stays with
+        // the exclusive admission lease.
+        const reservation = yield* fallbackIntent.reserve()
+        let staged = false
+        // Candidate validation mirrors the reload pipeline for the complete serialized document
+        // produced by sparse editing: it must parse as JSONC, normalize without dropping a recognized
+        // field, and decode as Info. Diagnostic kinds "unsupported" (legacy fields) and "conflict"
+        // (native/legacy precedence) stay tolerated so legacy documents, comments and formatting
+        // still commit. It runs pre-admission (this gates intent staging) and again at the
+        // commit boundary (this applies and compares the sparse patch against the latest
+        // committed document), so a stale validation never authorizes a stale write.
+        const editAndValidate = Effect.fnUntraced(function* () {
           const directory = initial.global ?? AbsolutePath.make(globalService.config)
           const candidates = ConfigDiscovery.names.map((name) => path.join(directory, name))
           const filepath =
             (yield* Effect.filter(candidates, fs.isFile)).at(-1) ?? path.join(directory, "opencode.jsonc")
           const text = (yield* fs.readFileStringSafe(filepath)) ?? "{}\n"
+          const formattingOptions = { formattingOptions: { tabSize: 2, insertSpaces: true } } as const
           const updated = yield* Effect.try({
-            try: () =>
-              applyEdits(
-                text,
-                modify(text, ["shell"], patch.shell ?? undefined, {
-                  formattingOptions: { tabSize: 2, insertSpaces: true },
-                }),
-              ),
+            try: () => {
+              const shellUpdated = Object.hasOwn(patch, "shell")
+                ? applyEdits(text, modify(text, ["shell"], patch.shell ?? undefined, formattingOptions))
+                : text
+              const candidate = hasFallback
+                ? applyEdits(shellUpdated, modify(shellUpdated, ["fallback"], fallback, formattingOptions))
+                : shellUpdated
+              return candidate.endsWith("\n") ? candidate : `${candidate}\n`
+            },
             catch: (cause) => new FSUtil.FileSystemError({ method: "config.update", cause }),
           })
-          yield* fs.writeWithDirs(filepath, updated.endsWith("\n") ? updated : `${updated}\n`)
-          yield* requestReload
-        },
-        (effect) => updateLock.withPermit(effect),
-      )
+          // Sparse edits must not smuggle a broken document past the pipeline: the complete
+          // candidate is validated before anything is staged or written, so a rejected
+          // candidate is an ordinary precommit failure with the old bytes intact.
+          const reason = validateCandidate(updated)
+          if (reason !== undefined) {
+            yield* Effect.logWarning("rejected configuration update", { source: filepath, reason })
+            return yield* Effect.fail(new CandidateRejectedError({ file: filepath, reason }))
+          }
+          return { directory, filepath, text, updated }
+        })
+        return yield* Effect.gen(function* () {
+          if (hasFallback) {
+            // FR-006: staging follows validation and precedes admission. A validation failure
+            // publishes no intent and keeps the old document; its reserved position still
+            // retires on exit, so a later writer progresses.
+            const validated = yield* Effect.exit(editAndValidate())
+            if (Exit.isSuccess(validated))
+              staged = yield* fallbackIntent.stageValidated(reservation, fallback ?? null)
+            else
+              return yield* Option.match(Exit.getCause(validated), {
+                // The actual precommit failure keeps its own identity: typed rejection,
+                // filesystem error or interruption. Nothing was staged, written or announced.
+                onSome: (cause) => Effect.failCause(cause),
+                onNone: () => Effect.die(new Error("configuration update validation failed")),
+              })
+          }
+          // FR-007: the commit boundary waits for every earlier entry position to retire
+          // (commit, fail, or cancel), so accepted durable commits occur in entry order even
+          // though a newer intent staged first. Shell-only patches never stage and never clear.
+          yield* fallbackIntent.awaitPredecessors(reservation)
+          const persist = admission.acquireExclusive.pipe(
+            Effect.flatMap((lease) =>
+              Effect.gen(function* () {
+                const fsError = (cause: unknown) => new FSUtil.FileSystemError({ method: "config.update", cause })
+                // The patch is (re)applied at this writer's own serialized commit boundary,
+                // against the latest committed document, preserving validation-before-write.
+                const { directory, filepath, text, updated } = yield* editAndValidate()
+                // Publication is required before the lease releases: readers admitted after
+                // this writer must observe the committed document, so the refresh is synchronous
+                // and the rescan below stays advisory. `load` converts filesystem errors into
+                // defects, so the step is observed as an Exit: any refresh failure means a
+                // durable document that protected readers cannot see yet.
+                // `committedByThisCall` says whether the durable document can be attributed to
+                // this writer: the rename path always can, a byte-equal PATCH only when a
+                // previous commit by this owner is still unpublished. Without attribution the
+                // real failure is surfaced instead of a committed-state identity.
+                const publishReaders = Effect.fnUntraced(function* (committedByThisCall: boolean) {
+                  // Distinguishes an aborted announcement from a failed refresh: both surface
+                  // inside one Exit, and only the first has already installed coherent readers.
+                  let announced = false
+                  const publication = yield* Effect.exit(
+                    reloadLock
+                      .withPermit(
+                        Effect.gen(function* () {
+                          const installed = yield* refresh()
+                          pendingCommit = false
+                          if (installed || deliveryPending) {
+                            announced = true
+                            yield* announceUpdate()
+                            deliveryPending = false
+                          }
+                        }),
+                      )
+                      .pipe(Effect.provide(context)),
+                  )
+                  if (Exit.isSuccess(publication)) return
+                  const cause = Exit.getCause(publication)
+                  // A captured interruption stays an interruption rather than becoming an
+                  // outcome, so the captured cause is re-raised unchanged.
+                  if (Option.isSome(cause) && Cause.hasInterrupts(cause.value))
+                    return yield* Effect.failCause(cause.value)
+                  if (announced && committedByThisCall) {
+                    // An attributable commit is durable and its readers are coherent; only the
+                    // mandatory cross-owner announcement is incomplete. Core cannot repeat an
+                    // ephemeral event for this writer, so the boundary names that state.
+                    yield* Effect.logWarning("configuration update notification did not complete", {
+                      cause: Option.getOrUndefined(cause),
+                    })
+                    return yield* Effect.fail(
+                      new CommittedWithPostPublicationFailureError({
+                        file: filepath,
+                        cause: Option.getOrUndefined(cause),
+                      }),
+                    )
+                  }
+                  if (announced) {
+                    // Nothing here committed: the announcement was still mandatory and its
+                    // delivery is incomplete, so the delivery is left pending for the reader
+                    // reconciliation mechanism to retry and the actual notification failure is
+                    // propagated. No committed-state identity belongs to this call, and
+                    // incomplete mandatory delivery is never reported as success.
+                    deliveryPending = true
+                    yield* Effect.logWarning("configuration update notification did not complete", {
+                      source: filepath,
+                      committed: false,
+                      cause: Option.getOrUndefined(cause),
+                    })
+                    return yield* Option.match(cause, {
+                      onSome: (cause) => Effect.failCause(cause),
+                      onNone: () => Effect.die(new Error("configuration announcement failed")),
+                    })
+                  }
+                  if (committedByThisCall) pendingCommit = true
+                  else if (Option.isSome(cause)) readersStale = true
+                  if (!pendingCommit) {
+                    // No commit can be attributed to this call, so no committed-state identity
+                    // is claimed: the reconciliation failure that actually happened is reported,
+                    // and success is not available while protected readers remain stale.
+                    yield* Effect.logWarning("configuration update could not be reconciled", {
+                      source: filepath,
+                      cause: Option.getOrUndefined(cause),
+                    })
+                    return yield* Option.match(cause, {
+                      onSome: (cause) => Effect.failCause(cause),
+                      onNone: () => Effect.die(new Error("configuration reconciliation failed")),
+                    })
+                  }
+                  yield* Effect.logWarning("configuration could not be published to protected readers", {
+                    source: filepath,
+                    cause: Option.getOrUndefined(cause),
+                  })
+                  return yield* Effect.fail(
+                    new CommittedButUnpublishedError({
+                      file: filepath,
+                      cause: Option.getOrUndefined(cause),
+                    }),
+                  )
+                })
+                // Equal bytes mean this request changes nothing on disk: no temporary file, no
+                // rename, and no announcement when readers already match. Coherence is still
+                // required, so a matching PATCH is only a success once the committed document is
+                // visible to protected readers. Retrying an unpublished commit keeps the committed
+                // identity; a matching PATCH that follows an unrelated external edit reports the
+                // reconciliation or announcement failure itself with no committed-state identity, and
+                // neither case reports success while protected readers remain stale or a mandatory
+                // announcement is incomplete.
+                if (updated === text) return yield* publishReaders(pendingCommit)
+                const temp = path.join(directory, `.${path.basename(filepath)}.${randomUUID()}.tmp`)
+                let committed = false
+                // Temporary cleanup always runs. After a successful rename nothing is stranded,
+                // so a failed removal is only a diagnostic; before the rename the flag records
+                // that a temp file may remain while the precommit failure stands.
+                const cleanup = () =>
+                  fs.remove(temp, { force: true }).pipe(
+                    Effect.catch((cause) =>
+                      Effect.logWarning("failed to clean temporary config file", {
+                        source: temp,
+                        committed,
+                        cause,
+                      }),
+                    ),
+                  )
+                // From the first write through publication nothing is interruptible: a writer
+                // cancelled across the commit publishes forward and cleans up instead of stranding
+                // a renamed document unpublished.
+                yield* Effect.uninterruptible(
+                  Effect.gen(function* () {
+                    yield* fs.ensureDir(directory).pipe(Effect.mapError(fsError))
+                    // The temporary file replaces the target, so carry its mode when one exists.
+                    const info = yield* fs.stat(filepath).pipe(
+                      Effect.catchIf((error) => error.reason._tag === "NotFound", () => Effect.undefined),
+                      Effect.mapError(fsError),
+                    )
+                    yield* fs.writeFileString(temp, updated).pipe(Effect.mapError(fsError))
+                    if (info) yield* fs.chmod(temp, info.mode).pipe(Effect.mapError(fsError))
+                    // The rename is the commit boundary: until it succeeds the previous bytes
+                    // stay readable, and every failure at or above it stays a precommit failure.
+                    yield* fs.rename(temp, filepath).pipe(Effect.mapError(fsError))
+                    committed = true
+                    // The durable replacement is now visible on disk, so the shared owner records
+                    // this revision as committed BEFORE any publication step runs. A later failure
+                    // in publication must not let another location's protected read conclude that
+                    // the previous document is still current, and neither a reservation nor a rejected
+                    // candidate ever reaches this line.
+                    yield* fallbackIntent.recordCommit(reservation)
+                    yield* publishReaders(true)
+                    // Advisory only: protected readers were refreshed above, so this rescan
+                    // cannot change the outcome and has no failure channel to classify.
+                    yield* requestReload
+                  }).pipe(Effect.ensuring(cleanup())),
+                )
+              }).pipe(Effect.ensuring(lease.release)),
+            ),
+          )
+          return yield* persist
+        }).pipe(
+          // Cleanup wraps the entire flow, so every exit path — a validation failure before
+          // admission, an interruption at the entry-order boundary or the exclusive lease, or
+          // success — retires this owner's entry position for later writers, and only drops
+          // the staged intent when this revision is still the current one. Shell-only patches
+          // never stage and never clear.
+          Effect.onExit(() =>
+            (staged ? fallbackIntent.clearIfCurrent(reservation) : Effect.void).pipe(
+              Effect.andThen(fallbackIntent.retire(reservation)),
+            ),
+          ),
+        )
+      })
 
       return Service.of({
         entries: Effect.fnUntraced(function* () {
-          return configs
+          // A protected read only returns the in-memory document while nothing is pending locally
+          // AND this owner has already reconciled the latest durable replacement recorded by any
+          // location in this application build. A commit by another location advances the shared
+          // revision immediately after its rename, so a local owner with a lagging marker reloads
+          // from disk instead of serving its older cached document. If that reload fails the read
+          // fails explicitly and the marker stays behind, so the next read retries it.
+          const committed = yield* fallbackIntent.committedRevision()
+
+          if (
+            !pendingCommit &&
+            !readersStale &&
+            !deliveryPending &&
+            observedCommitted >= committed
+          ) {
+            return configs
+          }
+
+          return yield* reconcileReaders()
         }),
         compatibility: () =>
           Effect.all({
@@ -526,6 +944,8 @@ export function configured(options?: Options) {
       Credential.node,
       WellKnown.node,
       AppProcess.node,
+      SessionGenerationAdmission.node,
+      FallbackRuntimeIntent.node,
     ],
   })
 }

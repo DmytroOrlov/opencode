@@ -58,7 +58,39 @@ describe("optimistic setting machine", () => {
     ])
 
     expect(failed.state).toMatchObject({ status: "idle", value: "bash" })
-    expect(failed.effects).toEqual([{ type: "notify.error", failure: { kind: "failed", message: "boom" } }])
+    expect(failed.effects).toEqual([{ type: "notify.error", failure: { kind: "failed", message: "boom", committed: false } }])
+  })
+
+  test("a rejection naming a durable commit re-reads the source instead of restoring the value written over", () => {
+    const failed = replay([
+      ...loaded,
+      { type: "write.requested", value: "/bin/bash" },
+      {
+        type: "write.failed",
+        attempt: 2,
+        message: "Committed /global/opencode.json without publishing it to protected readers",
+        committed: true,
+      },
+    ])
+
+    // `/bin/zsh` is what was written OVER, so it is not what the source holds: the value that carries the committed
+    // code stands until the re-read says otherwise, and the source is read again to settle it.
+    expect(selectSettingValue(failed.state)).toBe("/bin/bash")
+    expect(failed.effects).toEqual([
+      {
+        type: "notify.error",
+        failure: {
+          kind: "failed",
+          message: "Committed /global/opencode.json without publishing it to protected readers",
+          committed: true,
+        },
+      },
+      { type: "load", attempt: 3, source: "server-a" },
+    ])
+
+    // Whatever the source actually recorded is what the control ends up showing.
+    const reread = replay([{ type: "load.succeeded", attempt: 3, value: "/bin/fish", meta: ["zsh", "bash", "fish"] }], failed.state)
+    expect(selectSettingValue(reread.state)).toBe("/bin/fish")
   })
 
   test("a slow failure of an older toggle cannot flip the switch after newer toggles saved", () => {

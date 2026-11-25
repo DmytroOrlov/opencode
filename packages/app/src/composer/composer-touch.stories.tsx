@@ -192,7 +192,17 @@ function TouchComposer(props: { state: State }) {
     },
   } satisfies ModelSelection
 
-  const model = { ...editor, model: { selection, paid: true, loading: false } } satisfies ComposerModel
+  const model = {
+    ...editor,
+    model: {
+      selection,
+      fallback: { ...selection, enabled: () => true },
+      fallbackStatus: "model",
+      exchange: () => false,
+      paid: true,
+      loading: false,
+    },
+  } satisfies ComposerModel
 
   onMount(() => {
     if (props.state === "suggestions") editor.openCommands()

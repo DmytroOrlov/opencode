@@ -524,6 +524,18 @@ export function createComposerModel(adapter: ComposerAdapter, options?: { queue?
         },
         keybind: () => command.keybindParts("model.variant.cycle"),
       },
+      // The fallback slot's own variant control, beside the model it belongs to. It writes config through the same
+      // wrapped slot, so it carries the pair rule, and it has no keybind of its own: `shift+mod+d` already cycles this
+      // composer's primary variant, and the picker is this control's affordance.
+      fallbackVariant: {
+        options: () => adapter.controls().model.fallback.variant.list().map((value) => ({ id: value, label: value })),
+        current: () => adapter.controls().model.fallback.variant.current() ?? "default",
+        onSelect: (value) => {
+          if (adapter.controls().model.loading) return
+
+          adapter.controls().model.fallback.variant.set(value === "default" ? undefined : value)
+        },
+      },
       submit: {
         available,
         stopping,

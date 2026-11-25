@@ -1307,6 +1307,7 @@ export type ExperimentalSessionLogOutput =
             readonly sessionID: Session.ID
             readonly reason: "auto" | "manual"
             readonly inputID?: SessionMessage.ID | undefined
+            readonly candidateID?: SessionMessage.ID | undefined
           }
         }
       | {
@@ -1333,6 +1334,23 @@ export type ExperimentalSessionLogOutput =
                   readonly cache: { readonly read: number; readonly write: number }
                 }
               | undefined
+            readonly candidateID?: SessionMessage.ID | undefined
+            readonly summaryID?: SessionMessage.ID | undefined
+          }
+        }
+      | {
+          readonly id: Event.ID
+          readonly created: number
+          readonly metadata?: { readonly [x: string]: unknown } | undefined
+          readonly type: "session.compaction.published"
+          readonly durable: { readonly aggregateID: string; readonly seq: Event.Seq; readonly version: Event.Version }
+          readonly location?:
+            | { readonly directory: AbsolutePath; readonly workspaceID?: Workspace.ID | undefined }
+            | undefined
+          readonly data: {
+            readonly sessionID: Session.ID
+            readonly candidateID: SessionMessage.ID
+            readonly summaryID: SessionMessage.ID
           }
         }
       | {
@@ -1355,6 +1373,7 @@ export type ExperimentalSessionLogOutput =
               readonly retryAfterMs?: number | undefined
             }
             readonly inputID?: SessionMessage.ID | undefined
+            readonly candidateID?: SessionMessage.ID | undefined
             readonly cost?: Money.USD | undefined
             readonly tokens?:
               | {
@@ -2152,6 +2171,7 @@ export type EventSubscribeInput = {
         | "session.compaction.started"
         | "session.compaction.delta"
         | "session.compaction.ended"
+        | "session.compaction.published"
         | "session.compaction.failed"
         | "session.revert.staged"
         | "session.revert.cleared"
@@ -2837,10 +2857,16 @@ export interface ConfigApi<E = never> {
   readonly update: ExperimentalConfigUpdateOperation<E>
 }
 
-export type ExperimentalConfigUpdateInput = { readonly shell: string | null }
+export type ExperimentalConfigUpdateInput = {
+  readonly shell?: string | null | undefined
+  readonly fallback?:
+    | { readonly providerID: string; readonly model: string; readonly variant?: string | undefined }
+    | null
+    | undefined
+}
 export type ExperimentalConfigUpdateOutput = void
 export type ExperimentalConfigUpdateOperation<E = never> = (
-  input: ExperimentalConfigUpdateInput,
+  input?: ExperimentalConfigUpdateInput,
 ) => Effect.Effect<ExperimentalConfigUpdateOutput, E>
 
 export interface ExperimentalConfigApi<E = never> {

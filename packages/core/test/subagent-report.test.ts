@@ -18,6 +18,7 @@ import { Provider } from "@opencode/core/provider"
 import { AbsolutePath } from "@opencode/core/schema"
 import { SessionExecution } from "@opencode/core/session/execution"
 import { SubagentReport } from "@opencode/core/session/execution/subagent-report"
+import { SessionGenerationAdmission } from "@opencode/core/session/generation-admission"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionSchema } from "@opencode/core/session/schema"
 import { SessionMessage } from "@opencode/core/session/message"
@@ -32,7 +33,7 @@ import { testEffect } from "./lib/effect"
 
 const it = testEffect(
   AppNodeBuilder.build(
-    LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, SessionProjector.node, Job.node]),
+    LayerNode.group([Database.node, Bus.node, SessionStore.node, SessionInbox.node, SessionProjector.node, Job.node, SessionGenerationAdmission.node]),
   ),
 )
 

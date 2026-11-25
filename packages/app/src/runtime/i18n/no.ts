@@ -20,6 +20,7 @@ export const dict = {
   "server.action.authenticate": "Autentiser",
   "server.status.connecting": "Kobler over SSH...",
   "server.status.authentication": "Autentisering kreves",
+  "ui.sessionTurn.status.fallback": "Reservemodell",
   "mcp.auth.interactiveForm": "MCP server {{name}} krever et interaktivt autentiseringsskjema",
   "server.connect.title": "Koble til en server",
   "server.connect.description": "Skriv inn serveradressen og passordet for å komme i gang.",

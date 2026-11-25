@@ -52,7 +52,9 @@ export default function NewSessionPage(props: { draftId: string }) {
   })
 
   const model = createComposerModel(composer.adapter)
-  useComposerCommands({ model: composer.model })
+  // Same reason as the session composer's commands: the draft's commands act on the wrapped slots, which carry the
+  // pair rule, and not on the draft selection directly.
+  useComposerCommands({ model: composer.adapter.controls().model.selection })
 
   const project = createPromptProjectController({ controls: composer.project })
   const location = useNewSessionLocationDialog({ project, workspace, onDone: model.restoreFocus })

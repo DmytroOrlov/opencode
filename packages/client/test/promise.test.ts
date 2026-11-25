@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { isSessionNotFoundError, isUnauthorizedError, OpenCode } from "../src/promise/index"
+import { isUnknownError, isSessionNotFoundError, isUnauthorizedError, OpenCode } from "../src/promise/index"
 
 test("exposes every standard HTTP API group", () => {
   const client = OpenCode.make({ baseUrl: "http://localhost:3000" })
@@ -333,6 +333,91 @@ test("client errors keep the reason and describe the failure in the message", as
       message: "UnsupportedContentType: text/html",
     },
   )
+})
+
+test("experimental.config.update sends PATCH and resolves void on the 204", async () => {
+  const requests: Array<{ method: string | undefined; url: string }> = []
+  const client = OpenCode.make({
+    baseUrl: "http://localhost:3000",
+    fetch: async (input, init) => {
+      requests.push({ method: init?.method, url: String(input) })
+      return new Response(null, { status: 204 })
+    },
+  })
+
+  expect(await client.experimental.config.update({ fallback: null })).toBeUndefined()
+  expect(requests).toEqual([{ method: "PATCH", url: "http://localhost:3000/api/experimental/config" }])
+})
+
+test("a declared PATCH config 500 throws the UnknownError body and keeps the optional code", async () => {
+  const bodies = [
+    // Ordinary uncoded defect: no committed-state code.
+    { _tag: "UnknownError", message: "Server failed to handle the request. Check server logs for details.", ref: "err_2b8f1c3a" },
+    {
+      _tag: "UnknownError",
+      message: "Committed /global/opencode.json without publishing it to protected readers",
+      code: "CONFIG_COMMITTED_BUT_UNPUBLISHED",
+    },
+    {
+      _tag: "UnknownError",
+      message: "Committed and published /global/opencode.json with an incomplete completion step",
+      code: "CONFIG_COMMITTED_WITH_POSTPUBLICATION_FAILURE",
+    },
+  ] as const
+
+  for (const body of bodies) {
+    const client = OpenCode.make({
+      baseUrl: "http://localhost:3000",
+      fetch: async () => Response.json(body, { status: 500 }),
+    })
+    const error = await client.experimental.config.update({ fallback: null }).then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+
+    expect(error).toBeInstanceOf(Error)
+    if (!(error instanceof Error)) throw error
+    expect(error.name).toBe("UnknownError")
+    expect(error.message).toBe(body.message)
+    // The structural code survives without any string parsing: the generated guard narrows it.
+    expect(isUnknownError(error)).toBe(true)
+    if (!isUnknownError(error)) throw error
+    expect("code" in error).toBe("code" in body)
+    expect(error.code).toBe("code" in body ? body.code : undefined)
+    expect(error).toMatchObject(body)
+  }
+})
+
+test("an unrecognized PATCH code is neither committed identity, and other endpoints keep their undeclared 500", async () => {
+  const client = OpenCode.make({
+    baseUrl: "http://localhost:3000",
+    fetch: async () =>
+      Response.json(
+        { _tag: "UnknownError", message: "Something else failed", code: "CONFIG_ALREADY_COMMITTED_FOREVER" },
+        { status: 500 },
+      ),
+  })
+  const error = await client.experimental.config.update({ fallback: null }).then(
+    () => undefined,
+    (cause: unknown) => cause,
+  )
+  if (!isUnknownError(error)) throw error
+  expect(error.code).toBe("CONFIG_ALREADY_COMMITTED_FOREVER")
+  expect(error.code).not.toBe("CONFIG_COMMITTED_BUT_UNPUBLISHED")
+  expect(error.code).not.toBe("CONFIG_COMMITTED_WITH_POSTPUBLICATION_FAILURE")
+
+  // 500 stays undeclared everywhere else, so the old ClientError shape is untouched.
+  const other = await OpenCode.make({
+    baseUrl: "http://localhost:3000",
+    fetch: async () =>
+      Response.json({ _tag: "UnknownError", message: "Committed but unpublished", code: "BOGUS" }, { status: 500 }),
+  })
+    .session.list()
+    .then(
+      () => undefined,
+      (cause: unknown) => cause,
+    )
+  expect(other).toMatchObject({ reason: "UnexpectedStatus", message: "UnexpectedStatus: 500" })
 })
 
 test("project.update uses the global project contract", async () => {

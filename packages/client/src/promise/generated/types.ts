@@ -456,6 +456,9 @@ export type SessionMessageCompactionRunning = {
   id: SessionMessageID
   metadata?: { [x: string]: JsonValue }
   time: { created: number }
+  candidateID?: SessionMessageID
+  summaryID?: SessionMessageID
+  published?: boolean
   status: "running"
   reason: "auto" | "manual"
   summary: string
@@ -584,6 +587,9 @@ export type SessionMessageCompactionFailed = {
   id: SessionMessageID
   metadata?: { [x: string]: JsonValue }
   time: { created: number }
+  candidateID?: SessionMessageID
+  summaryID?: SessionMessageID
+  published?: boolean
   status: "failed"
   reason: "auto" | "manual"
   error: SessionStructuredError
@@ -1069,6 +1075,9 @@ export type SessionMessageCompactionCompleted = {
   id: SessionMessageID
   metadata?: { [x: string]: JsonValue }
   time: { created: number }
+  candidateID?: SessionMessageID
+  summaryID?: SessionMessageID
+  published?: boolean
   status: "completed"
   reason: "auto" | "manual"
   model?: ModelRef
@@ -1086,6 +1095,7 @@ export type ProviderSettings = {
   chunkTimeout?: number | false
   mlxTelemetry?: boolean
   splashTelemetry?: boolean
+  splashAdaptiveSseTimeout?: boolean
   compaction?: ProviderCompaction
   cache?: ProviderCache
   transport?: ProviderTransport
@@ -1103,6 +1113,7 @@ export type ConfigProviderSettings = {
   chunkTimeout?: number | false
   mlxTelemetry?: boolean
   splashTelemetry?: boolean
+  splashAdaptiveSseTimeout?: boolean
   compaction?: ProviderCompaction
   cache?: ProviderCache
   transport?: ProviderTransport
@@ -1626,7 +1637,7 @@ export type SessionCompactionStarted = {
   type: "session.compaction.started"
   durable: { aggregateID: string; seq: EventSeq; version: 1 }
   location?: LocationRef
-  data: { sessionID: SessionID; reason: "auto" | "manual"; inputID?: SessionMessageID }
+  data: { sessionID: SessionID; reason: "auto" | "manual"; inputID?: SessionMessageID; candidateID?: SessionMessageID }
 }
 
 export type SessionCompactionEnded = {
@@ -1644,7 +1655,19 @@ export type SessionCompactionEnded = {
     text: string
     cost?: MoneyUSD
     tokens?: TokenUsageInfo
+    candidateID?: SessionMessageID
+    summaryID?: SessionMessageID
   }
+}
+
+export type SessionCompactionPublished = {
+  id: EventID
+  created: number
+  metadata?: { [x: string]: any }
+  type: "session.compaction.published"
+  durable: { aggregateID: string; seq: EventSeq; version: 1 }
+  location?: LocationRef
+  data: { sessionID: SessionID; candidateID: SessionMessageID; summaryID: SessionMessageID }
 }
 
 export type SessionCompactionFailed = {
@@ -1659,6 +1682,7 @@ export type SessionCompactionFailed = {
     reason: "auto" | "manual"
     error: SessionStructuredError
     inputID?: SessionMessageID
+    candidateID?: SessionMessageID
     cost?: MoneyUSD
     tokens?: TokenUsageInfo
   }
@@ -2478,6 +2502,7 @@ export type ConfigEntry =
         $schema?: string
         shell?: string
         model?: string | { providerID: string; model: string; variant?: string }
+        fallback?: string | { providerID: string; model: string; variant?: string } | null
         default_agent?: string
         update?: "disable" | "notify" | "auto"
         share?: "manual" | "auto" | "disabled"
@@ -2957,6 +2982,7 @@ export type SessionEventDurable =
   | SessionRetryScheduled
   | SessionCompactionStarted
   | SessionCompactionEnded
+  | SessionCompactionPublished
   | SessionCompactionFailed
   | SessionRevertStaged
   | SessionRevertCleared
@@ -3022,6 +3048,7 @@ export type V2Event =
   | SessionCompactionStarted
   | SessionCompactionDelta
   | SessionCompactionEnded
+  | SessionCompactionPublished
   | SessionCompactionFailed
   | SessionRevertStaged
   | SessionRevertCleared
@@ -3171,6 +3198,7 @@ export type UnknownError = {
   readonly _tag: "UnknownError"
   readonly message: string
   readonly ref?: string | undefined
+  readonly code?: "CONFIG_COMMITTED_BUT_UNPUBLISHED" | "CONFIG_COMMITTED_WITH_POSTPUBLICATION_FAILURE" | undefined
 }
 export const isUnknownError = (value: unknown): value is UnknownError =>
   typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "UnknownError"
@@ -4558,6 +4586,7 @@ export type EventSubscribeInput = {
         | "session.compaction.started"
         | "session.compaction.delta"
         | "session.compaction.ended"
+        | "session.compaction.published"
         | "session.compaction.failed"
         | "session.revert.staged"
         | "session.revert.cleared"
@@ -4980,7 +5009,13 @@ export type ConfigGetOutput = Array<ConfigEntry>
 
 export type ConfigShellsOutput = Array<ConfigShellOption>
 
-export type ExperimentalConfigUpdateInput = { readonly shell: string | null }
+export type ExperimentalConfigUpdateInput = {
+  readonly shell?: string | null | undefined
+  readonly fallback?:
+    | { readonly providerID: string; readonly model: string; readonly variant?: string }
+    | null
+    | undefined
+}
 
 export type ExperimentalConfigUpdateOutput = void
 

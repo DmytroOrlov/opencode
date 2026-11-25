@@ -60,14 +60,23 @@ export function make(input: Partial<Interface> = {}): Interface {
   }
 }
 
-const acquire = (input: Partial<Interface>) =>
+const acquire = (input: Partial<Interface>, options: { readonly skipConfig?: boolean } = {}) =>
   Effect.gen(function* () {
     const service = Service.of(make(input))
+    // `skipConfig` defers only the config root: an embedded host creates it through its own injected Config
+    // filesystem (FSUtil.ensureDir), so the directory's provenance and identity come from the same filesystem
+    // that Config.update writes through. Every other root, and standalone acquisition, keeps using the OS directly.
     yield* Effect.promise(() =>
       Promise.all(
-        [service.data, service.config, service.state, service.log, service.bin, service.repos, service.tmp].map(
-          (directory) => fs.promises.mkdir(directory, { recursive: true }),
-        ),
+        [
+          service.data,
+          ...(options.skipConfig === true ? [] : [service.config]),
+          service.state,
+          service.log,
+          service.bin,
+          service.repos,
+          service.tmp,
+        ].map((directory) => fs.promises.mkdir(directory, { recursive: true })),
       ),
     )
     const canonicalTmp = yield* Effect.promise(() => fs.promises.realpath(service.tmp))
@@ -81,6 +90,9 @@ const layer = Layer.effect(
 
 export const node = makeGlobalNode({ service: Service, layer: layer, deps: [] })
 
-export const layerWith = (input: Partial<Interface>) => Layer.effect(Service, acquire(input))
+export const layerWith = (
+  input: Partial<Interface>,
+  options: { readonly skipConfig?: boolean } = {},
+) => Layer.effect(Service, acquire(input, options))
 
 export * as Global from "./global.js"

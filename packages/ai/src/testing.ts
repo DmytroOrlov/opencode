@@ -104,15 +104,18 @@ export const hangAfter = (...events: readonly LLMEvent[]) => Stream.concat(Strea
 const make = (options: LayerOptions) =>
   Effect.sync(() => {
     const script = makeScript(options)
-    const stream: ClientInterface["stream"] = (request) =>
+    const stream: ClientInterface["stream"] = (request, options) =>
       Stream.unwrap(
-        script.take(request).pipe(
-          Effect.map((response) => {
-            if (response instanceof CompactionResponse || response instanceof CompactionCheckpointResponse)
-              return Stream.die("TestLLM generation requires an event response")
-            return Stream.isStream(response) ? response : Stream.fromIterable(response)
-          }),
-        ),
+        Effect.gen(function* () {
+          if (options?.beforeDispatch !== undefined && !(yield* options.beforeDispatch))
+            return yield* Effect.interrupt
+          const response = yield* script.take(request)
+          if (response instanceof CompactionResponse || response instanceof CompactionCheckpointResponse)
+            return Stream.die("TestLLM generation requires an event response")
+          const stream = Stream.isStream(response) ? response : Stream.fromIterable(response)
+          const span = options?.dispatchSpan?.()
+          return span === undefined ? stream : Stream.withSpan(stream, span.name, span.options)
+        }),
       )
     function compact(
       request: LLMRequest & Pick<CompactionRequest, "model">,
